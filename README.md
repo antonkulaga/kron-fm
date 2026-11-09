@@ -60,6 +60,8 @@ uv run kron-data download ecoli-k12                    # data/input/cds/ecoli-k1
 uv run kron-dna prepare ecoli-k12                      # -> data/interim/cds/ecoli-k12/packed_1024
 uv run kron-dna train ecoli-k12 --objective hierarchical --steps 2000   # -> data/output/runs/kron-dna/...
 uv run kron-dna export-onnx data/output/runs/kron-dna/<run> --seq-len 256   # -> <run>/onnx/kron_dna.onnx
+uv run kron-dna prepare-stream syncodonlm --workers 6  # -> data/interim/cds/syncodonlm/packed_1024/{train,test}
+uv run kron-dna train <dir>/train --val-data <dir>/test --max-hours 20   # rerun with --out <run> to resume
 uv run kron-dna info --d-model 768 --n-layers 12       # parameter count of a config
 ```
 
@@ -69,15 +71,24 @@ matrix products (it matches the step-by-step recurrence to about 1e-6). The expo
 against PyTorch and, when CUDA is present, PyTorch against the Triton kernels, and records both in
 `onnx_meta.json`.
 
-`train` uses AdamW, a 10% linear warmup, cosine decay and bf16 autocast. It writes `checkpoint.pt`,
-`config.json` and `metrics.csv`; `val_bits_per_codon` is the plain cross-entropy whatever the objective.
-Its validation split is random over packed rows, so it shares genes with training and only tracks the
-loss.
+`prepare` holds every row in memory, which suits a genome. `prepare-stream` is for the 17 GB SynCodonLM
+corpus: it reads the CSV line by line, checks and encodes sequences with numpy lookup tables in worker
+processes (the same verdicts and tokens as `check_cds` and `encode`, which the tests check), and writes each
+value of the corpus's own `Set` column as its own directory of `uint8` shards (`tokens_00000.npy`, 256 MB
+each) with a `meta.json` listing the shards, the counts, the filter rejects and the species and group
+tallies. `PackedRows` reads either layout by memory map. The corpus is already MMseqs2-clustered per
+species at 90% identity by its authors, so it is not clustered again.
+
+`train` uses AdamW, a 10% linear warmup, cosine decay and bf16 autocast. It writes `checkpoint.pt` (with
+the optimizer state), `config.json` and `metrics.csv`; `val_bits_per_codon` is the plain cross-entropy
+whatever the objective. A run directory that holds a checkpoint is resumed, and `--max-hours` stops a run
+cleanly before a job's time limit. By default validation is a random split of packed rows, which shares
+genes with training and only tracks the loss; `--val-data` validates on another prepared directory
+instead: the corpus's `Set=test` rows, or another species' genome.
 
 **Not built yet:**
-- MMseqs2 clustering and a sharded `prepare` for tens of millions of sequences (the current `prepare`
-  holds rows in memory, so the 17 GB SynCodonLM corpus downloads but cannot be packed yet);
-- gene- and species-held-out splits;
+- gene- and species-held-out splits within a corpus (`--val-data` takes a whole other genome or the
+  corpus's own test set);
 - the evaluation harness: CodonBERT and SynCodonLM tasks under leave-one-gene-out, the `onehot_pos`
   canary, k-mer/GC/CAI baselines, and a random-init twin;
 - multi-GPU training and gradient checkpointing.
