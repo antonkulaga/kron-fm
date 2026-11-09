@@ -190,15 +190,53 @@ def mask_codons(tokens: torch.Tensor, mask_prob: float = 0.15, generator: torch.
     return inputs, labels
 
 
+def shard_files(directory: str | Path) -> list[Path]:
+    """The token arrays of a prepared directory: ``tokens.npy``, or the shards ``meta.json`` lists."""
+    directory = Path(directory)
+    if (directory / "tokens.npy").is_file():
+        return [directory / "tokens.npy"]
+    meta_path = directory / "meta.json"
+    if meta_path.is_file():
+        shards = json.loads(meta_path.read_text()).get("shards")
+        if shards:
+            return [directory / s["file"] for s in shards]
+    raise FileNotFoundError(f"{directory} holds neither tokens.npy nor a meta.json listing shards")
+
+
+def is_packed(directory: str | Path) -> bool:
+    try:
+        return bool(shard_files(directory))
+    except FileNotFoundError:
+        return False
+
+
 class PackedRows(torch.utils.data.Dataset):
-    """The rows of a prepared ``tokens.npy``, memory-mapped, as ``long`` tensors."""
+    """The rows of a prepared directory, memory-mapped, as ``long`` tensors.
+
+    The directory holds one ``tokens.npy`` or the shards its ``meta.json`` lists (``prepare-stream``);
+    shards are opened lazily, per process, so DataLoader workers never copy them.
+    """
 
     def __init__(self, directory: str | Path, rows: np.ndarray | None = None) -> None:
-        self.tokens = np.load(Path(directory) / "tokens.npy", mmap_mode="r")
-        self.rows = np.arange(len(self.tokens)) if rows is None else np.asarray(rows)
+        self.files = shard_files(directory)
+        counts = [int(np.load(f, mmap_mode="r").shape[0]) for f in self.files]
+        self.offsets = np.concatenate([[0], np.cumsum(counts)]).astype(np.int64)
+        self.n_total = int(self.offsets[-1])
+        self.rows = np.arange(self.n_total) if rows is None else np.asarray(rows)
+        self._maps: dict[int, np.ndarray] = {}
 
     def __len__(self) -> int:
         return len(self.rows)
 
+    def _shard(self, k: int) -> np.ndarray:
+        if k not in self._maps:
+            self._maps[k] = np.load(self.files[k], mmap_mode="r")
+        return self._maps[k]
+
     def __getitem__(self, i: int) -> torch.Tensor:
-        return torch.from_numpy(np.asarray(self.tokens[self.rows[i]], dtype=np.int64))
+        row = int(self.rows[i])
+        k = int(np.searchsorted(self.offsets, row, side="right") - 1)
+        return torch.from_numpy(np.asarray(self._shard(k)[row - self.offsets[k]], dtype=np.int64))
+
+    def __getstate__(self) -> dict:
+        return {**self.__dict__, "_maps": {}}

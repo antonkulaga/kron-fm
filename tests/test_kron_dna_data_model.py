@@ -167,3 +167,47 @@ def test_species_embedding_starts_silent(device):
     without, _ = model(tokens)
     with_species, _ = model(tokens, species=torch.tensor([3, 7], device=device))
     assert torch.allclose(without, with_species)
+
+
+# ---- sharded rows and resumable training ----------------------------------------------------------
+
+def test_packed_rows_read_shards_listed_in_meta(tmp_path):
+    a = np.arange(3 * 8, dtype=np.uint8).reshape(3, 8)
+    b = np.arange(2 * 8, dtype=np.uint8).reshape(2, 8) + 100
+    np.save(tmp_path / "tokens_00000.npy", a)
+    np.save(tmp_path / "tokens_00001.npy", b)
+    (tmp_path / "meta.json").write_text(json.dumps({"shards": [{"file": "tokens_00000.npy", "rows": 3},
+                                                               {"file": "tokens_00001.npy", "rows": 2}]}))
+    rows = PackedRows(tmp_path)
+    assert len(rows) == 5 and rows.n_total == 5
+    assert rows[2].tolist() == a[2].tolist() and rows[3].tolist() == b[0].tolist()
+    sub = PackedRows(tmp_path, np.array([4, 0]))
+    assert sub[0].tolist() == b[1].tolist() and sub[1].tolist() == a[0].tolist()
+
+
+def test_train_stops_on_time_and_resumes_from_its_checkpoint(tmp_path, monkeypatch):
+    import kron_core.blocks
+    from kron_core.testing import CausalMixer
+    from typer.testing import CliRunner
+
+    from kron_dna.cli import app
+
+    monkeypatch.setattr(kron_core.blocks, "kronlstm_mixer", CausalMixer)
+    fasta = tmp_path / "cds.fa"
+    fasta.write_text("".join(f">g{i}\n{_cds(40, i)}\n" for i in range(40)))
+    prepare([fasta], tmp_path / "packed", seq_len=64)
+    run = tmp_path / "run"
+    args = ["train", str(tmp_path / "packed"), "--out", str(run), "--device", "cpu", "--no-bf16",
+            "--d-model", "32", "--n-heads", "2", "--n-layers", "2", "--ff-units", "64", "--attention-every", "1",
+            "--batch-size", "4", "--steps", "6", "--eval-every", "2", "--eval-batches", "1", "--num-workers", "0",
+            "--val-fraction", "0.2"]
+    result = CliRunner().invoke(app, args + ["--max-hours", "1e-9"])
+    assert result.exit_code == 0, result.output
+    first = torch.load(run / "checkpoint.pt", weights_only=False)
+    assert first["step"] == 1 and "optimizer" in first
+    result = CliRunner().invoke(app, args)
+    assert result.exit_code == 0, result.output
+    assert "resuming at step 1" in result.output
+    assert torch.load(run / "checkpoint.pt", weights_only=False)["step"] == 6
+    steps = [int(line.split(",")[0]) for line in (run / "metrics.csv").read_text().splitlines()[1:]]
+    assert steps == [1, 2, 4, 6]
