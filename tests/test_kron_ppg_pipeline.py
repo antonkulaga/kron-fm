@@ -243,19 +243,26 @@ def test_the_hub_export_keeps_the_training_split(tmp_path):
     from kron_ppg.hub import export_hub
 
     fake_bidmc(tmp_path / "in" / "bidmc")
-    prepare_source("bidmc", 25.0, 30.0, folder=tmp_path / "in" / "bidmc", out=tmp_path / "prep")
-    summary = export_hub(["bidmc"], tmp_path / "hub", "someone/ppg", "PPG", folders={"bidmc": tmp_path / "prep"})
-    pool = Pool.load([tmp_path / "prep"])
-    sides = pool.split()
-    for ours, hub in (("train", "train"), ("val", "validation"), ("test", "test")):
-        shards = sorted((tmp_path / "hub" / "bidmc").glob(f"{hub}-*.parquet"))
-        rows = pl.concat([pl.read_parquet(p) for p in shards]) if shards else pl.DataFrame()
-        assert len(rows) == len(sides[ours]) == summary["bidmc"]["splits"][hub]["windows"]
-        if len(rows):
-            assert set("bidmc/" + rows["subject"]) == set(pool.subject[sides[ours]])
-            assert rows.schema["signal"] == pl.Array(pl.Float16, 750)
+    folders = {}
+    for rate in (25.0, 125.0):
+        folders[("bidmc", rate)] = tmp_path / f"prep{rate:g}"
+        prepare_source("bidmc", rate, 30.0, folder=tmp_path / "in" / "bidmc", out=folders[("bidmc", rate)])
+    summary = export_hub(["bidmc"], tmp_path / "hub", "someone/ppg", "PPG", rates=(25.0, 125.0, 250.0),
+                         folders=folders)
+    assert set(summary) == {"bidmc_25hz", "bidmc_125hz"}  # 250 Hz is above BIDMC's own 125 Hz
+    for rate, length in ((25.0, 750), (125.0, 3750)):
+        pool = Pool.load([folders[("bidmc", rate)]])
+        sides = pool.split()
+        for ours, hub in (("train", "train"), ("val", "validation"), ("test", "test")):
+            shards = sorted((tmp_path / "hub" / "bidmc" / f"{rate:g}hz").glob(f"{hub}-*.parquet"))
+            rows = pl.concat([pl.read_parquet(p) for p in shards])
+            assert len(rows) == len(sides[ours]) == summary[f"bidmc_{rate:g}hz"]["splits"][hub]["windows"]
+            if len(rows):
+                assert set("bidmc/" + rows["subject"]) == set(pool.subject[sides[ours]])
+                assert rows.schema["signal"] == pl.Array(pl.Float16, length)
     subjects = pl.read_parquet(tmp_path / "hub" / "bidmc" / "subjects.parquet")
     assert set(subjects["split"]) <= {"train", "validation", "test"} and len(subjects) == 4
     card = (tmp_path / "hub" / "README.md").read_text()
-    assert card.startswith("---\nlicense:\n- odc-by\n") and "config_name: bidmc_subjects" in card
-    assert "hf://datasets/someone/ppg/vitaldb" in card and "ODC Attribution License" in card
+    assert card.startswith("---\nlicense:\n- odc-by\n") and "config_name: bidmc_125hz" in card
+    assert "path: bidmc/125hz/test-*.parquet" in card and "config_name: bidmc_subjects" in card
+    assert "hf://datasets/someone/ppg/bidmc/25hz" in card and "ODC Attribution License" in card
