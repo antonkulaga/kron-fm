@@ -9,22 +9,27 @@ dependencies = [
     "einops>=0.8",
     "numpy>=2.0",
     "packaging>=24",
+    "scipy>=1.14",
     "torch>=2.9.1",
     "typer>=0.15.0",
 ]
 
 [project.scripts]
+kron-data = "kron_core.data_cli:app"
 kron-dna = "kron_dna.cli:app"
+kron-ppg = "kron_ppg.cli:app"
 
 [build-system]
 requires = ["hatchling>=1.26.0"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/kron_core", "src/krontime", "src/kron_dna"]
+packages = ["src/kron_core", "src/krontime", "src/kron_dna", "src/kron_ppg"]
 
 [tool.uv]
 system-certs = true
+# `uv sync` installs these too, so naming no group never uninstalls the ONNX tools or pytest.
+default-groups = ["dev", "onnx"]
 
 # The same CUDA 12.8 wheels as glucose_forecasting_metabonet, so the two projects share one torch build.
 [tool.uv.sources]
@@ -40,6 +45,12 @@ explicit = true
 [dependency-groups]
 dev = [
     "pytest>=8.3",
+]
+# ONNX export and its checks (krontime.onnx_export, kron_dna.onnx_export), the same pins as the glucose repo.
+onnx = [
+    "onnx>=1.17,<2",
+    "onnxruntime>=1.20,<2",
+    "onnxscript>=0.3,<1",
 ]
 
 [tool.pytest.ini_options]

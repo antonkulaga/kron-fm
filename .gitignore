@@ -219,5 +219,9 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 
-# kron-fm: packed corpora, runs and checkpoints
-/data/
+# kron-fm data: the three folders stay in git (each holds a .gitignore and a README), their contents do not.
+/data/*
+!/data/README.md
+!/data/input/
+!/data/interim/
+!/data/output/

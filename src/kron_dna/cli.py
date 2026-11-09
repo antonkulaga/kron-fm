@@ -1,8 +1,13 @@
-"""``kron-dna``: prepare coding sequences and pretrain a kron-dna model.
+"""``kron-dna``: prepare coding sequences, pretrain a kron-dna model and export it to ONNX.
 
-    uv run kron-dna prepare cds.fa.gz --out data/packed/demo
-    uv run kron-dna train data/packed/demo --out data/runs/demo --steps 2000
+    uv run kron-data download ecoli-k12                  # data/input/cds/ecoli-k12
+    uv run kron-dna prepare ecoli-k12                    # -> data/interim/cds/ecoli-k12/packed_1024
+    uv run kron-dna train ecoli-k12 --steps 2000         # -> data/output/runs/kron-dna/ecoli-k12-mlm-<UTC time>
+    uv run kron-dna export-onnx data/output/runs/kron-dna/<run>   # -> <run>/onnx/
     uv run kron-dna info --d-model 512 --n-layers 12
+
+A dataset is named by its source (``kron-data list``) or given as paths; the folders come from
+:mod:`kron_core.paths`.
 
 The validation split here is a random split of packed rows, for watching the loss only. It shares
 genes with training, so it says nothing about generalisation: the report's evaluation section explains
@@ -20,8 +25,10 @@ import numpy as np
 import torch
 import typer
 
-from kron_dna.data import PackedRows, doc_ids_from_tokens, mask_codons
+from kron_core.paths import input_dir, interim_dir, run_name, runs_dir
+from kron_dna.data import PackedRows, doc_ids_from_tokens, mask_codons, sequence_files
 from kron_dna.data import prepare as prepare_rows
+from kron_dna.sources import DOMAIN, SOURCES
 from kron_dna.losses import OBJECTIVES, mlm_cross_entropy, objective_loss
 from kron_dna.model import KronDNA, KronDNAConfig
 
@@ -34,15 +41,50 @@ def _config(d_model: int, n_heads: int, n_layers: int, ff_units: int, dropout: f
                          attention_every=attention_every, tie_directions=tie_directions)
 
 
+def packed_dir(source: str, seq_len: int = 1024, subset: str = "") -> Path:
+    """Where ``prepare`` writes a source's packed rows: ``data/interim/cds/<source>/packed_<seq_len>[_<subset>]``."""
+    return interim_dir(DOMAIN, source, f"packed_{seq_len}" + (f"_{subset}" if subset else ""))
+
+
+def resolve_packed(data: str, seq_len: int = 1024) -> Path:
+    """A packed-rows directory from a path or a source name."""
+    path = Path(data)
+    if (path / "tokens.npy").is_file():
+        return path
+    if data in SOURCES and (packed_dir(data, seq_len) / "tokens.npy").is_file():
+        return packed_dir(data, seq_len)
+    raise typer.BadParameter(f"{data!r} is neither a packed directory nor a prepared source; "
+                             f"run `kron-dna prepare {data}` first")
+
+
 @app.command()
-def prepare(fasta: list[Path] = typer.Argument(..., help="FASTA files of coding sequences (.gz allowed)"),
-            out: Path = typer.Option(..., help="output directory for tokens.npy and meta.json"),
+def prepare(inputs: list[str] = typer.Argument(..., help="a source name (`kron-data list`) or FASTA/CSV paths"),
+            out: Path | None = typer.Option(None, help="output directory (default: data/interim/cds/<source>/packed_<seq_len>)"),
             seq_len: int = typer.Option(1024, help="tokens per packed row"),
-            alt_starts: bool = typer.Option(False, help="also accept GTG and TTG starts (bacteria)"),
+            alt_starts: bool | None = typer.Option(None, help="also accept GTG and TTG starts (default: the source's setting)"),
+            keep_set: str | None = typer.Option(None, help="CSV sources: keep rows whose Set column has this value (train, test)"),
             max_sequences: int | None = typer.Option(None, help="stop after this many accepted sequences")) -> None:
     """Filter, tokenize and pack coding sequences."""
-    starts = ("ATG", "GTG", "TTG") if alt_starts else ("ATG",)
-    meta = prepare_rows(fasta, out, seq_len=seq_len, starts=starts, max_sequences=max_sequences)
+    source = SOURCES.get(inputs[0]) if len(inputs) == 1 else None
+    if source is not None:
+        folder = source.folder(input_dir())
+        paths = sequence_files(folder)
+        if not paths:
+            raise typer.BadParameter(f"nothing downloaded in {folder}; run `kron-data download {source.name}`")
+        out = out or packed_dir(source.name, seq_len, keep_set or "")
+        alt = source.notes.get("alt_starts", False) if alt_starts is None else alt_starts
+        keep = {source.notes.get("set_column", "Set"): keep_set} if keep_set else None
+    else:
+        paths = [Path(p) for p in inputs]
+        missing = [str(p) for p in paths if not p.is_file()]
+        if missing:
+            raise typer.BadParameter(f"not a source name and not files: {missing}")
+        if out is None:
+            raise typer.BadParameter("--out is needed when the inputs are paths")
+        alt, keep = bool(alt_starts), ({"Set": keep_set} if keep_set else None)
+    starts = ("ATG", "GTG", "TTG") if alt else ("ATG",)
+    meta = prepare_rows(paths, out, seq_len=seq_len, starts=starts, max_sequences=max_sequences, keep=keep)
+    typer.echo(f"wrote {out}")
     typer.echo(json.dumps(meta, indent=2))
 
 
@@ -74,8 +116,8 @@ def _lr_at(step: int, steps: int, warmup: int, lr: float) -> float:
 
 
 @app.command()
-def train(data: Path = typer.Argument(..., help="a directory written by `kron-dna prepare`"),
-          out: Path = typer.Option(..., help="run directory for checkpoint.pt, config.json and metrics.csv"),
+def train(data: str = typer.Argument(..., help="a prepared source name or a directory written by `kron-dna prepare`"),
+          out: Path | None = typer.Option(None, help="run directory (default: data/output/runs/kron-dna/<data>-<objective>-<UTC time>)"),
           objective: str = typer.Option("mlm", help=f"one of {', '.join(OBJECTIVES)}"),
           alpha: float = typer.Option(0.2, help="the hierarchical loss's depth discount"),
           d_model: int = 512, n_heads: int = 8, n_layers: int = 12, ff_units: int = 1536, dropout: float = 0.1,
@@ -89,7 +131,11 @@ def train(data: Path = typer.Argument(..., help="a directory written by `kron-dn
         raise typer.BadParameter(f"objective must be one of {OBJECTIVES}")
     torch.manual_seed(seed)
     dev = torch.device(device)
+    name = data if data in SOURCES else Path(data).name
+    data = resolve_packed(data)
+    out = out or runs_dir("kron-dna") / run_name(name, objective)
     out.mkdir(parents=True, exist_ok=True)
+    typer.echo(f"run directory: {out}")
     n_rows = len(np.load(data / "tokens.npy", mmap_mode="r"))
     order = np.random.default_rng(seed).permutation(n_rows)
     n_val = max(1, int(round(val_fraction * n_rows)))
@@ -160,6 +206,24 @@ def train(data: Path = typer.Argument(..., help="a directory written by `kron-dn
                             "objective": objective}, out / "checkpoint.pt")
                 typer.echo(f"step {step}: train {loss.item():.4f}, val {m['val_loss']:.4f}, "
                            f"{m['val_bits_per_codon']:.3f} bits/codon, {rate:,.0f} tokens/s")
+
+
+@app.command("export-onnx")
+def export_onnx_cmd(run: Path = typer.Argument(..., help="a `kron-dna train` run directory or checkpoint"),
+                    out: Path | None = typer.Option(None, help="output directory (default: <run>/onnx)"),
+                    seq_len: int = typer.Option(256, help="codon tokens the graph reads; the recurrence is unrolled, "
+                                                          "so the graph and the export time grow with it"),
+                    opset: int = typer.Option(17, help="ONNX opset"),
+                    check_kernels: bool = typer.Option(True, help="compare with the Triton kernels when CUDA is present")
+                    ) -> None:
+    """Export a trained model to ONNX and check ONNX Runtime against PyTorch."""
+    from kron_dna.onnx_export import export_onnx, load_run
+
+    model, record = load_run(run)
+    out = out or (run if run.is_dir() else run.parent) / "onnx"
+    meta = export_onnx(model, out, seq_len=seq_len, opset=opset, record=record, check_kernels=check_kernels)
+    typer.echo(f"wrote {out / meta['graph']} ({meta['bytes'] / 1e6:,.1f} MB, {meta['export_seconds']} s)")
+    typer.echo(json.dumps(meta["verification"], indent=2))
 
 
 if __name__ == "__main__":

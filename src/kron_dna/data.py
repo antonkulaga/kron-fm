@@ -1,6 +1,6 @@
 """Coding sequences to packed training rows, and the masking that turns rows into a masked-LM batch.
 
-Pipeline: FASTA (plain or gzipped) -> :func:`kron_dna.codons.check_cds` -> codon tokens -> packed rows
+Pipeline: FASTA or CSV (plain or gzipped) -> :func:`kron_dna.codons.check_cds` -> codon tokens -> packed rows
 of ``seq_len`` tokens, saved as one ``uint8`` array (``tokens.npy``, shape ``[rows, seq_len]``) with a
 ``meta.json`` of counts. Every document in a row starts with ``<cls>``, so document boundaries are
 recovered from the tokens alone (:func:`doc_ids_from_tokens`) and need not be stored. A sequence
@@ -13,8 +13,10 @@ every document (``cu_seqlens``), so packing costs nothing in correctness.
 """
 from __future__ import annotations
 
+import csv
 import gzip
 import json
+import sys
 from collections import Counter
 from collections.abc import Iterable, Iterator
 from pathlib import Path
@@ -44,6 +46,44 @@ def read_fasta(path: str | Path) -> Iterator[tuple[str, str]]:
                 parts.append(line)
     if header is not None:
         yield header, "".join(parts)
+
+
+def read_csv(path: str | Path, sequence_column: str = "CDS", keep: dict[str, str] | None = None
+             ) -> Iterator[tuple[str, str]]:
+    """``(header, sequence)`` pairs from a CSV with a sequence column (the SynCodonLM corpus: CDS, Species,
+    Group, Set). The header joins the other columns with ``|``; ``keep`` keeps only rows whose columns hold
+    the given values, e.g. ``{"Set": "train"}``. A cut last line, as in a truncated download, is skipped."""
+    path = Path(path)
+    opener = gzip.open if path.suffix == ".gz" else open
+    csv.field_size_limit(sys.maxsize)
+    with opener(path, "rt", newline="") as handle:
+        reader = csv.DictReader(handle)
+        if reader.fieldnames is None or sequence_column not in reader.fieldnames:
+            raise ValueError(f"{path} has no {sequence_column!r} column (columns: {reader.fieldnames})")
+        others = [c for c in reader.fieldnames if c != sequence_column]
+        try:
+            for row in reader:
+                if keep and any(row.get(k) != v for k, v in keep.items()):
+                    continue
+                yield "|".join(row.get(c) or "" for c in others), row[sequence_column] or ""
+        except (EOFError, csv.Error):
+            return
+
+
+def is_csv(path: str | Path) -> bool:
+    name = Path(path).name.lower()
+    return name.endswith(".csv") or name.endswith(".csv.gz")
+
+
+def read_sequences(path: str | Path, keep: dict[str, str] | None = None) -> Iterator[tuple[str, str]]:
+    """FASTA or CSV, chosen by the file name."""
+    return read_csv(path, keep=keep) if is_csv(path) else read_fasta(path)
+
+
+def sequence_files(folder: str | Path) -> list[Path]:
+    """The FASTA and CSV files of a downloaded source folder, in name order."""
+    patterns = ("*.fna.gz", "*.fa.gz", "*.fasta.gz", "*.fna", "*.fa", "*.fasta", "*.csv.gz", "*.csv")
+    return sorted({p for pattern in patterns for p in Path(folder).glob(pattern)})
 
 
 def documents(tokens: list[int], seq_len: int) -> Iterator[list[int]]:
@@ -81,9 +121,10 @@ def pack(docs: Iterable[list[int]], seq_len: int) -> Iterator[np.ndarray]:
         yield np.array(row + [PAD_ID] * (seq_len - len(row)), dtype=np.uint8)
 
 
-def prepare(fasta_paths: Iterable[str | Path], out_dir: str | Path, seq_len: int = 1024,
-            starts: tuple[str, ...] = ("ATG",), max_sequences: int | None = None) -> dict:
-    """Filter, tokenize and pack FASTA coding sequences into ``out_dir/tokens.npy`` and ``meta.json``.
+def prepare(paths: Iterable[str | Path], out_dir: str | Path, seq_len: int = 1024,
+            starts: tuple[str, ...] = ("ATG",), max_sequences: int | None = None,
+            keep: dict[str, str] | None = None) -> dict:
+    """Filter, tokenize and pack coding sequences (FASTA or CSV) into ``out_dir/tokens.npy`` and ``meta.json``.
 
     Holds the packed rows in memory, which is fine for tens of millions of codons; a corpus of
     SynCodonLM's size (43.5M sequences, ~18B codons) needs sharded output, not written yet.
@@ -95,8 +136,8 @@ def prepare(fasta_paths: Iterable[str | Path], out_dir: str | Path, seq_len: int
 
     def docs() -> Iterator[list[int]]:
         nonlocal kept, codons
-        for path in fasta_paths:
-            for _, seq in read_fasta(path):
+        for path in paths:
+            for _, seq in read_sequences(path, keep=keep):
                 if max_sequences is not None and kept >= max_sequences:
                     return
                 reason = check_cds(seq, starts=starts)
@@ -115,7 +156,7 @@ def prepare(fasta_paths: Iterable[str | Path], out_dir: str | Path, seq_len: int
     np.save(out / "tokens.npy", tokens)
     meta = {"seq_len": seq_len, "rows": int(tokens.shape[0]), "sequences": kept, "codons": codons,
             "fill": float((tokens != PAD_ID).mean()), "rejected": dict(rejected), "starts": list(starts),
-            "vocab_size": VOCAB_SIZE}
+            "vocab_size": VOCAB_SIZE, "inputs": [str(p) for p in paths], "keep": keep or {}}
     (out / "meta.json").write_text(json.dumps(meta, indent=2) + "\n")
     return meta
 
