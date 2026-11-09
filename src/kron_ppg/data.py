@@ -7,7 +7,8 @@ A prepared variant (``kron-ppg prepare``) holds:
   fixed-size ``Array(Float16, L)`` (zstd-compressed);
 * ``subjects.parquet``: per subject ``subject``, ``age`` (null when unknown), ``sex`` and any outcome
   flags the source carries (VitalDB: ``preop_htn``, ``preop_dm``, ``death_inhosp``, ``asa``); a column
-  whose every value is a number is stored as ``Float64``, any other as text;
+  whose every value is a whole number is stored as ``Int64`` (``age`` always as ``Float64``), one of
+  other numbers as ``Float64``, any other as text;
 * ``info.json``: the source, rate, window and hop, counts, and the input's ``SOURCE.json`` it was built from.
 
 Both tables are plain parquet, so polars, DuckDB, pyarrow or Hugging Face ``datasets`` read them as they are.
@@ -89,7 +90,12 @@ def _subject_frame(subjects: list[dict]) -> pl.DataFrame:
     for n in names:
         col = raw.get_column(n)
         number = col.cast(pl.Float64, strict=False)
-        columns.append(number if n != "subject" and number.null_count() == col.null_count() else col)
+        if n == "subject" or number.null_count() != col.null_count():
+            columns.append(col)
+        elif n != "age" and bool((number.drop_nulls() % 1 == 0).all()):
+            columns.append(number.cast(pl.Int64))
+        else:
+            columns.append(number)
     return pl.DataFrame(columns)
 
 

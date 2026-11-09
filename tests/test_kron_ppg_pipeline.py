@@ -122,6 +122,7 @@ def test_a_variant_is_typed_parquet(tmp_path):
     subjects = pl.read_parquet(tmp_path / "out" / "subjects.parquet")
     assert subjects.columns[:3] == ["subject", "age", "sex"]
     assert subjects.schema["age"] == pl.Float64 and subjects.schema["sex"] == pl.String
+    assert subjects.schema["age_censored"] == pl.Int64
     assert subjects.filter(pl.col("subject") == "04")["age"].is_null().all()
     assert not (tmp_path / "out" / "windows.npy").exists()
 
