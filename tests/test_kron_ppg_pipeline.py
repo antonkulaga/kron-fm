@@ -84,7 +84,7 @@ def test_bidmc_reads_ages_with_ninety_plus_censored_and_nan_unknown(tmp_path):
     assert by["01"]["age"] == "88" and by["03"]["age"] == "90" and by["03"]["age_censored"] == "1"
     assert by["04"]["age"] == ""
     rec = next(data.recordings)
-    assert rec.fs == 125.0 and len(rec.signal) == 120 * 125
+    assert rec.fs == 125.0 and len(rec.load()) == 120 * 125
 
 
 def test_vitaldb_tracks_read_one_sample_per_row_and_subjects_come_from_subjectid(tmp_path):
@@ -98,7 +98,7 @@ def test_vitaldb_tracks_read_one_sample_per_row_and_subjects_come_from_subjectid
     assert data.subjects[0]["subject"] == "4151" and data.subjects[0]["asa"] == "3"
     rec = next(data.recordings)
     assert rec.subject == "4151" and rec.fs == 500.0
-    assert np.array_equal(rec.signal, [np.nan, 1.5, 2.5, np.nan, 3.0], equal_nan=True)
+    assert np.array_equal(rec.load(), [np.nan, 1.5, 2.5, np.nan, 3.0], equal_nan=True)
 
 
 def test_prepare_writes_a_variant_the_pool_loads(tmp_path):
@@ -109,6 +109,14 @@ def test_prepare_writes_a_variant_the_pool_loads(tmp_path):
     assert pool.window(0).shape == (750,) and pool.window(0).dtype == np.float32
     assert set(pool.subject) == {"bidmc/01", "bidmc/02", "bidmc/03", "bidmc/04"}
     assert np.isnan(pool.age[pool.subject == "bidmc/04"]).all()
+
+
+def test_parallel_preparation_writes_what_one_process_writes(tmp_path):
+    fake_bidmc(tmp_path / "in" / "bidmc")
+    for workers in (1, 2):
+        prepare_source("bidmc", folder=tmp_path / "in" / "bidmc", out=tmp_path / f"w{workers}", workers=workers)
+    assert np.array_equal(np.load(tmp_path / "w1" / "windows.npy"), np.load(tmp_path / "w2" / "windows.npy"))
+    assert (tmp_path / "w1" / "windows.csv").read_text() == (tmp_path / "w2" / "windows.csv").read_text()
 
 
 # ---- splits and batches ------------------------------------------------------------------------

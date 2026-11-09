@@ -73,12 +73,14 @@ def prepare(sources: list[str] = typer.Argument(..., help="downloaded sources to
             seconds: float = typer.Option(30.0, help="window length, s"),
             hop: float | None = typer.Option(None, help="window step, s (default: no overlap)"),
             max_windows: int = typer.Option(240, help="most windows kept per recording, spread over it"),
-            min_periodicity: float = typer.Option(0.35, help="the quality gate's autocorrelation threshold")) -> None:
+            min_periodicity: float = typer.Option(0.35, help="the quality gate's autocorrelation threshold"),
+            workers: int | None = typer.Option(None, help="parallel processes (default: available CPUs, at most 16)")
+            ) -> None:
     """Band-pass, resample, window, scale and quality-gate into data/interim/ppg/<source>/fs<rate>-w<s>s."""
     from kron_ppg.prepare import prepare_source
 
     for source in sources:
-        info = prepare_source(source, sample_rate, seconds, hop, max_windows, min_periodicity)
+        info = prepare_source(source, sample_rate, seconds, hop, max_windows, min_periodicity, workers=workers)
         typer.echo(json.dumps({k: info[k] for k in ("source", "windows", "subjects", "subjects_with_windows",
                                                     "recordings_without_windows")}))
 

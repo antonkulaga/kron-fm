@@ -20,10 +20,20 @@ from kron_ppg.sources import open_text
 
 @dataclass
 class Recording:
+    """One recording. ``signal`` is either held, or parsed on demand from ``path`` by the parser named
+    ``parser`` (:data:`PARSERS`), so a worker process parses it rather than the reading process."""
+
     subject: str
     recording: str
     fs: float
-    signal: np.ndarray
+    signal: np.ndarray | None = None
+    path: Path | None = None
+    parser: str = ""
+
+    def load(self) -> np.ndarray:
+        if self.signal is not None:
+            return self.signal
+        return PARSERS[self.parser](self.path)
 
 
 @dataclass
@@ -72,7 +82,7 @@ def read_bidmc(folder: Path) -> SourceData:
 
     def gen() -> Iterator[Recording]:
         for i in ids:
-            yield Recording(i, i, 125.0, _column(folder / f"bidmc_{i}_Signals.csv", "PLETH"))
+            yield Recording(i, i, 125.0, path=folder / f"bidmc_{i}_Signals.csv", parser="bidmc")
 
     return SourceData(subjects, gen())
 
@@ -108,7 +118,7 @@ def read_vitaldb(folder: Path) -> SourceData:
 
     def gen() -> Iterator[Recording]:
         for subject, cid in order:
-            yield Recording(subject, str(cid), 500.0, read_vitaldb_track(tracks[cid]))
+            yield Recording(subject, str(cid), 500.0, path=tracks[cid], parser="vitaldb")
 
     return SourceData(subjects, gen())
 
@@ -152,4 +162,9 @@ def read_galaxyppg(folder: Path) -> SourceData:
     return SourceData(subjects, gen())
 
 
+def _bidmc_pleth(path: Path) -> np.ndarray:
+    return _column(path, "PLETH")
+
+
+PARSERS = {"bidmc": _bidmc_pleth, "vitaldb": read_vitaldb_track}
 READERS = {"bidmc": read_bidmc, "vitaldb": read_vitaldb, "galaxyppg": read_galaxyppg}
