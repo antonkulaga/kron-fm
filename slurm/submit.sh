@@ -1,6 +1,7 @@
 #!/bin/bash
 # slurm/submit.sh gpu|cpu NAME COMMAND...   e.g.
 #   slurm/submit.sh gpu dna-ecoli kron-dna train ecoli-k12 --steps 20000
+#   NODE=gpu13 slurm/submit.sh gpu ...    (pin a node; a GPU job exits 3 when every card on its node is busy)
 #   slurm/submit.sh cpu prepare-syncodon kron-dna prepare syncodonlm --keep-set train
 # Builds sbatch flags from slurm/env.sh (and the git-ignored env.local.sh) and runs job.sbatch.
 set -euo pipefail
@@ -16,7 +17,7 @@ if [ "$kind" = gpu ]; then
   [ -n "$KRON_GPU_PARTITION" ] || { echo "set KRON_GPU_PARTITION in slurm/env.local.sh" >&2; exit 2; }
   flags+=(--partition="$KRON_GPU_PARTITION" --cpus-per-task="$KRON_GPU_CPUS" --mem="$KRON_GPU_MEM")
   [ -n "$KRON_GPU_CONSTRAINT" ] && flags+=(--constraint="$KRON_GPU_CONSTRAINT")
-  [ -n "$KRON_GPU_NODES" ] && flags+=(--nodelist="${NODE:-$KRON_GPU_NODES}")
+  nodes="${NODE:-$KRON_GPU_NODES}"; [ -n "$nodes" ] && flags+=(--nodelist="$nodes")
 else
   [ -n "$KRON_CPU_PARTITION" ] || { echo "set KRON_CPU_PARTITION in slurm/env.local.sh" >&2; exit 2; }
   flags+=(--partition="$KRON_CPU_PARTITION" --cpus-per-task="$KRON_CPU_CPUS" --mem="$KRON_CPU_MEM")
