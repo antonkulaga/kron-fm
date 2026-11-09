@@ -25,7 +25,7 @@ import os
 import csv
 from pathlib import Path
 
-from kron_core.download import (RemoteFile, Source, download_file, link_folder, read_manifest,
+from kron_core.download import (RemoteFile, Source, download_file, link_folder, read_manifest, sha256,
                                 write_manifest)
 from kron_core.paths import repo_root
 
@@ -73,8 +73,13 @@ def fetch_vitaldb(source: Source, folder: Path, force: bool, cases: int | None =
 
     def get(url: str, name: str) -> dict:
         dest = folder / name
-        if dest.exists() and not force and name in old and old[name].get("bytes") == dest.stat().st_size:
-            return old[name]
+        if dest.exists() and not force:
+            if name in old and old[name].get("bytes") == dest.stat().st_size:
+                return old[name]
+            # A complete file from a run stopped before it wrote the manifest: download_file renames
+            # the .part file only once the whole body has arrived, so a file under its own name is whole.
+            return {"file": name, "url": url, "bytes": dest.stat().st_size, "sha256": sha256(dest),
+                    "downloaded_at": None}
         return {**download_file(url, dest), "file": name}
 
     entries = [get(f"{VITALDB_API}/cases", "cases.csv.gz"), get(f"{VITALDB_API}/trks", "trks.csv.gz")]
