@@ -187,7 +187,7 @@ if __name__ == "__main__":
 
 @app.command("hub-export")
 def hub_export(sources: list[str] = typer.Argument(..., help="prepared sources"),
-               repo: str = typer.Option("antonkulaga/ppg-windows-25hz", help="the Hub dataset id the card names"),
+               repo: str = typer.Option("GlucoseDao/ppg-windows-25hz", help="the Hub dataset id the card names"),
                name: str = typer.Option("PPG windows at 25 Hz", help="the card's title"),
                out: Path | None = typer.Option(None, help="output folder (default data/output/hub/<repo name>)"),
                sample_rate: float = typer.Option(25.0), seconds: float = typer.Option(30.0)) -> None:
