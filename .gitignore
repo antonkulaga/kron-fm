@@ -225,3 +225,7 @@ __marimo__/
 !/data/input/
 !/data/interim/
 !/data/output/
+
+# kron-fm cluster settings and job logs stay on the cluster
+/slurm/env.local.sh
+/slurm/logs/

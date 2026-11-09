@@ -35,7 +35,8 @@ The GPU run uses the real kernels and skips without CUDA.
 ported with module and parameter names unchanged. A forecaster built in the glucose repo loads here
 strictly and gives bit-identical forecasts on the GPU (checked 2026-11-09). These stay in the glucose
 repo, because they are wired into its MetaboNet trainer, data pipeline and scorer: record streaming
-(`stream.py`), the trainer (`stream_train.py`), the family spec and the ONNX export.
+(`stream.py`), the trainer (`stream_train.py`) and the family spec. The streaming ONNX bundle export is
+ported (`krontime.onnx_export.export_stream_bundle`); a CLI for it waits for krontime's own trainer.
 
 Next steps toward a time-series foundation model: let the input channels be general rather than glucose,
 basal, bolus and carbs, and pretrain on more than one dataset.
@@ -55,10 +56,18 @@ The design follows the research report [reports/Small DNA foundation models 2026
   have never been compared on the same corpus and backbone.
 
 ```bash
-uv run kron-dna prepare cds.fa.gz --out data/packed/refseq_demo           # --alt-starts for bacteria
-uv run kron-dna train data/packed/refseq_demo --out data/runs/demo --objective hierarchical --steps 2000
-uv run kron-dna info --d-model 768 --n-layers 12                          # parameter count of a config
+uv run kron-data download ecoli-k12                    # data/input/cds/ecoli-k12 (1.5 MB)
+uv run kron-dna prepare ecoli-k12                      # -> data/interim/cds/ecoli-k12/packed_1024
+uv run kron-dna train ecoli-k12 --objective hierarchical --steps 2000   # -> data/output/runs/kron-dna/...
+uv run kron-dna export-onnx data/output/runs/kron-dna/<run> --seq-len 256   # -> <run>/onnx/kron_dna.onnx
+uv run kron-dna info --d-model 768 --n-layers 12       # parameter count of a config
 ```
+
+The ONNX graph reads a fixed number of codon tokens, one sequence per row, through
+`kron_core.onnx.ChunkedKronMixer`: the KronLSTM recurrence in plain PyTorch, 16 steps at a time with
+matrix products (it matches the step-by-step recurrence to about 1e-6). The export checks ONNX Runtime
+against PyTorch and, when CUDA is present, PyTorch against the Triton kernels, and records both in
+`onnx_meta.json`.
 
 `train` uses AdamW, a 10% linear warmup, cosine decay and bf16 autocast. It writes `checkpoint.pt`,
 `config.json` and `metrics.csv`; `val_bits_per_codon` is the plain cross-entropy whatever the objective.
@@ -66,8 +75,8 @@ Its validation split is random over packed rows, so it shares genes with trainin
 loss.
 
 **Not built yet:**
-- the RefSeq/SynCodonLM corpus download, MMseqs2 clustering and sharded `prepare` for tens of millions
-  of sequences (the current `prepare` holds rows in memory);
+- MMseqs2 clustering and a sharded `prepare` for tens of millions of sequences (the current `prepare`
+  holds rows in memory, so the 17 GB SynCodonLM corpus downloads but cannot be packed yet);
 - gene- and species-held-out splits;
 - the evaluation harness: CodonBERT and SynCodonLM tasks under leave-one-gene-out, the `onehot_pos`
   canary, k-mer/GC/CAI baselines, and a random-init twin;
@@ -120,6 +129,24 @@ Status: the package, its tests (CPU stand-in and GPU kernels) and the ONNX expor
 30 VitalDB cases ran end to end. No clock result is reported yet. The first real run needs a few hundred
 to a few thousand VitalDB cases, and then baselines on the same subject splits (age and sex alone,
 pulse-shape features, AI-PPG Age).
+
+## Data and the cluster
+
+Data lives in `data/input` (downloads as published, each with a `SOURCE.json`), `data/interim` (derived,
+rebuildable) and `data/output` (runs, ONNX graphs); see [data/README.md](data/README.md). `$KRON_FM_DATA`
+moves the tree. `uv run kron-data list` shows every dataset and `uv run kron-data status` what is on disk.
+
+Large downloads and training belong on the SLURM cluster. `slurm/submit.sh gpu|cpu NAME COMMAND...` runs
+one kron-fm command as a job (`uv run --no-sync`). The GPU nodes there may have no GPU GRES, so a GPU job
+picks the first card with no compute process (or `CUDA_DEVICE`). The partition, account and node names
+go in `slurm/env.local.sh`, which is git-ignored because this repository is public; start it from
+`slurm/env.local.example.sh`. Put the checkout, `UV_CACHE_DIR` and `UV_PYTHON_INSTALL_DIR` on the large
+scratch filesystem, not a small home quota.
+
+```bash
+slurm/submit.sh gpu dna-ecoli kron-dna train ecoli-k12 --steps 20000
+slurm/submit.sh cpu prep-human kron-dna prepare human-grch38
+```
 
 ## Research
 
