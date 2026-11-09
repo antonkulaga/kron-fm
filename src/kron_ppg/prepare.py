@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+import multiprocessing
 import os
 import sys
 import time
@@ -26,12 +27,16 @@ def _cut(rec: Recording, sample_rate: float, seconds: float, hop: float, max_win
 
 def _results(recordings, workers: int, *args):
     """``_cut`` over the recordings in their order, in ``workers`` processes with at most ``2 * workers``
-    recordings in flight (each can hold hundreds of MB of samples)."""
+    recordings in flight (each can hold hundreds of MB of samples).
+
+    Workers are spawned, not forked: polars runs a thread pool, and a child forked from a process whose
+    pool has started can deadlock on a lock held by a thread that did not survive the fork.
+    """
     if workers <= 1:
         for rec in recordings:
             yield _cut(rec, *args)
         return
-    with ProcessPoolExecutor(workers) as pool:
+    with ProcessPoolExecutor(workers, mp_context=multiprocessing.get_context("spawn")) as pool:
         pending: deque = deque()
         for rec in recordings:
             pending.append(pool.submit(_cut, rec, *args))
@@ -68,8 +73,9 @@ def prepare_source(source: str, sample_rate: float = 25.0, seconds: float = 30.0
                                                          max_windows, min_periodicity):
         n_rec += 1
         windows.append(w)
-        rows += [{"subject": subject, "start_s": f"{s:.2f}", "hr_bpm": f"{q.hr_bpm:.1f}",
-                  "periodicity": f"{q.periodicity:.3f}"} for s, q in zip(starts, quals, strict=True)]
+        rows += [{"subject": subject, "recording": recording, "start_s": round(float(s), 2),
+                  "hr_bpm": round(float(q.hr_bpm), 1), "periodicity": round(float(q.periodicity), 3)}
+                 for s, q in zip(starts, quals, strict=True)]
         reasons[recording] = len(w)
         sys.stderr.write(f"\r  {source}: {n_rec} recordings, {len(rows):,} windows, {time.time() - started:,.0f} s")
     sys.stderr.write("\n")

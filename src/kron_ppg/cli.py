@@ -34,8 +34,8 @@ def _variants(names: list[str], sample_rate: float, seconds: float) -> list[Path
     out = []
     for name in names:
         path = Path(name)
-        folder = path if (path / "windows.npy").is_file() else variant_dir(name, sample_rate, seconds)
-        if not (folder / "windows.npy").is_file():
+        folder = path if (path / "windows.parquet").is_file() else variant_dir(name, sample_rate, seconds)
+        if not (folder / "windows.parquet").is_file():
             raise typer.BadParameter(f"{folder} is not prepared: run `uv run kron-ppg prepare {name}`")
         out.append(folder)
     return out

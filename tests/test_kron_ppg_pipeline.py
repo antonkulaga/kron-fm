@@ -6,6 +6,7 @@ import json
 import math
 
 import numpy as np
+import polars as pl
 import pytest
 import torch
 
@@ -111,12 +112,26 @@ def test_prepare_writes_a_variant_the_pool_loads(tmp_path):
     assert np.isnan(pool.age[pool.subject == "bidmc/04"]).all()
 
 
+def test_a_variant_is_typed_parquet(tmp_path):
+    fake_bidmc(tmp_path / "in" / "bidmc")
+    prepare_source("bidmc", 25.0, 30.0, folder=tmp_path / "in" / "bidmc", out=tmp_path / "out")
+    windows = pl.read_parquet(tmp_path / "out" / "windows.parquet")
+    assert windows.schema["signal"] == pl.Array(pl.Float16, 750)
+    assert windows.schema["start_s"] == pl.Float64 and windows.schema["subject"] == pl.String
+    assert set(windows["recording"]) <= {"01", "02", "03", "04"}
+    subjects = pl.read_parquet(tmp_path / "out" / "subjects.parquet")
+    assert subjects.columns[:3] == ["subject", "age", "sex"]
+    assert subjects.schema["age"] == pl.Float64 and subjects.schema["sex"] == pl.String
+    assert subjects.filter(pl.col("subject") == "04")["age"].is_null().all()
+    assert not (tmp_path / "out" / "windows.npy").exists()
+
+
 def test_parallel_preparation_writes_what_one_process_writes(tmp_path):
     fake_bidmc(tmp_path / "in" / "bidmc")
     for workers in (1, 2):
         prepare_source("bidmc", folder=tmp_path / "in" / "bidmc", out=tmp_path / f"w{workers}", workers=workers)
-    assert np.array_equal(np.load(tmp_path / "w1" / "windows.npy"), np.load(tmp_path / "w2" / "windows.npy"))
-    assert (tmp_path / "w1" / "windows.csv").read_text() == (tmp_path / "w2" / "windows.csv").read_text()
+    one, two = (pl.read_parquet(tmp_path / f"w{w}" / "windows.parquet") for w in (1, 2))
+    assert one.equals(two)
 
 
 # ---- splits and batches ------------------------------------------------------------------------
@@ -179,7 +194,8 @@ def tiny_variant(folder, n_subjects=24, per_subject=4, seconds=10, fs=25.0):
         for k in range(per_subject):
             seg = x[int((2 + k * seconds) * fs):int((2 + (k + 1) * seconds) * fs)]
             windows.append(robust_scale(seg + 0.01 * rng.standard_normal(len(seg)))[None].astype(np.float32))
-            rows.append({"subject": f"s{s:02d}", "start_s": str(k * seconds), "hr_bpm": "60", "periodicity": "0.9"})
+            rows.append({"subject": f"s{s:02d}", "recording": f"s{s:02d}", "start_s": k * seconds, "hr_bpm": 60.0,
+                         "periodicity": 0.9})
     write_windows(folder, windows, rows, subjects, {"source": "tiny", "sample_rate": fs, "seconds": seconds})
     return folder
 
@@ -197,8 +213,10 @@ def test_pretrain_then_clock_runs_end_to_end_and_writes_its_records(device, tmp_
     metrics = json.loads((tmp_path / "clock" / "metrics.json").read_text())
     assert metrics["test"]["subjects"] >= 2 and "bias" in metrics and "preop_htn" in metrics["outcomes"]["test"]
     assert clock["best_step"] in (2, 4)
-    lines = (tmp_path / "clock" / "predictions.csv").read_text().splitlines()
-    assert lines[0] == "split,subject,age,predicted,gap_corrected,windows" and len(lines) == 25
+    predictions = pl.read_parquet(tmp_path / "clock" / "predictions.parquet")
+    assert predictions.columns == ["split", "subject", "age", "predicted", "gap_corrected", "windows"]
+    assert len(predictions) == 24 and predictions["windows"].sum() == 96
+    assert pl.read_parquet(tmp_path / "clock" / "metrics.parquet")["step"].to_list() == [2, 4]
     model = load_clock(tmp_path / "clock" / "checkpoint.pt", device)
     with torch.no_grad():
         assert model(torch.from_numpy(Pool.load([variant]).window(0))[None].to(device)).shape == (1,)

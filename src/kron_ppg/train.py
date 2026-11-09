@@ -1,12 +1,11 @@
 """Pretraining the kron-ppg encoder and fitting the age clock on prepared windows.
 
-Both write a run folder under ``data/output/runs/kron-ppg/`` by default: ``config.json``, ``metrics.csv``
+Both write a run folder under ``data/output/runs/kron-ppg/`` by default: ``config.json``, ``metrics.parquet``
 and ``checkpoint.pt``; the clock also writes ``metrics.json`` (per-split scores, the bias correction,
-the gap's outcome associations) and ``predictions.csv`` (per subject).
+the gap's outcome associations) and ``predictions.parquet`` (per subject).
 """
 from __future__ import annotations
 
-import csv
 import json
 import math
 import time
@@ -14,6 +13,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
+import polars as pl
 import torch
 import torch.nn.functional as F
 
@@ -129,9 +129,7 @@ def pretrain(a: PretrainArgs) -> dict:
         model.train()
         return total / max(n, 1)
 
-    metrics_path = a.out / "metrics.csv"
-    with metrics_path.open("w", newline="") as fh:
-        csv.writer(fh).writerow(["step", "lr", "train_next", "train_subject", "val_next", "windows_per_s"])
+    log: list[dict] = []
     best = float("inf")
     step, t0, seen = 0, time.time(), 0
     model.train()
@@ -157,9 +155,9 @@ def pretrain(a: PretrainArgs) -> dict:
             if step % a.eval_every == 0 or step == a.steps:
                 val = evaluate()
                 rate = seen / (time.time() - t0)
-                with metrics_path.open("a", newline="") as fh:
-                    csv.writer(fh).writerow([step, opt.param_groups[0]["lr"], next_loss.item(), subj_loss.item(),
-                                             val, round(rate, 1)])
+                log.append({"step": step, "lr": opt.param_groups[0]["lr"], "train_next": next_loss.item(),
+                            "train_subject": subj_loss.item(), "val_next": val, "windows_per_s": round(rate, 1)})
+                pl.DataFrame(log).write_parquet(a.out / "metrics.parquet")
                 print(f"step {step}: next {next_loss.item():.4f}, subject {subj_loss.item():.4f}, "
                       f"val next {val:.4f}, {rate:,.0f} windows/s", flush=True)
                 if val < best:
@@ -275,9 +273,7 @@ def fit_clock(a: ClockArgs) -> dict:
                            for k in ("val", "test")}
         return {"scores": out, "subjects": subj, "gaps": gaps}
 
-    metrics_path = a.out / "metrics.csv"
-    with metrics_path.open("w", newline="") as fh:
-        csv.writer(fh).writerow(["step", "train_l1", "val_mae", "val_r", "test_mae", "test_r"])
+    log: list[dict] = []
     best, best_eval, step = float("inf"), None, 0
     clock.train()
     if a.freeze:
@@ -298,9 +294,9 @@ def fit_clock(a: ClockArgs) -> dict:
         if step % a.eval_every == 0 or step == a.steps:
             ev = evaluate()
             s = ev["scores"]
-            with metrics_path.open("a", newline="") as fh:
-                csv.writer(fh).writerow([step, loss.item(), s["val"]["mae"], s["val"]["r"], s["test"]["mae"],
-                                         s["test"]["r"]])
+            log.append({"step": step, "train_l1": loss.item(), "val_mae": s["val"]["mae"], "val_r": s["val"]["r"],
+                        "test_mae": s["test"]["mae"], "test_r": s["test"]["r"]})
+            pl.DataFrame(log).write_parquet(a.out / "metrics.parquet")
             print(f"step {step}: train l1 {loss.item():.2f}, val MAE {s['val']['mae']:.2f} (r {s['val']['r']:.2f}), "
                   f"test MAE {s['test']['mae']:.2f} (r {s['test']['r']:.2f})", flush=True)
             if s["val"]["mae"] < best:
@@ -310,10 +306,10 @@ def fit_clock(a: ClockArgs) -> dict:
     assert best_eval is not None
     result = {**record, "best_step": best_eval["step"], **best_eval["scores"]}
     (a.out / "metrics.json").write_text(json.dumps(json_safe(result), indent=2) + "\n")
-    with (a.out / "predictions.csv").open("w", newline="") as fh:
-        writer = csv.writer(fh)
-        writer.writerow(["split", "subject", "age", "predicted", "gap_corrected", "windows"])
-        for k, d in best_eval["subjects"].items():
-            for s, (p, g, n) in sorted(d.items()):
-                writer.writerow([k, s, g, round(p, 3), round(best_eval["gaps"][k][s], 3), n])
+    pl.DataFrame(
+        [{"split": k, "subject": s, "age": g, "predicted": p, "gap_corrected": best_eval["gaps"][k][s], "windows": n}
+         for k, d in best_eval["subjects"].items() for s, (p, g, n) in sorted(d.items())],
+        schema={"split": pl.String, "subject": pl.String, "age": pl.Float64, "predicted": pl.Float64,
+                "gap_corrected": pl.Float64, "windows": pl.Int64},
+    ).write_parquet(a.out / "predictions.parquet")
     return result

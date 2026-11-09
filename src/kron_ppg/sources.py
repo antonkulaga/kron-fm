@@ -18,12 +18,11 @@ Only sets that carry a per-subject age and download over plain HTTPS without cre
 """
 from __future__ import annotations
 
-import gzip
 import hashlib
-import io
 import os
-import csv
 from pathlib import Path
+
+import polars as pl
 
 from kron_core.download import (RemoteFile, Source, download_file, link_folder, read_manifest, sha256,
                                 write_manifest)
@@ -40,28 +39,21 @@ GALAXYPPG_URL = "https://zenodo.org/records/14635823/files/GalaxyPPG.zip?downloa
 PULSE_ENV = "PULSE_REPO"
 
 
-def open_text(path: Path):
-    """A text handle on a plain or gzipped file, judged by its first bytes rather than its name."""
-    with path.open("rb") as fh:
-        magic = fh.read(2)
-    if magic == b"\x1f\x8b":
-        return io.TextIOWrapper(gzip.open(path, "rb"), encoding="utf-8-sig", newline="")
-    return path.open(encoding="utf-8-sig", newline="")
-
-
 # ---- VitalDB ---------------------------------------------------------------------------------
 def vitaldb_cases_wanted(n: int, trks: Path, cases: Path) -> list[tuple[int, str]]:
     """``n`` ``(caseid, tid)`` pairs with a PLETH track: one case per person (the first by case id),
     taken in a fixed pseudo-random order of case ids so any ``n`` spreads over the whole set."""
-    with open_text(trks) as fh:
-        tid = {int(r["caseid"]): r["tid"] for r in csv.DictReader(fh) if r["tname"] == VITALDB_TRACK}
-    first: dict[str, int] = {}
-    with open_text(cases) as fh:
-        for r in csv.DictReader(fh):
-            cid = int(r["caseid"])
-            if cid in tid and r.get("age"):
-                first.setdefault(r["subjectid"], cid)
-    chosen = sorted(first.values(), key=lambda c: hashlib.sha256(f"vitaldb/{c}".encode()).hexdigest())
+    tracks = (pl.read_csv(trks, infer_schema=False)
+              .filter(pl.col("tname") == VITALDB_TRACK)
+              .select(pl.col("caseid").cast(pl.Int64), "tid")
+              .unique("caseid", keep="first"))
+    first = (pl.read_csv(cases, infer_schema=False)
+             .filter(pl.col("age").fill_null("") != "")
+             .select(pl.col("caseid").cast(pl.Int64), "subjectid")
+             .join(tracks, on="caseid", how="inner", maintain_order="left")
+             .unique("subjectid", keep="first", maintain_order=True))
+    tid = dict(zip(first["caseid"].to_list(), first["tid"].to_list(), strict=True))
+    chosen = sorted(tid, key=lambda c: hashlib.sha256(f"vitaldb/{c}".encode()).hexdigest())
     return [(c, tid[c]) for c in chosen[:n]]
 
 

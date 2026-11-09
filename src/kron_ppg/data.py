@@ -2,18 +2,21 @@
 
 A prepared variant (``kron-ppg prepare``) holds:
 
-* ``windows.npy``: ``float16`` ``(N, L)``, robust-scaled windows at the variant's rate;
-* ``windows.csv``: per window ``subject``, ``start_s`` (in its recording), ``hr_bpm``, ``periodicity``;
-* ``subjects.csv``: per subject ``subject``, ``age`` (empty when unknown), ``sex`` and any outcome
-  flags the source carries (VitalDB: ``preop_htn``, ``preop_dm``, ``death_inhosp``, ``asa``);
+* ``windows.parquet``: one row per window: ``subject``, ``recording``, ``start_s`` (in its recording),
+  ``hr_bpm``, ``periodicity`` and ``signal``, the robust-scaled window at the variant's rate as a
+  fixed-size ``Array(Float16, L)`` (zstd-compressed);
+* ``subjects.parquet``: per subject ``subject``, ``age`` (null when unknown), ``sex`` and any outcome
+  flags the source carries (VitalDB: ``preop_htn``, ``preop_dm``, ``death_inhosp``, ``asa``); a column
+  whose every value is a number is stored as ``Float64``, any other as text;
 * ``info.json``: the source, rate, window and hop, counts, and the input's ``SOURCE.json`` it was built from.
+
+Both tables are plain parquet, so polars, DuckDB, pyarrow or Hugging Face ``datasets`` read them as they are.
 
 Splits are by subject (:func:`subject_split`), from a hash of the source and subject id, so a person's
 windows never sit on both sides and a split does not move when other subjects are added.
 """
 from __future__ import annotations
 
-import csv
 import hashlib
 import json
 from collections.abc import Iterator, Sequence
@@ -21,6 +24,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
+import polars as pl
 import torch
 
 from kron_core.paths import interim_dir
@@ -50,26 +54,24 @@ class Windows:
     @classmethod
     def load(cls, folder: str | Path) -> "Windows":
         folder = Path(folder)
-        x = np.load(folder / "windows.npy", mmap_mode="r")
-        with (folder / "windows.csv").open(newline="") as fh:
-            rows = list(csv.DictReader(fh))
-        with (folder / "subjects.csv").open(newline="") as fh:
-            subjects = {r["subject"]: r for r in csv.DictReader(fh)}
         info = json.loads((folder / "info.json").read_text())
-        if len(rows) != len(x):
-            raise ValueError(f"{folder}: {len(x)} windows and {len(rows)} rows in windows.csv")
-        return cls(folder, x, np.array([r["subject"] for r in rows]),
-                   np.array([float(r["start_s"]) for r in rows]), subjects, info)
+        table = pl.read_parquet(folder / "windows.parquet")
+        length = int(round(float(info["seconds"]) * float(info["sample_rate"])))
+        x = (table.get_column("signal").to_numpy() if len(table)
+             else np.zeros((0, length), np.float16))
+        subjects = {r["subject"]: r for r in pl.read_parquet(folder / "subjects.parquet").to_dicts()}
+        return cls(folder, x, table.get_column("subject").to_numpy().astype(str),
+                   table.get_column("start_s").to_numpy(), subjects, info)
 
     @property
     def sample_rate(self) -> float:
         return float(self.info["sample_rate"])
 
     def age(self, subject: str) -> float:
-        value = self.subjects.get(subject, {}).get("age", "")
+        value = self.subjects.get(subject, {}).get("age")
         try:
             return float(value)
-        except ValueError:
+        except (TypeError, ValueError):
             return float("nan")
 
     def ages(self) -> np.ndarray:
@@ -78,21 +80,40 @@ class Windows:
         return np.array([lookup.get(s, float("nan")) for s in self.subject])
 
 
+def _subject_frame(subjects: list[dict]) -> pl.DataFrame:
+    """The subject table with ``subject``, ``age`` and ``sex`` first; numeric columns typed as numbers."""
+    names = ["subject", "age", "sex"] + sorted({k for s in subjects for k in s} - {"subject", "age", "sex"})
+    raw = pl.DataFrame({n: [None if s.get(n) in (None, "") else str(s[n]) for s in subjects] for n in names},
+                       schema={n: pl.String for n in names})
+    columns = []
+    for n in names:
+        col = raw.get_column(n)
+        number = col.cast(pl.Float64, strict=False)
+        columns.append(number if n != "subject" and number.null_count() == col.null_count() else col)
+    return pl.DataFrame(columns)
+
+
 def write_windows(folder: Path, windows: Sequence[np.ndarray], rows: list[dict], subjects: list[dict],
                   info: dict) -> dict:
-    """Write a variant; ``windows`` is a list of ``(n_i, L)`` arrays matching ``rows`` in order."""
+    """Write a variant; ``windows`` is a list of ``(n_i, L)`` arrays matching ``rows`` in order, each row
+    holding ``subject``, ``recording``, ``start_s``, ``hr_bpm`` and ``periodicity``."""
     folder.mkdir(parents=True, exist_ok=True)
-    x = np.concatenate(list(windows)) if len(windows) else np.zeros((0, 0))
-    np.save(folder / "windows.npy", x.astype(np.float16))
-    with (folder / "windows.csv").open("w", newline="") as fh:
-        writer = csv.DictWriter(fh, fieldnames=["subject", "start_s", "hr_bpm", "periodicity"])
-        writer.writeheader()
-        writer.writerows(rows)
-    columns = ["subject", "age", "sex"] + sorted({k for s in subjects for k in s} - {"subject", "age", "sex"})
-    with (folder / "subjects.csv").open("w", newline="") as fh:
-        writer = csv.DictWriter(fh, fieldnames=columns, restval="")
-        writer.writeheader()
-        writer.writerows(subjects)
+    length = int(round(float(info["seconds"]) * float(info["sample_rate"])))
+    x = (np.concatenate(list(windows)) if len(windows) else np.zeros((0, length))).astype(np.float16)
+    if len(x) != len(rows):
+        raise ValueError(f"{len(x)} windows and {len(rows)} rows")
+    table = pl.DataFrame({
+        "subject": pl.Series([str(r["subject"]) for r in rows], dtype=pl.String),
+        "recording": pl.Series([str(r["recording"]) for r in rows], dtype=pl.String),
+        "start_s": pl.Series([r["start_s"] for r in rows], dtype=pl.Float64),
+        "hr_bpm": pl.Series([r["hr_bpm"] for r in rows], dtype=pl.Float32),
+        "periodicity": pl.Series([r["periodicity"] for r in rows], dtype=pl.Float32),
+        "signal": pl.Series(x.reshape(len(x), length)).cast(pl.Array(pl.Float16, length)),
+    })
+    table.write_parquet(folder / "windows.parquet", compression="zstd", row_group_size=16_384)
+    _subject_frame(subjects).write_parquet(folder / "subjects.parquet", compression="zstd")
+    for stale in ("windows.npy", "windows.csv", "subjects.csv"):  # the format before parquet
+        (folder / stale).unlink(missing_ok=True)
     info = {**info, "windows": int(len(x)), "subjects": len(subjects),
             "subjects_with_windows": len({r["subject"] for r in rows})}
     (folder / "info.json").write_text(json.dumps(info, indent=2) + "\n")
