@@ -50,7 +50,9 @@ def _float(value: str) -> float:
 
 
 def _values(series: pl.Series) -> np.ndarray:
-    """A numeric column as float64, nulls and unparsable cells as NaN."""
+    """A numeric column as float64 (text cells stripped of spaces first), nulls and unparsable cells as NaN."""
+    if series.dtype == pl.String:
+        series = series.str.strip_chars()
     return series.cast(pl.Float64, strict=False).fill_null(float("nan")).to_numpy()
 
 

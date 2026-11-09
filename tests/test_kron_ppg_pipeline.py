@@ -132,7 +132,7 @@ def test_parallel_preparation_writes_what_one_process_writes(tmp_path):
     for workers in (1, 2):
         prepare_source("bidmc", folder=tmp_path / "in" / "bidmc", out=tmp_path / f"w{workers}", workers=workers)
     one, two = (pl.read_parquet(tmp_path / f"w{w}" / "windows.parquet") for w in (1, 2))
-    assert one.equals(two)
+    assert len(one) >= 8 and one.equals(two)
 
 
 # ---- splits and batches ------------------------------------------------------------------------
