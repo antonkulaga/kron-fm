@@ -11,6 +11,7 @@ NX-AI's chunkwise Triton kernels, which are vendored here.
 | `kron_core` | The vendored KronLSTM layer and kernels, the causal residual block and state cache, a bidirectional block and a document-masked attention block, packed-sequence helpers, a CPU stand-in for tests | working |
 | `krontime` | Time-series models. First member: the glucose forecaster from [glucose_forecasting_metabonet](../glucose_forecasting_metabonet) | model ported; trainer still in the glucose repo |
 | `kron_dna` | A masked-language model over coding DNA, tokenized by codon | skeleton: data, losses, model and trainer run end to end; nothing pretrained yet |
+| `kron_ppg` | A causal, streaming KronLSTM encoder over raw PPG, with a PPG aging clock and an ONNX streaming graph for a phone | package, tests and export work; no clock result yet |
 
 ## Setup
 
@@ -72,10 +73,60 @@ loss.
   canary, k-mer/GC/CAI baselines, and a random-init twin;
 - multi-GPU training and gradient checkpointing.
 
+## kron-ppg
+
+A causal, streaming KronLSTM encoder over raw photoplethysmography (PPG), with a PPG aging clock as its
+first task. The design and its sources are in
+[reports/PPG foundation models and aging clocks 2026.md](reports/PPG%20foundation%20models%20and%20aging%20clocks%202026.md).
+It follows the earlier PPG work in [pulse-exploration](../pulse-exploration) (`docs/ppg-age.md`).
+
+- **Input:** PPG at 25 Hz, the rate of the watch's no-setup tier. It is band-passed to 0.5–8 Hz,
+  robust-scaled per 30 s window, and cut into 0.2 s patches; each patch is one token.
+- **Encoder:** `kron_core.blocks.KronLSTMBlock` layers with `LayerStates`, so a stream read in chunks
+  equals the stream read whole. The default has 5.85M parameters (d_model 256, 6 layers);
+  `uv run kron-ppg info` prints the count of any configuration.
+- **Pretraining:** `next` predicts the next 1 s of patches from every step (GPT-PPG's objective, with
+  an L1 loss). `next+subject` adds a contrast in which windows of the same person are positives
+  (Apple's PPG foundation model).
+- **Age clock:** an MLP reads the mean hidden state. It is scored per person, with a bias-corrected
+  age gap, and that gap's AUC is reported for every outcome flag the source carries (VitalDB:
+  hypertension, diabetes, ASA ≥ 3, in-hospital death). Outcome evidence, not MAE, is what makes a
+  clock worth having.
+- **ONNX:** `stream.onnx` is one graph. It takes a 5 s chunk, every layer's memory and the running
+  pool, and returns the age so far with the updated state. It runs through
+  `kron_core.onnx.PlainKronMixer`. The export checks it against PyTorch in ONNX Runtime and, on a
+  GPU, against the Triton kernels.
+
+```bash
+uv run kron-data download bidmc galaxyppg vitaldb   # vitaldb: 200 cases (KRON_PPG_VITALDB_CASES), ~0.9 GB
+uv run kron-ppg download vitaldb --cases 1000       # more VitalDB, one case per person
+uv run kron-ppg prepare bidmc vitaldb galaxyppg     # -> data/interim/ppg/<source>/fs25-w30s
+uv run kron-ppg pretrain vitaldb galaxyppg bidmc --objective next+subject --steps 5000
+uv run kron-ppg clock vitaldb --encoder data/output/runs/kron-ppg/<pretrain run>/checkpoint.pt
+uv run kron-ppg evaluate data/output/runs/kron-ppg/<clock run> bidmc
+uv run kron-ppg export data/output/runs/kron-ppg/<clock run>   # -> <run>/onnx/stream.onnx + stream.json
+```
+
+| Source | What | Licence |
+|---|---|---|
+| `vitaldb` | surgical finger PPG at 500 Hz, with age and outcome flags; 6,157 cases, about 4 MB each | CC BY-NC-SA 4.0 (VitalDB API terms) |
+| `bidmc` | 53 ICU recordings of 8 min, finger PPG at 125 Hz, with ages | ODC-By 1.0 |
+| `galaxyppg` | Galaxy Watch5 PPG at 25 Hz from 24 people aged 20–29; linked from pulse-exploration when present | CC BY 4.0 |
+
+A PPG age is a within-person trend, never a biological age. It must be shown with the run's error
+band.
+
+Status: the package, its tests (CPU stand-in and GPU kernels) and the ONNX export work, and smoke runs on
+30 VitalDB cases ran end to end. No clock result is reported yet. The first real run needs a few hundred
+to a few thousand VitalDB cases, and then baselines on the same subject splits (age and sex alone,
+pulse-shape features, AI-PPG Age).
+
 ## Research
 
 - [reports/Small DNA foundation models 2026.md](reports/Small%20DNA%20foundation%20models%202026.md):
   which small 2025–2026 DNA models matter for kron-dna, and the recommended setup.
+- [reports/PPG foundation models and aging clocks 2026.md](reports/PPG%20foundation%20models%20and%20aging%20clocks%202026.md):
+  PPG foundation models, published PPG age clocks, open datasets with ages, and kron-ppg's design.
 - [research_notes/](research_notes/): the notes behind it, with each claim tagged by its source.
 
 ## Vendored code
