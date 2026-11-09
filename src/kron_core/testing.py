@@ -12,6 +12,11 @@ own logic (padding, packing, decode layouts, directions) can be tested on the CP
 Its output at a step is a causal decayed sum, ``out_t = sum over read steps s <= t of 0.98 ** (read
 steps in (s, t]) * v_s``, written as a matrix: quadratic in length, so keep test sequences short.
 Install it with ``monkeypatch.setattr(kron_core.blocks, "kronlstm_mixer", CausalMixer)``.
+
+With ``past_key_values`` (a :class:`kron_core.blocks.LayerStates`) it also carries its memory as the
+layer does: the decayed sum ``S`` ``(B, D)`` is read as the starting memory (``0.98 ** (read steps in
+[0, t]) * S`` joins every output) and left holding the sum at the piece's end, as ``recurrent_state``.
+So a stream read in pieces gives what it gives read whole, on the CPU too.
 """
 from __future__ import annotations
 
@@ -21,12 +26,15 @@ import torch
 class CausalMixer(torch.nn.Module):
     def __init__(self, d_model: int, n_heads: int, layer_idx: int) -> None:
         super().__init__()
+        self.layer_idx = layer_idx
         self.inp = torch.nn.Linear(d_model, d_model)
         self.out = torch.nn.Linear(d_model, d_model)
         # the glucose family's checkpoint fingerprint looks for A_log
         self.A_log = torch.nn.Parameter(torch.zeros(n_heads))
 
-    def forward(self, h, attention_mask=None, cu_seqlens=None, **_):
+    def forward(self, h, attention_mask=None, cu_seqlens=None, past_key_values=None, **_):
+        if past_key_values is not None and cu_seqlens is None:
+            return self._carried(h, attention_mask, past_key_values)
         batch, steps = h.shape[:2]
         read = (torch.ones(batch, steps, dtype=torch.bool, device=h.device) if attention_mask is None
                 else attention_mask.bool())
@@ -43,3 +51,24 @@ class CausalMixer(torch.nn.Module):
         same = segment.unsqueeze(2) == segment.unsqueeze(1)
         weight = 0.98 ** lag * (causal & same & read.unsqueeze(1) & read.unsqueeze(2))
         return self.out(weight @ self.inp(h)) * read.unsqueeze(-1), None, None
+
+    def _carried(self, h, attention_mask, states):
+        batch, steps = h.shape[:2]
+        read = (torch.ones(batch, steps, dtype=torch.bool, device=h.device) if attention_mask is None
+                else attention_mask.bool())
+        values = self.inp(h)
+        count = read.to(torch.int64).cumsum(dim=1)
+        lag = (count.unsqueeze(2) - count.unsqueeze(1)).clamp(min=0).to(h.dtype)
+        causal = torch.ones(steps, steps, dtype=torch.bool, device=h.device).tril()
+        weight = 0.98 ** lag * (causal & read.unsqueeze(1) & read.unsqueeze(2))
+        summed = weight @ values
+        end_lag = (count[:, -1:] - count).to(h.dtype)  # read steps after s, up to the piece's end
+        end = ((0.98 ** end_lag) * read).unsqueeze(-1).mul(values).sum(1)
+        prior = states[self.layer_idx]
+        start = None if prior is None else prior.get("recurrent_state")
+        if start is not None:
+            start = start.to(h.dtype)
+            summed = summed + (0.98 ** count.to(h.dtype)).unsqueeze(-1) * start.unsqueeze(1)
+            end = end + (0.98 ** count[:, -1].to(h.dtype)).unsqueeze(-1) * start
+        states.update(self.layer_idx, recurrent_state=end, conv_state=None)
+        return self.out(summed) * read.unsqueeze(-1), None, None

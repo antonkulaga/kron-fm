@@ -1,0 +1,139 @@
+"""PPG datasets kron-ppg can download, into ``data/input/ppg/<name>``, each with a ``SOURCE.json``.
+
+Only sets that carry a per-subject age and download over plain HTTPS without credentials are here
+(``reports/PPG foundation models and aging clocks 2026.md`` lists the rest and why they are not):
+
+* ``bidmc``: 53 ICU recordings of 8 min, finger PPG at 125 Hz, ages 19-90+ (ODC-By 1.0). Small: the
+  smoke test and an external check.
+* ``vitaldb``: surgical finger PPG (``SNUADC/PLETH``, 500 Hz) from the VitalDB open API, with age, sex
+  and outcome flags for 6,388 cases; 6,157 have the PLETH track, about 4 MB gzipped per case. The
+  only open set large enough to train an age clock. A first download takes ``KRON_PPG_VITALDB_CASES``
+  cases (default 200, one per person, spread over case ids); ``kron-ppg download vitaldb --cases N``
+  takes more, and a later run only adds what is missing. The API's terms are CC BY-NC-SA 4.0 under
+  the VitalDB data use agreement (research use); PhysioNet's full copy (95 GB of ``.vital`` files) is
+  CC BY 4.0.
+* ``galaxyppg``: Galaxy Watch5 25 Hz green PPG (plus E4 64 Hz) from 24 people aged 20-29 (CC BY 4.0).
+  Narrow in age, so it is wrist pretraining data and a device check, not a clock set. When the
+  pulse-exploration checkout already holds it, the folder is linked rather than downloaded again.
+"""
+from __future__ import annotations
+
+import gzip
+import hashlib
+import io
+import os
+import csv
+from pathlib import Path
+
+from kron_core.download import (RemoteFile, Source, download_file, link_folder, read_manifest,
+                                write_manifest)
+from kron_core.paths import repo_root
+
+DOMAIN = "ppg"
+
+BIDMC = "https://physionet.org/files/bidmc/1.0.0/bidmc_csv"
+VITALDB_API = "https://api.vitaldb.net"
+VITALDB_TRACK = "SNUADC/PLETH"
+VITALDB_CASES_ENV = "KRON_PPG_VITALDB_CASES"
+VITALDB_DEFAULT_CASES = 200
+GALAXYPPG_URL = "https://zenodo.org/records/14635823/files/GalaxyPPG.zip?download=1"
+PULSE_ENV = "PULSE_REPO"
+
+
+def open_text(path: Path):
+    """A text handle on a plain or gzipped file, judged by its first bytes rather than its name."""
+    with path.open("rb") as fh:
+        magic = fh.read(2)
+    if magic == b"\x1f\x8b":
+        return io.TextIOWrapper(gzip.open(path, "rb"), encoding="utf-8-sig", newline="")
+    return path.open(encoding="utf-8-sig", newline="")
+
+
+# ---- VitalDB ---------------------------------------------------------------------------------
+def vitaldb_cases_wanted(n: int, trks: Path, cases: Path) -> list[tuple[int, str]]:
+    """``n`` ``(caseid, tid)`` pairs with a PLETH track: one case per person (the first by case id),
+    taken in a fixed pseudo-random order of case ids so any ``n`` spreads over the whole set."""
+    with open_text(trks) as fh:
+        tid = {int(r["caseid"]): r["tid"] for r in csv.DictReader(fh) if r["tname"] == VITALDB_TRACK}
+    first: dict[str, int] = {}
+    with open_text(cases) as fh:
+        for r in csv.DictReader(fh):
+            cid = int(r["caseid"])
+            if cid in tid and r.get("age"):
+                first.setdefault(r["subjectid"], cid)
+    chosen = sorted(first.values(), key=lambda c: hashlib.sha256(f"vitaldb/{c}".encode()).hexdigest())
+    return [(c, tid[c]) for c in chosen[:n]]
+
+
+def fetch_vitaldb(source: Source, folder: Path, force: bool, cases: int | None = None) -> dict:
+    """The case table, the track list and ``cases`` PLETH tracks as ``pleth/<caseid>.csv.gz``."""
+    n = cases if cases is not None else int(os.environ.get(VITALDB_CASES_ENV, VITALDB_DEFAULT_CASES))
+    folder.mkdir(parents=True, exist_ok=True)
+    old = {e["file"]: e for e in (read_manifest(folder) or {}).get("files", [])}
+
+    def get(url: str, name: str) -> dict:
+        dest = folder / name
+        if dest.exists() and not force and name in old and old[name].get("bytes") == dest.stat().st_size:
+            return old[name]
+        return {**download_file(url, dest), "file": name}
+
+    entries = [get(f"{VITALDB_API}/cases", "cases.csv.gz"), get(f"{VITALDB_API}/trks", "trks.csv.gz")]
+    wanted = vitaldb_cases_wanted(n, folder / "trks.csv.gz", folder / "cases.csv.gz")
+    for i, (cid, tid) in enumerate(wanted, 1):
+        print(f"  [{i}/{len(wanted)}] case {cid}")
+        entries.append(get(f"{VITALDB_API}/{tid}", f"pleth/{cid:04d}.csv.gz"))
+    # keep tracks a larger earlier download fetched
+    have = {e["file"] for e in entries}
+    entries += [e for name, e in old.items() if name not in have and (folder / name).exists()]
+    return write_manifest(folder, source, entries, {"vitaldb_track": VITALDB_TRACK, "cases_requested": n})
+
+
+# ---- GalaxyPPG -------------------------------------------------------------------------------
+def pulse_repo() -> Path:
+    if os.environ.get(PULSE_ENV):
+        return Path(os.environ[PULSE_ENV]).expanduser()
+    return (repo_root() or Path.cwd()).parent / "pulse-exploration"
+
+
+def fetch_galaxyppg(source: Source, folder: Path, force: bool) -> dict:
+    local = pulse_repo() / "data" / "external" / "galaxyppg"
+    if (local / "GalaxyPPG.zip").is_file() and not force:
+        return link_folder(source, folder, local, "")
+    folder.mkdir(parents=True, exist_ok=True)
+    entry = download_file(GALAXYPPG_URL, folder / "GalaxyPPG.zip", source.files[0].size)
+    return write_manifest(folder, source, [entry])
+
+
+SOURCES: dict[str, Source] = {
+    s.name: s for s in (
+        Source("bidmc", DOMAIN,
+               "BIDMC PPG and Respiration: 53 ICU recordings of 8 min, finger PPG 125 Hz, age and sex per record",
+               tuple(RemoteFile(f"{BIDMC}/bidmc_{i:02d}_{kind}") for i in range(1, 54)
+                     for kind in ("Signals.csv", "Fix.txt")),
+               "ODC-By 1.0",
+               "Pimentel et al. (2016) Toward a robust estimation of respiratory rate from pulse oximeters. "
+               "IEEE Trans Biomed Eng 64(8):1914-1923. Goldberger et al. (2000) PhysioNet. Circulation 101:e215.",
+               "https://physionet.org/content/bidmc/1.0.0/",
+               {"format": "csv", "fs": 125, "signal_column": "PLETH", "age_file": "bidmc_NN_Fix.txt",
+                "approx_mb": 70}),
+        Source("vitaldb", DOMAIN,
+               "VitalDB surgical finger PPG (SNUADC/PLETH 500 Hz) with age, sex and outcome flags; "
+               f"{VITALDB_DEFAULT_CASES} cases by default (KRON_PPG_VITALDB_CASES, or kron-ppg download --cases)",
+               (), "CC BY-NC-SA 4.0 under the VitalDB data use agreement (API); PhysioNet copy CC BY 4.0",
+               "Lee et al. (2022) VitalDB, a high-fidelity multi-parameter vital signs database in surgical "
+               "patients. Sci Data 9:279.",
+               "https://vitaldb.net/dataset/",
+               {"format": "csv.gz", "fs": 500, "track": VITALDB_TRACK, "cases_with_pleth": 6157,
+                "approx_mb_per_case": 4.3, "approx_mb": round(4.3 * VITALDB_DEFAULT_CASES)},
+               fetch=fetch_vitaldb),
+        Source("galaxyppg", DOMAIN,
+               "GalaxyPPG: Galaxy Watch5 25 Hz green PPG, E4 BVP 64 Hz and Polar H10 ECG from 24 people aged 20-29; "
+               "linked from pulse-exploration when present",
+               (RemoteFile(GALAXYPPG_URL, "GalaxyPPG.zip", 481_594_233),),
+               "CC BY 4.0",
+               "Park, Zheng & Lee (2025) GalaxyPPG: a multi-device PPG dataset. Sci Data. Zenodo 14635823.",
+               "https://zenodo.org/records/14635823",
+               {"format": "zip", "fs": 25, "invert": True, "approx_mb": 482},
+               fetch=fetch_galaxyppg),
+    )
+}
