@@ -266,3 +266,43 @@ def test_the_hub_export_keeps_the_training_split(tmp_path):
     assert card.startswith("---\nlicense:\n- odc-by\n") and "config_name: bidmc_125hz" in card
     assert "path: bidmc/125hz/test-*.parquet" in card and "config_name: bidmc_subjects" in card
     assert "hf://datasets/someone/ppg/bidmc/25hz" in card and "ODC Attribution License" in card
+
+
+def test_trait_values_from_the_subject_table():
+    from kron_ppg.traits import TRAITS, trait_value
+
+    row = {"age": 61.0, "bmi": None, "preop_htn": 1, "preop_dm": 0, "asa": 2, "sex": "F"}
+    assert trait_value(TRAITS["age"], row) == 61.0 and math.isnan(trait_value(TRAITS["bmi"], row))
+    assert trait_value(TRAITS["preop_htn"], row) == 1.0 and trait_value(TRAITS["preop_dm"], row) == 0.0
+    assert trait_value(TRAITS["asa_ge3"], row) == 0.0 and trait_value(TRAITS["asa_ge3"], {"asa": "3"}) == 1.0
+    assert trait_value(TRAITS["sex_male"], row) == 0.0 and math.isnan(trait_value(TRAITS["sex_male"], {"sex": "?"}))
+
+
+def test_the_logistic_fit_separates_a_shifted_class():
+    from kron_ppg.traits import fit_logistic
+
+    rng = np.random.default_rng(0)
+    x = np.r_[rng.normal(-1, 1, 200), rng.normal(1, 1, 200)][:, None]
+    y = np.r_[np.zeros(200), np.ones(200)]
+    w = fit_logistic(x, y)
+    assert w[1] > 1.0 and abs(w[0]) < 0.3
+    assert auc(np.column_stack([np.ones(400), x]) @ w, y.astype(bool)) > 0.85
+
+
+def test_traits_train_and_score_end_to_end(tmp_path, device):
+    from kron_ppg.traits import TraitArgs, fit_traits
+
+    variant = tiny_variant(tmp_path / "tiny")
+    result = fit_traits(TraitArgs([variant], tmp_path / "traits", None, ("age", "preop_htn", "sex_male"),
+                                  KronPPGConfig(**SMALL), batch_size=8, steps=4, eval_every=2, device=str(device),
+                                  num_workers=0))
+    s = result["scores"]
+    assert s["age"]["kind"] == "regression" and math.isfinite(s["age"]["test"]["mae"])
+    assert s["preop_htn"]["test"]["positive"] + s["preop_htn"]["test"]["negative"] == result["subjects"]["test"]
+    assert "auc_age_plus_ppg" in s["preop_htn"]["test"] and "auc_age" in s["preop_htn"]["val"]
+    assert s["sex_male"]["test"]["positive"] == 0  # every tiny subject is F: the AUC is undefined, not a crash
+    assert "preop_htn" in s["age"]["gap_outcomes_test"]
+    predictions = pl.read_parquet(tmp_path / "traits" / "predictions.parquet")
+    assert {"age", "age_predicted", "preop_htn_predicted"} <= set(predictions.columns)
+    assert len(predictions) == result["subjects"]["val"] + result["subjects"]["test"]
+    assert (tmp_path / "traits" / "checkpoint.pt").is_file()

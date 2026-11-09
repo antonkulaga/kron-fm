@@ -5,6 +5,7 @@
     uv run kron-ppg prepare bidmc vitaldb                # -> data/interim/ppg/<source>/fs25-w30s
     uv run kron-ppg pretrain vitaldb bidmc --steps 5000  # -> data/output/runs/kron-ppg/pretrain-...
     uv run kron-ppg clock vitaldb --encoder <run>/checkpoint.pt
+    uv run kron-ppg traits vitaldb --encoder <run>/checkpoint.pt   # age, BMI, hypertension, diabetes, ASA, sex
     uv run kron-ppg evaluate <clock run> bidmc           # a trained clock on another source
     uv run kron-ppg export <clock run>                   # stream.onnx for a phone, checked with ONNX Runtime
     uv run kron-ppg info --d-model 256 --n-layers 6
@@ -138,6 +139,32 @@ def clock(sources: list[str] = typer.Argument(..., help="prepared sources with a
     from kron_ppg.clock import json_safe
 
     typer.echo(json.dumps(json_safe({k: result[k] for k in ("best_step", "val", "test", "outcomes")}), indent=2))
+    typer.echo(f"written to {out}")
+
+
+@app.command()
+def traits(sources: list[str] = typer.Argument(..., help="prepared sources with a subject table"),
+           encoder: Path | None = typer.Option(None, help="a pretraining checkpoint; none trains from scratch"),
+           freeze: bool = typer.Option(False, help="train the head only (a probe of the pretrained encoder)"),
+           names: str = typer.Option("age,bmi,preop_htn,preop_dm,asa_ge3,sex_male", "--traits",
+                                     help="comma-separated traits; must include age"),
+           out: Path | None = typer.Option(None, help="run folder (default data/output/runs/kron-ppg/...)"),
+           sample_rate: float = 25.0, seconds: float = 30.0, patch: int = 5, d_model: int = 256, n_heads: int = 4,
+           n_layers: int = 6, ff_units: int = 768, dropout: float = 0.1,
+           batch_size: int = 128, steps: int = 6_000, lr: float = 3e-4, head_lr: float = 1e-3,
+           eval_every: int = 500, seed: int = 0, device: str = "cuda") -> None:
+    """Predict age-related traits with one multi-task head; scores each against age alone."""
+    from kron_ppg.clock import json_safe
+    from kron_ppg.traits import TraitArgs, fit_traits
+
+    folders = _variants(sources, sample_rate, seconds)
+    tag = "probe" if freeze else ("finetune" if encoder else "scratch")
+    out = out or runs_dir(MODEL) / run_name("traits", tag, *sources)
+    config = _config(sample_rate, patch, d_model, n_heads, n_layers, ff_units, dropout, 5)
+    result = fit_traits(TraitArgs(folders, out, encoder, tuple(t.strip() for t in names.split(",") if t.strip()),
+                                  config, freeze, batch_size, steps, lr, head_lr, eval_every=eval_every, seed=seed,
+                                  device=device))
+    typer.echo(json.dumps(json_safe({k: result[k] for k in ("best_step", "scores")}), indent=2))
     typer.echo(f"written to {out}")
 
 
