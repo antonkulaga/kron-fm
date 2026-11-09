@@ -182,6 +182,8 @@ def train(data: str = typer.Argument(..., help="a prepared source name or a dire
     started = time.time()
     torch.manual_seed(seed)
     dev = torch.device(device)
+    if dev.type == "cuda":
+        torch.zeros(1, device=dev)   # hold the card from the start: a shared node's launchers read a card with no process as free
     name = data if data in SOURCES else Path(data).name
     data_dir = resolve_packed(data)
     out = out or runs_dir("kron-dna") / run_name(name, objective)
@@ -277,8 +279,9 @@ def train(data: str = typer.Argument(..., help="a prepared source name or a dire
                 with metrics_path.open("a", newline="") as fh:
                     csv.writer(fh).writerow([step, opt.param_groups[0]["lr"], loss.item(), m["val_loss"],
                                              m["val_bits_per_codon"], round(rate), round(hours, 4)])
+                peak = f", peak {torch.cuda.max_memory_allocated(dev) / 2**30:.1f} GiB" if dev.type == "cuda" else ""
                 typer.echo(f"step {step}: train {loss.item():.4f}, val {m['val_loss']:.4f}, "
-                           f"{m['val_bits_per_codon']:.3f} bits/codon, {rate:,.0f} tokens/s, {hours:.2f} h")
+                           f"{m['val_bits_per_codon']:.3f} bits/codon, {rate:,.0f} tokens/s, {hours:.2f} h{peak}")
             if step % checkpoint_every == 0 or stop:
                 hours = hours_before + (time.time() - t0) / 3600
                 _save_atomic({"model": model.state_dict(), "optimizer": opt.state_dict(), "config": config.to_dict(),

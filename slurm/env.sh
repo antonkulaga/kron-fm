@@ -18,6 +18,8 @@ export KRON_CPU_CPUS="${KRON_CPU_CPUS:-8}" KRON_CPU_MEM="${KRON_CPU_MEM:-64G}"
 export KRON_TIME="${KRON_TIME:-}"
 export LOG_DIR="${LOG_DIR:-$REPO/slurm/logs}"
 export PYTHONUNBUFFERED=1
+# Fewer out-of-memory failures from fragmentation when a model sits near a card's limit.
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 # uv's cache and Python builds go wherever env.local.sh points them (a large scratch filesystem).
 [ -n "${UV_CACHE_DIR:-}" ] && export UV_CACHE_DIR
 [ -n "${UV_PYTHON_INSTALL_DIR:-}" ] && export UV_PYTHON_INSTALL_DIR
