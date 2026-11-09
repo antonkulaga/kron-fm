@@ -89,16 +89,9 @@ def auc(score: np.ndarray, positive: np.ndarray) -> float:
     n_pos, n_neg = int(positive.sum()), int((~positive).sum())
     if n_pos == 0 or n_neg == 0:
         return float("nan")
-    order = np.argsort(score, kind="mergesort")
-    ranks = np.empty(len(score))
-    sorted_scores = score[order]
-    i = 0
-    while i < len(score):
-        j = i
-        while j + 1 < len(score) and sorted_scores[j + 1] == sorted_scores[i]:
-            j += 1
-        ranks[order[i:j + 1]] = (i + j) / 2 + 1
-        i = j + 1
+    from scipy.stats import rankdata
+
+    ranks = rankdata(score)  # ties share their mean rank
     return float((ranks[positive].sum() - n_pos * (n_pos + 1) / 2) / (n_pos * n_neg))
 
 

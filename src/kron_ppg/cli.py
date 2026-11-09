@@ -6,6 +6,8 @@
     uv run kron-ppg pretrain vitaldb bidmc --steps 5000  # -> data/output/runs/kron-ppg/pretrain-...
     uv run kron-ppg clock vitaldb --encoder <run>/checkpoint.pt
     uv run kron-ppg traits vitaldb --encoder <run>/checkpoint.pt   # age, BMI, hypertension, diabetes, ASA, sex
+    uv run kron-ppg download vitaldb --extras vitals --extras ecg --workers 6   # watch-like tracks too
+    uv run kron-ppg vitals vitaldb                       # per-window BP, SpO2, HR, HRV, pulse arrival time
     uv run kron-ppg evaluate <clock run> bidmc           # a trained clock on another source
     uv run kron-ppg export <clock run>                   # stream.onnx for a phone, checked with ONNX Runtime
     uv run kron-ppg info --d-model 256 --n-layers 6
@@ -25,6 +27,7 @@ import typer
 
 from kron_core.paths import input_dir, run_name, runs_dir
 from kron_ppg.model import KronPPG, KronPPGConfig
+from kron_ppg.traits import DEFAULT_TRAITS
 
 app = typer.Typer(add_completion=False, no_args_is_help=True)
 MODEL = "kron-ppg"
@@ -52,6 +55,9 @@ def _config(sample_rate: float, patch: int, d_model: int, n_heads: int, n_layers
 @app.command()
 def download(names: list[str] = typer.Argument(..., help="bidmc, vitaldb, galaxyppg"),
              cases: int | None = typer.Option(None, help="VitalDB: how many cases (one per person)"),
+             extras: list[str] = typer.Option([], help="VitalDB: further track groups for the same cases: "
+                                              "ecg (lead II, 500 Hz), vitals (HR, SpO2, BP, temperature)"),
+             workers: int = typer.Option(1, help="VitalDB: downloads at once"),
              force: bool = typer.Option(False, help="download again even when the files are present")) -> None:
     """Download PPG sources into data/input/ppg/<name> with SOURCE.json."""
     from kron_core.download import fetch_source
@@ -63,7 +69,7 @@ def download(names: list[str] = typer.Argument(..., help="bidmc, vitaldb, galaxy
         source = SOURCES[name]
         typer.echo(f"{name} -> {source.folder(input_dir())}")
         if name == "vitaldb":
-            record = fetch_vitaldb(source, source.folder(input_dir()), force, cases)
+            record = fetch_vitaldb(source, source.folder(input_dir()), force, cases, tuple(extras), workers)
         else:
             record = fetch_source(source, input_dir(), force=force)
         typer.echo(f"  {len(record.get('files', []))} files" if "files" in record else f"  {record}")
@@ -122,6 +128,7 @@ def pretrain(sources: list[str] = typer.Argument(..., help="prepared sources (or
 def clock(sources: list[str] = typer.Argument(..., help="prepared sources with ages"),
           encoder: Path | None = typer.Option(None, help="a pretraining checkpoint; none trains from scratch"),
           freeze: bool = typer.Option(False, help="train the head only (a probe of the pretrained encoder)"),
+          healthy_only: bool = typer.Option(False, help="learn age from healthy people only; test on everyone"),
           out: Path | None = typer.Option(None, help="run folder (default data/output/runs/kron-ppg/...)"),
           sample_rate: float = 25.0, seconds: float = 30.0, patch: int = 5, d_model: int = 256, n_heads: int = 4,
           n_layers: int = 6, ff_units: int = 768, dropout: float = 0.1,
@@ -135,7 +142,7 @@ def clock(sources: list[str] = typer.Argument(..., help="prepared sources with a
     out = out or runs_dir(MODEL) / run_name("clock", tag, *sources)
     config = _config(sample_rate, patch, d_model, n_heads, n_layers, ff_units, dropout, 5)
     result = fit_clock(ClockArgs(folders, out, encoder, config, freeze, batch_size, steps, lr, head_lr,
-                                 eval_every=eval_every, seed=seed, device=device))
+                                 eval_every=eval_every, seed=seed, device=device, healthy_only=healthy_only))
     from kron_ppg.clock import json_safe
 
     typer.echo(json.dumps(json_safe({k: result[k] for k in ("best_step", "val", "test", "outcomes")}), indent=2))
@@ -146,8 +153,8 @@ def clock(sources: list[str] = typer.Argument(..., help="prepared sources with a
 def traits(sources: list[str] = typer.Argument(..., help="prepared sources with a subject table"),
            encoder: Path | None = typer.Option(None, help="a pretraining checkpoint; none trains from scratch"),
            freeze: bool = typer.Option(False, help="train the head only (a probe of the pretrained encoder)"),
-           names: str = typer.Option("age,bmi,preop_htn,preop_dm,asa_ge3,sex_male", "--traits",
-                                     help="comma-separated traits; must include age"),
+           names: str = typer.Option(",".join(DEFAULT_TRAITS), "--traits",
+                                     help="comma-separated traits; must include age (a trait with no labels is skipped)"),
            out: Path | None = typer.Option(None, help="run folder (default data/output/runs/kron-ppg/...)"),
            sample_rate: float = 25.0, seconds: float = 30.0, patch: int = 5, d_model: int = 256, n_heads: int = 4,
            n_layers: int = 6, ff_units: int = 768, dropout: float = 0.1,
@@ -166,6 +173,15 @@ def traits(sources: list[str] = typer.Argument(..., help="prepared sources with 
                                   device=device))
     typer.echo(json.dumps(json_safe({k: result[k] for k in ("best_step", "scores")}), indent=2))
     typer.echo(f"written to {out}")
+
+
+@app.command()
+def vitals(source: str = typer.Argument("vitaldb"), sample_rate: float = 25.0, seconds: float = 30.0,
+           workers: int | None = typer.Option(None, help="parallel processes (default: CPUs, at most 16)")) -> None:
+    """Per-window vitals from VitalDB's ECG and monitor tracks -> vitals.parquet beside the windows."""
+    from kron_ppg.vitals import prepare_vitals
+
+    typer.echo(json.dumps(prepare_vitals(source, sample_rate, seconds, workers=workers), indent=2))
 
 
 @app.command()

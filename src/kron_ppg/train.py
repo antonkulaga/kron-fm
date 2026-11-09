@@ -186,6 +186,10 @@ class ClockArgs:
     seed: int = 0
     device: str = "cuda"
     num_workers: int = 2
+    #: learn age from healthy people only (ASA 1, no hypertension or diabetes; :mod:`kron_ppg.traits`), the
+    #: usual aging-clock design: train and validation (which fits the bias) are healthy, test is everyone,
+    #: so the test gap says whether the unhealthy read older than healthy aging predicts
+    healthy_only: bool = False
 
 
 def _eval_index(pool: Pool, idx: np.ndarray, per_subject_cap: int, seed: int) -> np.ndarray:
@@ -224,6 +228,12 @@ def fit_clock(a: ClockArgs) -> dict:
     _check_rate(pool, config)
     has_age = np.isfinite(pool.age)
     split = {k: v[has_age[v]] for k, v in pool.split().items()}
+    if a.healthy_only:
+        from kron_ppg.traits import TRAITS, trait_value
+
+        healthy = {s: trait_value(TRAITS["healthy"], pool.table.get(s, {})) == 1.0 for s in set(pool.subject)}
+        for k in ("train", "val"):
+            split[k] = split[k][np.array([healthy[s] for s in pool.subject[split[k]]], dtype=bool)]
     if min(len(set(pool.subject[v])) for v in split.values()) < 2:
         raise ValueError("need at least two subjects with an age in each of train, val and test: "
                          f"{ {k: len(set(pool.subject[v])) for k, v in split.items()} }")
@@ -238,7 +248,7 @@ def fit_clock(a: ClockArgs) -> dict:
     a.out.mkdir(parents=True, exist_ok=True)
     eval_idx = {k: _eval_index(pool, v, a.eval_windows_per_subject, a.seed) for k, v in split.items()}
     record = {"task": "clock", "model": config.to_dict(), "encoder": str(a.encoder) if a.encoder else None,
-              "freeze": a.freeze, "data": [str(f) for f in a.folders], "lr": a.lr, "head_lr": a.head_lr,
+              "freeze": a.freeze, "healthy_only": a.healthy_only, "data": [str(f) for f in a.folders], "lr": a.lr, "head_lr": a.head_lr,
               "batch_size": a.batch_size, "steps": a.steps, "seed": a.seed,
               "windows": {k: int(len(v)) for k, v in split.items()},
               "subjects": {k: int(len(set(pool.subject[v]))) for k, v in split.items()},

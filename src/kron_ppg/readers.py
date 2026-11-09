@@ -112,6 +112,11 @@ def read_vitaldb_track(path: Path) -> np.ndarray:
     return _values(df.get_column(VITALDB_TRACK))
 
 
+#: preoperative labs kept from VitalDB's case table: haemoglobin, glucose, creatinine, albumin, urea
+#: nitrogen, sodium (age-related, and things a person's health shows in)
+VITALDB_LABS = ("preop_hb", "preop_gluc", "preop_cr", "preop_alb", "preop_bun", "preop_na")
+
+
 def read_vitaldb(folder: Path) -> SourceData:
     tracks = {int(p.name.split(".")[0]): p for p in (folder / "pleth").glob("*.csv.gz")}
     cases = {int(r["caseid"]): r for r in _table(folder / "cases.csv.gz")}
@@ -122,7 +127,8 @@ def read_vitaldb(folder: Path) -> SourceData:
             continue
         row = {"subject": r["subjectid"], "age": r.get("age", ""), "sex": r.get("sex", ""), "caseid": str(cid)}
         row.update({k: r.get(k, "") for k in OUTCOME_FLAGS})
-        row.update({k: r.get(k, "") for k in ("department", "optype", "emop", "bmi")})
+        row.update({k: r.get(k, "") for k in ("department", "optype", "emop", "bmi", "height", "weight")})
+        row.update({k: r.get(k, "") for k in VITALDB_LABS})
         subjects.append(row)
         order.append((r["subjectid"], cid))
 

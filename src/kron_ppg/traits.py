@@ -4,11 +4,18 @@ Run 1 showed that an age clock's *gap* carried no outcome signal (AUC 0.50-0.56 
 diabetes and ASA >= 3), so this asks the direct question instead: does a PPG window say whether a person
 has an age-related condition, and does it say more than their age does?
 
-The head predicts, from the encoder's pooled embedding, every trait the subject table carries:
+The head predicts, from the encoder's pooled embedding, every trait the data carries:
 
-* regression: ``age`` (years), ``bmi`` (kg/m2);
-* binary: ``preop_htn`` (hypertension), ``preop_dm`` (diabetes), ``asa_ge3`` (ASA class >= 3: severe
-  systemic disease), and ``sex_male`` as a control the literature says PPG predicts well.
+* per person, from the subject table:
+  regression ``age`` (years), ``bmi``, ``height``, ``weight`` and the preoperative labs ``preop_hb``,
+  ``preop_gluc``, ``preop_cr``, ``preop_alb``; binary ``preop_htn`` (hypertension), ``preop_dm``
+  (diabetes), ``asa_ge3`` (ASA class >= 3: severe systemic disease), ``healthy`` (ASA 1 with neither
+  hypertension nor diabetes) and ``sex_male`` as a control the literature says PPG predicts well;
+* per window, from ``vitals.parquet`` (:mod:`kron_ppg.vitals`; what a Galaxy Watch also measures):
+  ``sbp`` and ``dbp`` (blood pressure), ``pat_ms`` (pulse arrival time from ECG), ``rmssd_ms`` (heart-rate
+  variability) and ``spo2``.
+
+A trait with no labels in the data is skipped.
 
 Missing labels are masked per trait. Regression targets are learned in units of their training spread;
 binary ones as logits starting at the training prevalence.
@@ -44,6 +51,7 @@ class Trait:
     name: str
     kind: str  # "regression" | "binary"
     column: str
+    level: str = "subject"  # "subject": from the subject table; "window": from the pool's per-window vitals
     positive: Sequence[str] = ()  # binary from text: the values that count as 1
     negative: Sequence[str] = ()  # ... and as 0
     at_least: float | None = None  # binary from a number: >= this is 1
@@ -56,12 +64,32 @@ TRAITS: dict[str, Trait] = {t.name: t for t in (
     Trait("preop_dm", "binary", "preop_dm", at_least=1),
     Trait("asa_ge3", "binary", "asa", at_least=3),
     Trait("sex_male", "binary", "sex", positive=("M", "m", "male", "Male"), negative=("F", "f", "female", "Female")),
+    Trait("healthy", "binary", "asa"),
+    Trait("height", "regression", "height"),
+    Trait("weight", "regression", "weight"),
+    Trait("preop_hb", "regression", "preop_hb"),
+    Trait("preop_gluc", "regression", "preop_gluc"),
+    Trait("preop_cr", "regression", "preop_cr"),
+    Trait("preop_alb", "regression", "preop_alb"),
+    Trait("sbp", "regression", "sbp", level="window"),
+    Trait("dbp", "regression", "dbp", level="window"),
+    Trait("pat_ms", "regression", "pat_ms", level="window"),
+    Trait("rmssd_ms", "regression", "rmssd_ms", level="window"),
+    Trait("spo2", "regression", "spo2", level="window"),
 )}
 DEFAULT_TRAITS = tuple(TRAITS)
+#: the traits run 2a was first trained with, before vitals and labs
+FIRST_TRAITS = ("age", "bmi", "preop_htn", "preop_dm", "asa_ge3", "sex_male")
 
 
 def trait_value(trait: Trait, row: Mapping) -> float:
     """The trait's target for one subject-table row: a number, 0/1, or NaN when unknown."""
+    if trait.name == "healthy":
+        parts = [trait_value(TRAITS[n], row) for n in ("asa_ge3", "preop_htn", "preop_dm")]
+        asa = trait_value(Trait("asa", "regression", "asa"), row)
+        if any(p == 1.0 for p in parts) or asa >= 2:
+            return 0.0
+        return 1.0 if asa == 1 and all(p == 0.0 for p in parts[1:]) else float("nan")
     value = row.get(trait.column)
     if value is None or value == "":
         return float("nan")
@@ -80,9 +108,14 @@ def trait_value(trait: Trait, row: Mapping) -> float:
 
 
 def targets(pool: Pool, traits: Sequence[str]) -> np.ndarray:
-    """``(windows, traits)`` float32 targets, NaN where the subject's value is unknown."""
+    """``(windows, traits)`` float32 targets, NaN where the value is unknown: a subject-level trait from
+    the subject table, a window-level one from the pool's per-window vitals."""
     per_subject = {s: [trait_value(TRAITS[t], pool.table.get(s, {})) for t in traits] for s in set(pool.subject)}
-    return np.array([per_subject[s] for s in pool.subject], dtype=np.float32).reshape(len(pool.subject), len(traits))
+    y = np.array([per_subject[s] for s in pool.subject], dtype=np.float32).reshape(len(pool.subject), len(traits))
+    for j, t in enumerate(traits):
+        if TRAITS[t].level == "window":
+            y[:, j] = pool.extra.get(TRAITS[t].column, np.full(len(pool.subject), np.nan))
+    return y
 
 
 class TraitHead(nn.Module):
@@ -193,6 +226,25 @@ def score_traits(preds: Mapping[str, dict[str, np.ndarray]], truth: Mapping[str,
     return out
 
 
+def window_scores(out: np.ndarray, y: np.ndarray, subjects: np.ndarray, traits: Sequence[str]) -> dict:
+    """For each window-level trait over test windows: MAE, Pearson r, and the within-person r (both sides
+    centred on each person's mean), which says whether PPG tracks a person's changes, not just who they are."""
+    res = {}
+    for j, name in enumerate(traits):
+        if TRAITS[name].level != "window":
+            continue
+        known = np.isfinite(y[:, j])
+        p, t, s = out[known, j], y[known, j], subjects[known]
+        entry = {"windows": int(known.sum()), "people": int(len(np.unique(s)))}
+        if len(t) >= 3:
+            keys, inv = np.unique(s, return_inverse=True)
+            pc = p - (np.bincount(inv, p) / np.bincount(inv))[inv]
+            tc = t - (np.bincount(inv, t) / np.bincount(inv))[inv]
+            entry.update({"mae": float(np.mean(np.abs(p - t))), "r": pearson(p, t), "within_person_r": pearson(pc, tc)})
+        res[name] = entry
+    return res
+
+
 def _beyond_age(preds, truth, name: str) -> dict:
     """AUC on test people of logistic models fitted on the validation people: age alone, and age plus
     the PPG score. Both use the same people (those with the trait and an age known)."""
@@ -207,8 +259,29 @@ def _beyond_age(preds, truth, name: str) -> dict:
         return {"auc_age_plus_ppg": float("nan")}
     mu, sd = np.array([va.mean(), vp.mean()]), np.array([va.std() or 1.0, vp.std() or 1.0])
     w = fit_logistic((np.column_stack([va, vp]) - mu) / sd, vt)
+    w_age = fit_logistic(((va - mu[0]) / sd[0])[:, None], vt)
     combined = np.column_stack([np.ones(len(ta)), (np.column_stack([ta, tp]) - mu) / sd]) @ w
-    return {"auc_age_plus_ppg": auc(combined, tt.astype(bool)), "logistic_val": [float(v) for v in w]}
+    age_only = w_age[0] + w_age[1] * (ta - mu[0]) / sd[0]
+    positive = tt.astype(bool)
+    delta, low, high = _paired_auc_delta(combined, age_only, positive)
+    return {"auc_age_plus_ppg": auc(combined, positive), "auc_age_fitted": auc(age_only, positive),
+            "delta_auc": delta, "delta_auc_ci95": [low, high], "logistic_val": [float(v) for v in w]}
+
+
+def _paired_auc_delta(a: np.ndarray, b: np.ndarray, positive: np.ndarray, n: int = 2000, seed: int = 0
+                      ) -> tuple[float, float, float]:
+    """AUC(a) - AUC(b) on the same people, with a 95% interval from a paired bootstrap over people."""
+    rng = np.random.default_rng(seed)
+    deltas = []
+    for _ in range(n):
+        i = rng.integers(0, len(positive), len(positive))
+        if positive[i].all() or not positive[i].any():
+            continue
+        deltas.append(auc(a[i], positive[i]) - auc(b[i], positive[i]))
+    if not deltas:
+        return float("nan"), float("nan"), float("nan")
+    low, high = np.percentile(deltas, [2.5, 97.5])
+    return auc(a, positive) - auc(b, positive), float(low), float(high)
 
 
 @dataclass
@@ -311,7 +384,7 @@ def fit_traits(a: TraitArgs) -> dict:
 
     def evaluate() -> dict:
         model.eval()
-        preds, truth, subjects, val_loss = {}, {}, {}, 0.0
+        preds, truth, subjects, val_loss, test_windows = {}, {}, {}, 0.0, {}
         with torch.no_grad():
             for k in ("val", "test"):
                 idx = eval_idx[k]
@@ -321,6 +394,8 @@ def fit_traits(a: TraitArgs) -> dict:
                     x = torch.from_numpy(np.stack([pool.window(int(i)) for i in chunk])).to(dev)
                     outs.append(model(x).float().cpu().numpy())
                 window_out = np.concatenate(outs)
+                if k == "test":
+                    test_windows = window_scores(window_out, y[idx], pool.subject[idx], traits)
                 if k == "val":
                     val_loss = float(trait_loss(torch.from_numpy(window_out), torch.from_numpy(y[idx]), head.cpu()))
                     head.to(dev)
@@ -333,6 +408,8 @@ def fit_traits(a: TraitArgs) -> dict:
         if a.freeze:
             encoder.eval()
         scores = score_traits(preds, truth, traits)
+        for name, entry in test_windows.items():
+            scores[name]["test_windows"] = entry
         bias = fit_bias(preds["val"]["age"], truth["val"]["age"])
         gaps = {s: p - (bias[0] + bias[1] * g)
                 for s, p, g in zip(subjects["test"], preds["test"]["age"], truth["test"]["age"], strict=True)
@@ -370,7 +447,7 @@ def fit_traits(a: TraitArgs) -> dict:
                   f"{s['age']['test']['mae']:.2f}, " + ", ".join(
                       f"{t} AUC {s[t]['test']['auc_ppg']:.3f} (age {s[t]['test']['auc_age']:.3f}, "
                       f"age+ppg {s[t]['test']['auc_age_plus_ppg']:.3f})"
-                      for t in traits if TRAITS[t].kind == "binary"), flush=True)
+                      for t in traits if TRAITS[t].kind == "binary" and s[t]["test"]["positive"]), flush=True)
             if ev["val_loss"] < best:
                 best, best_eval = ev["val_loss"], {**ev, "step": step}
                 torch.save({"encoder": encoder.state_dict(), "head": head.state_dict(), "traits": traits,

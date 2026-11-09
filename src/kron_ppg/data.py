@@ -9,7 +9,9 @@ A prepared variant (``kron-ppg prepare``) holds:
   flags the source carries (VitalDB: ``preop_htn``, ``preop_dm``, ``death_inhosp``, ``asa``); a column
   whose every value is a whole number is stored as ``Int64`` (``age`` always as ``Float64``), one of
   other numbers as ``Float64``, any other as text;
-* ``info.json``: the source, rate, window and hop, counts, and the input's ``SOURCE.json`` it was built from.
+* ``info.json``: the source, rate, window and hop, counts, and the input's ``SOURCE.json`` it was built from;
+* optionally ``vitals.parquet`` (:mod:`kron_ppg.vitals`): per-window vitals keyed by ``(recording, start_s)``,
+  loaded as :attr:`Windows.extra`.
 
 Both tables are plain parquet, so polars, DuckDB, pyarrow or Hugging Face ``datasets`` read them as they are.
 
@@ -21,7 +23,7 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import Iterator, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
@@ -51,6 +53,7 @@ class Windows:
     start_s: np.ndarray
     subjects: dict[str, dict[str, str]]
     info: dict
+    extra: dict[str, np.ndarray] = field(default_factory=dict)
 
     @classmethod
     def load(cls, folder: str | Path) -> "Windows":
@@ -61,8 +64,16 @@ class Windows:
         x = (table.get_column("signal").to_numpy() if len(table)
              else np.zeros((0, length), np.float16))
         subjects = {r["subject"]: r for r in pl.read_parquet(folder / "subjects.parquet").to_dicts()}
+        extra = {}
+        if (folder / "vitals.parquet").is_file():
+            vitals = pl.read_parquet(folder / "vitals.parquet")
+            numeric = [c for c, t in vitals.schema.items() if c not in ("recording", "start_s") and t.is_numeric()]
+            joined = table.select("recording", "start_s").join(vitals.select("recording", "start_s", *numeric),
+                                                               on=["recording", "start_s"], how="left",
+                                                               maintain_order="left")
+            extra = {c: joined[c].cast(pl.Float64).fill_null(np.nan).to_numpy() for c in numeric}
         return cls(folder, x, table.get_column("subject").to_numpy().astype(str),
-                   table.get_column("start_s").to_numpy(), subjects, info)
+                   table.get_column("start_s").to_numpy(), subjects, info, extra)
 
     @property
     def sample_rate(self) -> float:
@@ -153,6 +164,9 @@ class Pool:
                                        for v in variants])
         self.age = np.concatenate([v.ages() for v in variants])
         self.table = {f"{v.info['source']}/{k}": row for v in variants for k, row in v.subjects.items()}
+        names = sorted({c for v in variants for c in v.extra})
+        #: per-window values from each variant's ``vitals.parquet``; NaN where a variant has none
+        self.extra = {c: np.concatenate([v.extra.get(c, np.full(len(v.x), np.nan)) for v in variants]) for c in names}
 
     @classmethod
     def load(cls, folders: Sequence[str | Path]) -> "Pool":

@@ -190,7 +190,7 @@ def tiny_variant(folder, n_subjects=24, per_subject=4, seconds=10, fs=25.0):
     for s in range(n_subjects):
         age = 20 + 60 * s / (n_subjects - 1)
         subjects.append({"subject": f"s{s:02d}", "age": f"{age:.0f}", "sex": "F",
-                         "preop_htn": str(int(age > 50))})
+                         "preop_htn": str(int(age > 50)), "preop_dm": "0", "asa": str(1 + (s % 3 == 0))})
         x, _ = prepare_signal(synthetic_ppg(per_subject * seconds + 4, 100.0, hr=55 + s, seed=s), 100.0, fs)
         for k in range(per_subject):
             seg = x[int((2 + k * seconds) * fs):int((2 + (k + 1) * seconds) * fs)]
@@ -306,3 +306,86 @@ def test_traits_train_and_score_end_to_end(tmp_path, device):
     assert {"age", "age_predicted", "preop_htn_predicted"} <= set(predictions.columns)
     assert len(predictions) == result["subjects"]["val"] + result["subjects"]["test"]
     assert (tmp_path / "traits" / "checkpoint.pt").is_file()
+
+
+
+# ---- vitals and the traits they feed -----------------------------------------------------------
+def synthetic_ecg_ppg(seconds=30, fs=500.0, rr=0.9, pat=0.21, seed=0):
+    """Lead II-like spikes every ``rr`` s and a PPG whose upstroke is steepest ``pat`` s after each."""
+    rng = np.random.default_rng(seed)
+    t = np.arange(int(seconds * fs)) / fs
+    beats = np.arange(0.3, seconds - 0.7, rr)
+    ecg = sum(np.exp(-((t - b) / 0.008) ** 2) for b in beats) + 0.02 * rng.standard_normal(len(t))
+    ppg = sum(1 / (1 + np.exp(np.clip(-(t - b - pat) / 0.03, -50, 50))) * np.exp(-np.clip(t - b - pat, 0, None) / 0.35)
+              for b in beats) + 0.005 * rng.standard_normal(len(t))
+    return ecg, ppg, len(beats)
+
+
+def test_ecg_features_find_beats_and_the_pulse_arrival_time():
+    from kron_ppg.vitals import ecg_features
+
+    ecg, ppg, n = synthetic_ecg_ppg()
+    f = ecg_features(ecg, ppg)
+    assert abs(f["beats"] - n) <= 1 and abs(f["rr_ms"] - 900) < 5 and abs(f["ecg_hr"] - 66.7) < 1
+    assert f["rmssd_ms"] < 10 and abs(f["pat_ms"] - 210) < 30
+    assert np.isnan(ecg_features(np.full(15000, np.nan), ppg)["rr_ms"])
+
+
+def test_window_medians_respect_ranges_and_gaps():
+    from kron_ppg.vitals import window_medians
+
+    t = np.arange(0, 100, 2.0)
+    v = np.where(t < 50, 120.0, 140.0)
+    v[3] = 999  # out of range: dropped
+    m = window_medians(t, v, np.array([0.0, 60.0, 200.0]), 30.0, (40, 260))
+    assert m[0] == 120 and m[1] == 140 and np.isnan(m[2])
+
+
+def test_window_level_traits_read_vitals_and_score_within_person(tmp_path, device):
+    from kron_ppg.traits import TraitArgs, fit_traits
+
+    variant = tiny_variant(tmp_path / "tiny")
+    w = pl.read_parquet(variant / "windows.parquet", columns=["recording", "start_s"])
+    rng = np.random.default_rng(1)
+    pl.DataFrame({"recording": w["recording"], "start_s": w["start_s"],
+                  "sbp": rng.normal(120, 15, len(w)), "pat_ms": rng.normal(220, 20, len(w)),
+                  "bp_source": ["art"] * len(w)}).write_parquet(variant / "vitals.parquet")
+    pool = Pool.load([variant])
+    assert set(pool.extra) == {"sbp", "pat_ms"} and np.isfinite(pool.extra["sbp"]).all()
+    result = fit_traits(TraitArgs([variant], tmp_path / "t", None, ("age", "sbp", "healthy", "preop_hb"),
+                                  KronPPGConfig(**SMALL), batch_size=8, steps=4, eval_every=2, device=str(device),
+                                  num_workers=0))
+    s = result["scores"]
+    assert {"mae", "r", "within_person_r"} <= set(s["sbp"]["test_windows"])
+    assert s["healthy"]["test"]["positive"] + s["healthy"]["test"]["negative"] > 0
+    assert s["preop_hb"]["test"]["subjects"] == 0  # no labels anywhere: skipped, not a crash
+
+
+def test_healthy_trait_and_healthy_only_clock(tmp_path, device):
+    from kron_ppg.traits import TRAITS, trait_value
+    from kron_ppg.train import ClockArgs, fit_clock
+
+    h = TRAITS["healthy"]
+    assert trait_value(h, {"asa": 1, "preop_htn": 0, "preop_dm": 0}) == 1.0
+    assert trait_value(h, {"asa": 2, "preop_htn": 0, "preop_dm": 0}) == 0.0
+    assert trait_value(h, {"asa": 1, "preop_htn": 1}) == 0.0
+    assert np.isnan(trait_value(h, {"asa": 1, "preop_htn": 0}))  # diabetes unknown
+    variant = tiny_variant(tmp_path / "tiny")
+    fit_clock(ClockArgs([variant], tmp_path / "c", None, KronPPGConfig(**SMALL), batch_size=8, steps=2,
+                        eval_every=2, device=str(device), num_workers=0, healthy_only=True))
+    config = json.loads((tmp_path / "c" / "config.json").read_text())
+    every = Pool.load([variant])
+    assert config["healthy_only"] and config["subjects"]["test"] == len(set(every.subject[every.split()["test"]]))
+
+
+def test_extra_vitaldb_tracks_follow_the_chosen_cases(tmp_path):
+    from kron_ppg.sources import vitaldb_extra_tracks
+
+    trks = tmp_path / "trks.csv.gz"
+    with gzip.open(trks, "wt") as fh:
+        fh.write("caseid,tname,tid\n1,SNUADC/PLETH,a\n1,SNUADC/ECG_II,b\n1,Solar8000/NIBP_SBP,c\n"
+                 "2,SNUADC/ECG_II,d\n3,Solar8000/HR,e\n")
+    assert vitaldb_extra_tracks([1, 3], trks, ["ecg"]) == [(1, "b", "ecg_ii")]
+    assert vitaldb_extra_tracks([1, 3], trks, ["vitals"]) == [(1, "c", "nibp_sbp"), (3, "e", "hr")]
+    with pytest.raises(ValueError):
+        vitaldb_extra_tracks([1], trks, ["accelerometer"])

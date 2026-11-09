@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import polars as pl
@@ -34,6 +35,16 @@ DOMAIN = "ppg"
 BIDMC = "https://physionet.org/files/bidmc/1.0.0/bidmc_csv"
 VITALDB_API = "https://api.vitaldb.net"
 VITALDB_TRACK = "SNUADC/PLETH"
+#: Further VitalDB tracks, by group, that match what a Galaxy Watch can also measure: its single-lead ECG
+#: spot check (ECG lead II), and its heart rate, SpO2, blood pressure and temperature readings (the
+#: Solar8000 monitor's numbers, with the arterial line's beat-by-beat pressure where there is one).
+#: Each lands in ``tracks/<slug>/<caseid>.csv.gz``, for the same cases as the PLETH tracks.
+VITALDB_EXTRAS: dict[str, dict[str, str]] = {
+    "ecg": {"SNUADC/ECG_II": "ecg_ii"},
+    "vitals": {"Solar8000/HR": "hr", "Solar8000/PLETH_SPO2": "spo2", "Solar8000/BT": "bt",
+               "Solar8000/NIBP_SBP": "nibp_sbp", "Solar8000/NIBP_DBP": "nibp_dbp", "Solar8000/NIBP_MBP": "nibp_mbp",
+               "Solar8000/ART_SBP": "art_sbp", "Solar8000/ART_DBP": "art_dbp", "Solar8000/ART_MBP": "art_mbp"},
+}
 VITALDB_CASES_ENV = "KRON_PPG_VITALDB_CASES"
 VITALDB_DEFAULT_CASES = 200
 GALAXYPPG_URL = "https://zenodo.org/records/14635823/files/GalaxyPPG.zip?download=1"
@@ -58,8 +69,26 @@ def vitaldb_cases_wanted(n: int, trks: Path, cases: Path) -> list[tuple[int, str
     return [(c, tid[c]) for c in chosen[:n]]
 
 
-def fetch_vitaldb(source: Source, folder: Path, force: bool, cases: int | None = None) -> dict:
-    """The case table, the track list and ``cases`` PLETH tracks as ``pleth/<caseid>.csv.gz``."""
+def vitaldb_extra_tracks(cases: list[int], trks: Path, groups: list[str]) -> list[tuple[int, str, str]]:
+    """``(caseid, tid, slug)`` for every track of ``groups`` (keys of :data:`VITALDB_EXTRAS`) the cases have."""
+    unknown = [g for g in groups if g not in VITALDB_EXTRAS]
+    if unknown:
+        raise ValueError(f"unknown VitalDB track groups {unknown}; one of {sorted(VITALDB_EXTRAS)}")
+    slugs = {name: slug for g in groups for name, slug in VITALDB_EXTRAS[g].items()}
+    rows = (pl.read_csv(trks, infer_schema=False)
+            .filter(pl.col("tname").is_in(list(slugs)))
+            .with_columns(pl.col("caseid").cast(pl.Int64))
+            .filter(pl.col("caseid").is_in(cases))
+            .unique(["caseid", "tname"], keep="first")
+            .sort(["caseid", "tname"]))
+    return [(c, t, slugs[n]) for c, t, n in zip(rows["caseid"], rows["tid"], rows["tname"], strict=True)]
+
+
+def fetch_vitaldb(source: Source, folder: Path, force: bool, cases: int | None = None,
+                  extras: tuple[str, ...] = (), workers: int = 1) -> dict:
+    """The case table, the track list, ``cases`` PLETH tracks as ``pleth/<caseid>.csv.gz`` and, for the
+    same cases, the tracks of each ``extras`` group as ``tracks/<slug>/<caseid>.csv.gz``; ``workers``
+    downloads run at once (the API serves one track per request)."""
     n = cases if cases is not None else int(os.environ.get(VITALDB_CASES_ENV, VITALDB_DEFAULT_CASES))
     folder.mkdir(parents=True, exist_ok=True)
     old = {e["file"]: e for e in (read_manifest(folder) or {}).get("files", [])}
@@ -77,13 +106,26 @@ def fetch_vitaldb(source: Source, folder: Path, force: bool, cases: int | None =
 
     entries = [get(f"{VITALDB_API}/cases", "cases.csv.gz"), get(f"{VITALDB_API}/trks", "trks.csv.gz")]
     wanted = vitaldb_cases_wanted(n, folder / "trks.csv.gz", folder / "cases.csv.gz")
-    for i, (cid, tid) in enumerate(wanted, 1):
-        print(f"  [{i}/{len(wanted)}] case {cid}")
-        entries.append(get(f"{VITALDB_API}/{tid}", f"pleth/{cid:04d}.csv.gz"))
+    jobs = [(f"{VITALDB_API}/{tid}", f"pleth/{cid:04d}.csv.gz") for cid, tid in wanted]
+    jobs += [(f"{VITALDB_API}/{tid}", f"tracks/{slug}/{cid:04d}.csv.gz")
+             for cid, tid, slug in vitaldb_extra_tracks([c for c, _ in wanted], folder / "trks.csv.gz", list(extras))]
+    done = 0
+
+    def fetch(job: tuple[str, str]) -> dict:
+        nonlocal done
+        entry = get(*job)
+        done += 1
+        if done % 100 == 0 or done == len(jobs):
+            print(f"  [{done}/{len(jobs)}] {job[1]}", flush=True)
+        return entry
+
+    with ThreadPoolExecutor(max(1, workers)) as pool:
+        entries += list(pool.map(fetch, jobs))
     # keep tracks a larger earlier download fetched
     have = {e["file"] for e in entries}
     entries += [e for name, e in old.items() if name not in have and (folder / name).exists()]
-    return write_manifest(folder, source, entries, {"vitaldb_track": VITALDB_TRACK, "cases_requested": n})
+    return write_manifest(folder, source, entries, {"vitaldb_track": VITALDB_TRACK, "cases_requested": n,
+                                                    "extras": sorted(set(extras))})
 
 
 # ---- GalaxyPPG -------------------------------------------------------------------------------
