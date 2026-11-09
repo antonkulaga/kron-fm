@@ -76,7 +76,7 @@ Checked 2026-11-09 by fetching the files.
 
 | Source | What | Age | Size | Licence | In kron-ppg |
 |---|---|---|---|---|---|
-| **VitalDB** API (`api.vitaldb.net`) | surgical finger PPG `SNUADC/PLETH`, 500 Hz | age, sex, ASA, `preop_htn`, `preop_dm`, `death_inhosp` per case; `subjectid` links one person's repeat surgeries | 6,157 cases with PLETH; about 4.3 MB gzipped per case (about 3 h at 500 Hz) | CC BY-NC-SA 4.0 under the VitalDB data use agreement (research). The PhysioNet copy (95 GB of `.vital` files) is CC BY 4.0 | `vitaldb`: the training set |
+| **VitalDB** API (`api.vitaldb.net`) | surgical finger PPG `SNUADC/PLETH`, 500 Hz | age, sex, ASA, `preop_htn`, `preop_dm`, `death_inhosp` per case; `subjectid` links one person's repeat surgeries | 6,157 cases with PLETH; about 4.3 MB gzipped per case (about 3 h at 500 Hz) | CC BY 4.0, through the API (vitaldb.net data use agreement, read 2026-11-09: commercial use and redistribution allowed with credit, a licence link and a note of changes; no re-identification) and as the PhysioNet copy (95 GB of `.vital` files) | `vitaldb`: the training set |
 | **BIDMC** (PhysioNet `bidmc`) | 53 ICU recordings × 8 min, finger PPG 125 Hz | `Age:` in `bidmc_NN_Fix.txt`; three say `90+`, one says `NaN` | 147 MB (CSV + Fix files) | ODC-By 1.0 | `bidmc`: external check and smoke test |
 | **GalaxyPPG** (Zenodo 14635823) | Galaxy Watch5 25 Hz green PPG, E4 64 Hz, Polar H10 | ages 20–29 only | 482 MB | CC BY 4.0 | `galaxyppg`: wrist pretraining and device domain, not a clock set |
 | BUT PPG v2 (PhysioNet) | smartphone fingertip PPG, 30 Hz, 10 s × 3,888 | ages 19–76, 50 subjects | 203 MB | CC BY 4.0 | not yet (WFDB reader, 10 s windows): the closest public match to the user's fingertip camera |

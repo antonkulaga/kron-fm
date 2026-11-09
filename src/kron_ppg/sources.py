@@ -9,9 +9,10 @@ Only sets that carry a per-subject age and download over plain HTTPS without cre
   and outcome flags for 6,388 cases; 6,157 have the PLETH track, about 4 MB gzipped per case. The
   only open set large enough to train an age clock. A first download takes ``KRON_PPG_VITALDB_CASES``
   cases (default 200, one per person, spread over case ids); ``kron-ppg download vitaldb --cases N``
-  takes more, and a later run only adds what is missing. The API's terms are CC BY-NC-SA 4.0 under
-  the VitalDB data use agreement (research use); PhysioNet's full copy (95 GB of ``.vital`` files) is
-  CC BY 4.0.
+  takes more, and a later run only adds what is missing. CC BY 4.0, both through the API (the
+  vitaldb.net data use agreement: share and adapt "for any purpose, even commercially", with credit
+  to VitalDB, a licence link and a note of changes; no attempt to re-identify anyone) and as
+  PhysioNet's full copy (95 GB of ``.vital`` files).
 * ``galaxyppg``: Galaxy Watch5 25 Hz green PPG (plus E4 64 Hz) from 24 people aged 20-29 (CC BY 4.0).
   Narrow in age, so it is wrist pretraining data and a device check, not a clock set. When the
   pulse-exploration checkout already holds it, the folder is linked rather than downloaded again.
@@ -116,7 +117,7 @@ SOURCES: dict[str, Source] = {
         Source("vitaldb", DOMAIN,
                "VitalDB surgical finger PPG (SNUADC/PLETH 500 Hz) with age, sex and outcome flags; "
                f"{VITALDB_DEFAULT_CASES} cases by default (KRON_PPG_VITALDB_CASES, or kron-ppg download --cases)",
-               (), "CC BY-NC-SA 4.0 under the VitalDB data use agreement (API); PhysioNet copy CC BY 4.0",
+               (), "CC BY 4.0 (vitaldb.net data use agreement; the PhysioNet copy too)",
                "Lee et al. (2022) VitalDB, a high-fidelity multi-parameter vital signs database in surgical "
                "patients. Sci Data 9:279.",
                "https://vitaldb.net/dataset/",

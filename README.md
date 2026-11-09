@@ -118,7 +118,7 @@ uv run kron-ppg export data/output/runs/kron-ppg/<clock run>   # -> <run>/onnx/s
 
 | Source | What | Licence |
 |---|---|---|
-| `vitaldb` | surgical finger PPG at 500 Hz, with age and outcome flags; 6,157 cases, about 4 MB each | CC BY-NC-SA 4.0 (VitalDB API terms) |
+| `vitaldb` | surgical finger PPG at 500 Hz, with age and outcome flags; 6,157 cases, about 4 MB each | CC BY 4.0 (VitalDB data use agreement) |
 | `bidmc` | 53 ICU recordings of 8 min, finger PPG at 125 Hz, with ages | ODC-By 1.0 |
 | `galaxyppg` | Galaxy Watch5 PPG at 25 Hz from 24 people aged 20–29; linked from pulse-exploration when present | CC BY 4.0 |
 

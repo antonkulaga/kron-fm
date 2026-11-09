@@ -8,6 +8,7 @@
     uv run kron-ppg evaluate <clock run> bidmc           # a trained clock on another source
     uv run kron-ppg export <clock run>                   # stream.onnx for a phone, checked with ONNX Runtime
     uv run kron-ppg info --d-model 256 --n-layers 6
+    uv run kron-ppg hub-export vitaldb bidmc galaxyppg   # -> data/output/hub/<name>: parquet shards + card
 
 A source name stands for its prepared variant at the given ``--sample-rate`` and ``--seconds``; a path
 to a variant folder works too.
@@ -182,3 +183,19 @@ def export(run: Path = typer.Argument(..., help="a clock run folder (or its chec
 
 if __name__ == "__main__":
     app()
+
+
+@app.command("hub-export")
+def hub_export(sources: list[str] = typer.Argument(..., help="prepared sources"),
+               repo: str = typer.Option("antonkulaga/ppg-windows-25hz", help="the Hub dataset id the card names"),
+               name: str = typer.Option("PPG windows at 25 Hz", help="the card's title"),
+               out: Path | None = typer.Option(None, help="output folder (default data/output/hub/<repo name>)"),
+               sample_rate: float = typer.Option(25.0), seconds: float = typer.Option(30.0)) -> None:
+    """Prepared windows as a Hugging Face dataset folder: parquet shards per source and split, and a card."""
+    from kron_core.paths import output_dir
+    from kron_ppg.hub import export_hub
+
+    out = out or output_dir() / "hub" / repo.split("/")[-1]
+    summary = export_hub(sources, out, repo, name, sample_rate, seconds)
+    typer.echo(json.dumps(summary, indent=2))
+    typer.echo(f"-> {out}")

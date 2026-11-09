@@ -237,3 +237,25 @@ def test_window_set_items_are_samples_subject_and_age(tmp_path):
     ds = WindowSet(pool, np.arange(len(pool)))
     x, subject, age = ds[3]
     assert x.shape == (250,) and subject == 1 and age == pytest.approx(50.0)
+
+
+def test_the_hub_export_keeps_the_training_split(tmp_path):
+    from kron_ppg.hub import export_hub
+
+    fake_bidmc(tmp_path / "in" / "bidmc")
+    prepare_source("bidmc", 25.0, 30.0, folder=tmp_path / "in" / "bidmc", out=tmp_path / "prep")
+    summary = export_hub(["bidmc"], tmp_path / "hub", "someone/ppg", "PPG", folders={"bidmc": tmp_path / "prep"})
+    pool = Pool.load([tmp_path / "prep"])
+    sides = pool.split()
+    for ours, hub in (("train", "train"), ("val", "validation"), ("test", "test")):
+        shards = sorted((tmp_path / "hub" / "bidmc").glob(f"{hub}-*.parquet"))
+        rows = pl.concat([pl.read_parquet(p) for p in shards]) if shards else pl.DataFrame()
+        assert len(rows) == len(sides[ours]) == summary["bidmc"]["splits"][hub]["windows"]
+        if len(rows):
+            assert set("bidmc/" + rows["subject"]) == set(pool.subject[sides[ours]])
+            assert rows.schema["signal"] == pl.Array(pl.Float16, 750)
+    subjects = pl.read_parquet(tmp_path / "hub" / "bidmc" / "subjects.parquet")
+    assert set(subjects["split"]) <= {"train", "validation", "test"} and len(subjects) == 4
+    card = (tmp_path / "hub" / "README.md").read_text()
+    assert card.startswith("---\nlicense:\n- odc-by\n") and "config_name: bidmc_subjects" in card
+    assert "hf://datasets/someone/ppg/vitaldb" in card and "ODC Attribution License" in card
