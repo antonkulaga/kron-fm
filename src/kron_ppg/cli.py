@@ -160,7 +160,7 @@ def evaluate(run: Path = typer.Argument(..., help="a clock run folder (or its ch
     age = np.array([a for _, a, _ in subj.values()])
     gaps = {s: p - (bias["a"] + bias["b"] * a) for s, (p, a, _) in subj.items()}
     result = {"run": str(ckpt), "sources": sources, **scores(pred, age, (bias["a"], bias["b"])),
-              "outcomes": gap_associations(gaps, pool.table)}
+              "outcomes": gap_associations(gaps, pool.table, ages={s: a for s, (_, a, _) in subj.items()})}
     typer.echo(json.dumps(json_safe(result), indent=2))
 
 

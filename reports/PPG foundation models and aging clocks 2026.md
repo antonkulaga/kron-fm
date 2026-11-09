@@ -119,8 +119,8 @@ before it means anything on a watch. GalaxyPPG's 20–29-year-olds cannot do tha
   - the head is an MLP that predicts a deviation from the training mean, in units of the age SD;
   - training draws windows weighted by 1/(the subject's window count);
   - scoring is per subject (the mean over up to 20 windows);
-  - the bias correction is fitted on training subjects, and the gap is the residual of prediction on
-    age;
+  - the bias correction is fitted on validation subjects (see run 1 for why not training ones), and the
+    gap is the residual of prediction on age;
   - for every outcome flag present, the gap's AUC is reported on validation and test subjects;
   - splits are by subject, from a hash, so they stay put as data is added.
 - **Streaming and ONNX:**
@@ -129,18 +129,70 @@ before it means anything on a watch. GalaxyPPG's 20–29-year-olds cannot do tha
     and every layer's memory, and returns the age so far with the updated state.
   - It reads the trained weights through `kron_core.onnx.PlainKronMixer`, as krontime does.
 
-## First results
+## First results: run 1 (2026-11-09, haumea, one A100)
 
-None yet worth reporting.
-- **Smoke runs** (30 VitalDB cases + BIDMC, a 1M-parameter encoder, 300 steps each) showed the whole
-  path runs on the GPU, from pretraining through the clock, with metrics, predictions and outcome AUCs
-  written. With about 12 test subjects their numbers carry no information.
-- **ONNX:** the exported graph matches its PyTorch module to 3e-5 years in ONNX Runtime. In float32 it
-  matches the Triton streaming path to 3e-5 years; under the bfloat16 autocast used in training the
-  difference is 0.36 years.
+**Data.** 2,000 VitalDB cases, one per person, gave 405,242 windows of 30 s from 1,996 people. Four
+cases had no window that passed the gate. GalaxyPPG gave 1,847 windows and BIDMC 820. Subjects were
+split by hash: 1,384 train, 304 validation and 308 test people with an age. Training ages ran 7–89 y,
+mean 58.1, SD 14.5.
 
-The first real run needs several hundred to a few thousand VitalDB cases. A 500-case download was
-under way on 2026-11-09.
+**Pretraining.**
+- Encoder: 5.85M parameters, `next+subject`, 20,000 steps × 128 windows on VitalDB + GalaxyPPG;
+  BIDMC was held out as a clean external check.
+- It took 28 min at about 1,600 windows/s.
+- Validation next-patch L1 fell from 0.263 to 0.197.
+
+**Clock.** Three clocks, each trained for 6,000 steps on VitalDB:
+- *scratch*: no pretraining;
+- *finetune*: from the pretrained encoder;
+- *probe*: the pretrained encoder frozen, only the head trained.
+
+Scores are per person, as the mean over up to 20 windows.
+
+| | test MAE | test r | val MAE | BIDMC MAE (52 people) | BIDMC r |
+|---|---|---|---|---|---|
+| predicting the median age | 11.33 | – | 11.17 | 14.31 | – |
+| scratch | 7.79 | 0.75 | 8.31 | 12.58 | 0.65 |
+| finetune | 7.45 | 0.77 | 7.67 | 13.60 | 0.65 |
+| probe (frozen encoder) | **7.33** | **0.78** | 7.78 | 15.29 | 0.68 |
+
+- **Pretraining helps a little.** The frozen pretrained encoder with a small head beats the same model
+  trained end to end from scratch: test MAE 7.33 against 7.79. Fine-tuning overfits: its training MAE
+  is 2.8 y and its test MAE 7.4 y.
+- **Against published numbers**, 7.3 y on held-out VitalDB people sits at the better end of the open
+  results:
+  - AI-PPG Age zero-shot on VitalDB: 11.5 y;
+  - Brag benchmark on PulseDB: 8.2–9.7 y;
+  - AnyPPG: 6.1 y, on another cohort.
+
+  It is far from Apple's 2.4–3.2 y with 214k people. VitalDB is one hospital and one device, so this
+  is in-domain.
+- **Transfer is weak.** On BIDMC (ICU, mostly elderly, another hospital and monitor) every clock is only
+  slightly better than predicting the median age, and r stays at 0.65–0.68.
+- **The age gap carries no outcome signal yet.** The gap was bias-corrected on validation people and
+  read on the 308 test people (87 hypertensive, 21 diabetic, 29 with ASA ≥ 3; one in-hospital death):
+
+  | outcome | AUC of gap (scratch / finetune / probe) | AUC of age alone |
+  |---|---|---|
+  | hypertension | 0.52 / 0.51 / 0.54 | 0.75 |
+  | diabetes | 0.56 / 0.54 / 0.54 | 0.76 |
+  | ASA ≥ 3 | 0.51 / 0.50 / 0.51 | 0.68 |
+
+  With these counts the AUCs carry about ±0.07 of sampling noise, so none differs from 0.5. By the
+  standard this project uses, run 1 is **not yet a useful aging clock**, only a fair age regressor.
+- **A bias-correction bug, caught in this run.**
+  - The first scoring fitted the correction on the training people. The overfit model's slope is near
+    1 there, so the held-out gap stayed anti-correlated with age (r −0.3 to −0.6), and every age-linked
+    outcome read as a *younger* gap (AUC 0.34–0.43).
+  - `kron_ppg.clock` now fits the correction on validation people and reports age's own AUC beside the
+    gap's.
+  - The table above is recomputed from run 1's saved predictions.
+- **ONNX:** `stream.onnx` for the finetuned clock (24 MB, 25-patch chunks).
+  - It matches PyTorch in ONNX Runtime to 1e-5 y.
+  - In float32 it matches the A100 kernels to 4e-6 y; under bfloat16 autocast the difference is 0.03 y.
+
+Run folders, on haumea: `data/output/runs/kron-ppg/r1-{pretrain,clock-scratch,clock-finetune,clock-probe}`.
+Each holds `metrics.json`, `predictions.csv` and `bidmc.json`.
 
 ## What is not done
 

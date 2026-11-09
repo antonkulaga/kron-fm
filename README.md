@@ -11,7 +11,7 @@ NX-AI's chunkwise Triton kernels, which are vendored here.
 | `kron_core` | The vendored KronLSTM layer and kernels, the causal residual block and state cache, a bidirectional block and a document-masked attention block, packed-sequence helpers, a CPU stand-in for tests | working |
 | `krontime` | Time-series models. First member: the glucose forecaster from [glucose_forecasting_metabonet](../glucose_forecasting_metabonet) | model ported; trainer still in the glucose repo |
 | `kron_dna` | A masked-language model over coding DNA, tokenized by codon | skeleton: data, losses, model and trainer run end to end; nothing pretrained yet |
-| `kron_ppg` | A causal, streaming KronLSTM encoder over raw PPG, with a PPG aging clock and an ONNX streaming graph for a phone | package, tests and export work; no clock result yet |
+| `kron_ppg` | A causal, streaming KronLSTM encoder over raw PPG, with a PPG aging clock and an ONNX streaming graph for a phone | run 1 on 2,000 VitalDB people: test MAE 7.3 y (r 0.78); the age gap does not yet predict outcomes |
 
 ## Setup
 
@@ -125,10 +125,12 @@ uv run kron-ppg export data/output/runs/kron-ppg/<clock run>   # -> <run>/onnx/s
 A PPG age is a within-person trend, never a biological age. It must be shown with the run's error
 band.
 
-Status: the package, its tests (CPU stand-in and GPU kernels) and the ONNX export work, and smoke runs on
-30 VitalDB cases ran end to end. No clock result is reported yet. The first real run needs a few hundred
-to a few thousand VitalDB cases, and then baselines on the same subject splits (age and sex alone,
-pulse-shape features, AI-PPG Age).
+Status: run 1 (2,000 VitalDB people, one A100) reached a held-out MAE of 7.3 y (r 0.78) with the frozen
+pretrained encoder, against 7.8 y from scratch and 11.3 y for predicting the median age. It transfers
+weakly to BIDMC, and its bias-corrected age gap does not yet separate hypertension, diabetes or ASA ≥ 3
+(AUC 0.50–0.56, against 0.68–0.76 for age alone). So it is an age regressor, not yet an aging clock.
+Details are in the report. Next: baselines on the same splits (age and sex, pulse-shape features,
+AI-PPG Age), more VitalDB people, and wrist data.
 
 ## Data and the cluster
 

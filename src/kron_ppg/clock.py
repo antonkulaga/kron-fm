@@ -5,13 +5,17 @@
   check can say.
 * **Bias correction.** Every regression clock regresses toward the training mean (young people read
   old, old people young). The *age gap* used downstream is the residual after regressing prediction on
-  age in the **training** subjects, ``gap = pred - (a + b * age)``, the standard correction (Le Goallec &
-  Patel; Apple's PpgAge uses the same residual), applied unchanged to validation and test.
+  age, ``gap = pred - (a + b * age)``, the standard correction (Le Goallec & Patel; Apple's PpgAge uses the
+  same residual). It is fitted on the **validation** subjects, never the training ones: a model that fits
+  its training subjects closely gives a slope near 1 there, which leaves the held-out gap strongly
+  anti-correlated with age (r -0.3 to -0.6 in kron-ppg's first run), and every age-linked outcome then
+  reads as a *younger* gap. The test gap is the one to read.
 * **Outcome evidence over MAE.** A clock is worth something only if its gap carries information beyond
   age: AI-PPG Age's gap > 9 y gave a MACCE hazard ratio of 2.37 in UK Biobank, PpgAge's 6-year gap a
   hazard ratio of 1.40 for cardiac events. Where a source carries outcome or disease flags (VitalDB's
   ``preop_htn``, ``preop_dm``, ``death_inhosp``; ASA class >= 3), :func:`gap_associations` reports the
-  AUC of the corrected gap for each, on held-out subjects; 0.5 means the gap carries nothing.
+  AUC of the corrected gap for each, on held-out subjects, beside the AUC of age alone; 0.5 means the gap
+  carries nothing, and a gap AUC far below age's says the clock adds little to the calendar.
 """
 from __future__ import annotations
 
@@ -110,17 +114,22 @@ def _flag(value: str, rule: str) -> bool | None:
 
 
 def gap_associations(gaps: Mapping[str, float], table: Mapping[str, Mapping[str, str]],
-                     flags: Mapping[str, str] = OUTCOME_FLAGS) -> dict[str, dict[str, float]]:
-    """For each outcome column present: positives, negatives, the AUC of the gap and the mean gap of each class."""
+                     flags: Mapping[str, str] = OUTCOME_FLAGS,
+                     ages: Mapping[str, float] | None = None) -> dict[str, dict[str, float]]:
+    """For each outcome column present: positives, negatives, the AUC of the gap, the mean gap of each class
+    and, with ``ages``, the AUC of age alone for comparison."""
     out = {}
     for column, rule in flags.items():
-        pairs = [(g, _flag(table.get(s, {}).get(column, ""), rule)) for s, g in gaps.items()]
-        pairs = [(g, f) for g, f in pairs if f is not None]
-        if not pairs:
+        rows = [(s, g, _flag(table.get(s, {}).get(column, ""), rule)) for s, g in gaps.items()]
+        rows = [r for r in rows if r[2] is not None]
+        if not rows:
             continue
-        g = np.array([p[0] for p in pairs])
-        f = np.array([p[1] for p in pairs])
-        out[column] = {"positive": int(f.sum()), "negative": int((~f).sum()), "auc_of_gap": auc(g, f),
-                       "mean_gap_positive": float(g[f].mean()) if f.any() else float("nan"),
-                       "mean_gap_negative": float(g[~f].mean()) if (~f).any() else float("nan")}
+        g = np.array([r[1] for r in rows])
+        f = np.array([r[2] for r in rows])
+        entry = {"positive": int(f.sum()), "negative": int((~f).sum()), "auc_of_gap": auc(g, f),
+                 "mean_gap_positive": float(g[f].mean()) if f.any() else float("nan"),
+                 "mean_gap_negative": float(g[~f].mean()) if (~f).any() else float("nan")}
+        if ages is not None:
+            entry["auc_of_age"] = auc(np.array([ages[r[0]] for r in rows]), f)
+        out[column] = entry
     return out

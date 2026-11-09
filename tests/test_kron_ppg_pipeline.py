@@ -154,8 +154,9 @@ def test_gap_associations_read_outcome_flags_and_skip_unknown_values():
     table = {"x/1": {"preop_htn": "1", "asa": "3"}, "x/2": {"preop_htn": "1", "asa": "2"},
              "x/3": {"preop_htn": "0", "asa": "1"}, "x/4": {"preop_htn": "0", "asa": ""},
              "x/5": {"preop_htn": ""}}
-    out = gap_associations(gaps, table)
+    out = gap_associations(gaps, table, ages={"x/1": 70.0, "x/2": 30.0, "x/3": 60.0, "x/4": 40.0, "x/5": 50.0})
     assert out["preop_htn"]["auc_of_gap"] == 1.0 and out["preop_htn"]["positive"] == 2
+    assert out["preop_htn"]["auc_of_age"] == 0.5
     assert out["asa"]["positive"] == 1 and out["asa"]["negative"] == 2
     assert "death_inhosp" not in out
     assert json.loads(json.dumps(json_safe({"a": float("nan")}))) == {"a": None}

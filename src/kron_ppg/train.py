@@ -267,11 +267,12 @@ def fit_clock(a: ClockArgs) -> dict:
         subj = {k: predict(clock, pool, v, a.batch_size, dev) for k, v in eval_idx.items()}
         arrays = {k: (np.array([p for p, _, _ in d.values()]), np.array([g for _, g, _ in d.values()]))
                   for k, d in subj.items()}
-        bias = fit_bias(*arrays["train"])
+        bias = fit_bias(*arrays["val"])  # held out: see kron_ppg.clock
         out = {"bias": {"a": bias[0], "b": bias[1]},
                **{k: scores(p, g, bias) for k, (p, g) in arrays.items()}}
         gaps = {k: {s: p - (bias[0] + bias[1] * g) for s, (p, g, _) in d.items()} for k, d in subj.items()}
-        out["outcomes"] = {k: gap_associations(gaps[k], pool.table) for k in ("val", "test")}
+        out["outcomes"] = {k: gap_associations(gaps[k], pool.table, ages={s: g for s, (_, g, _) in subj[k].items()})
+                           for k in ("val", "test")}
         return {"scores": out, "subjects": subj, "gaps": gaps}
 
     metrics_path = a.out / "metrics.csv"
