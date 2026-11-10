@@ -54,6 +54,32 @@ def _zip_or_tree(folder: Path, archive: str) -> tuple[list[str], Callable[[str],
     return names, opener
 
 
+def xlsx_rows(path: Path, sheet: int = 1) -> list[list[str]]:
+    """The cells of one sheet of an ``.xlsx`` as rows of text, placed by their references (``C7``), so empty
+    cells keep their columns. The workbook is read as the zip of XML it is; nothing in it is evaluated."""
+    import xml.etree.ElementTree as ET
+
+    ns = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
+    with zipfile.ZipFile(path) as z:
+        shared = []
+        if "xl/sharedStrings.xml" in z.namelist():
+            shared = ["".join(si.itertext()) for si in ET.fromstring(z.read("xl/sharedStrings.xml")).iter(f"{ns}si")]
+        root = ET.fromstring(z.read(f"xl/worksheets/sheet{sheet}.xml"))
+    rows = []
+    for row in root.iter(f"{ns}row"):
+        cells: dict[int, str] = {}
+        for c in row.iter(f"{ns}c"):
+            letters = re.match(r"[A-Z]+", c.get("r", "")).group(0)
+            col = 0
+            for ch in letters:
+                col = col * 26 + ord(ch) - 64
+            v = c.find(f"{ns}v")
+            text = "".join(c.find(f"{ns}is").itertext()) if c.get("t") == "inlineStr" else (v.text if v is not None else "")
+            cells[col - 1] = shared[int(text)] if c.get("t") == "s" and text else (text or "")
+        rows.append([cells.get(i, "") for i in range(max(cells, default=-1) + 1)])
+    return rows
+
+
 # ---- WF-PPG ------------------------------------------------------------------------------------
 #: WF-PPG's samples come at about 100 Hz with jittered timestamps; they are put on this grid.
 WF_PPG_FS = 100.0
@@ -182,8 +208,55 @@ def read_galaxy_active2(folder: Path) -> SourceData:
     return SourceData(subjects, gen())
 
 
+# ---- Vilnius long-term wrist PPG with AF (Zenodo) ------------------------------------------------
+VILNIUS_FS = 100.0
+#: A synchronised segment (up to 35 h) is cut into recordings of at most this long, so the per-recording window
+#: cap of ``prepare`` samples every part of a week-long recording rather than its first day.
+VILNIUS_CHUNK_S = 6 * 3600
+#: Columns 0-29 of ``subject_info.xlsx`` (the last two, free-text medication lists, are left out); ``?`` = unknown.
+VILNIUS_COLUMNS = (
+    "subject", "sex_female", "age", "height", "weight", "alcohol", "smoking", "physical_inactivity",
+    "excessive_physical_activity", "familial_af", "sleep_apnea", "hyperlipidaemia", "hyperglycaemia",
+    "impaired_fasting_glycaemia", "hyperthyroidism", "adrenal_hyperfunction", "hfref", "hfpef",
+    "coronary_artery_disease", "chronic_kidney_disease", "copd_asthma", "stroke_tia", "metabolic_syndrome",
+    "bp_over_140_80", "triglycerides_high", "hdl_low", "waist_high", "glucose_intolerance_diabetes",
+    "hypertension_stage", "antihypertensive_treatment")
+
+
+def read_vilnius_af(folder: Path) -> SourceData:
+    """Wrist green PPG (``PPG_GREEN``, inverted) of each ECG-synchronised segment of each ``NNN_PPG.mat``
+    (MATLAB 7.3, read with h5py as HDF5 datasets), cut into recordings ``<NNN>/<segment>.<chunk>`` of at most
+    :data:`VILNIUS_CHUNK_S`. Subjects: age, sex, body size, risk factors and comorbidities per patient."""
+    import h5py
+
+    rows = xlsx_rows(folder / "subject_info.xlsx")
+    subjects = []
+    for row in rows:
+        if not row or not row[0].strip().isdigit():
+            continue  # the two header rows
+        values = [(row[i] if i < len(row) else "").strip() for i in range(len(VILNIUS_COLUMNS))]
+        rec = {k: ("" if v == "?" else v) for k, v in zip(VILNIUS_COLUMNS, values, strict=True)}
+        rec["subject"] = f"{int(rec['subject']):03d}"
+        rec["sex"] = {"0": "M", "1": "F"}.get(rec["sex_female"], "")
+        subjects.append(rec)
+    files = sorted(folder.glob("[0-9][0-9][0-9]_PPG.mat"))
+    chunk = int(VILNIUS_CHUNK_S * VILNIUS_FS)
+
+    def gen() -> Iterator[Recording]:
+        for path in files:
+            subject = path.name[:3]
+            with h5py.File(path, "r") as f:
+                for k, ref in enumerate(f["PPG_GREEN"][:, 0]):
+                    x = -np.asarray(f[ref][()], np.float64).ravel()
+                    for j, start in enumerate(range(0, len(x), chunk)):
+                        yield Recording(subject, f"{subject}/{k}.{j}", VILNIUS_FS, x[start:start + chunk])
+
+    return SourceData(subjects, gen())
+
+
 UNPACKERS = {"galaxy_active2": unpack_galaxy_active2}
-READERS = {"wf_ppg": read_wf_ppg, "multisite_ppg": read_multisite_ppg, "galaxy_active2": read_galaxy_active2}
+READERS = {"wf_ppg": read_wf_ppg, "multisite_ppg": read_multisite_ppg, "galaxy_active2": read_galaxy_active2,
+           "vilnius_af": read_vilnius_af}
 PARSERS: dict[str, Callable[[Path], np.ndarray]] = {"multisite_watch": multisite_watch,
                                                     "galaxy_active2_day": galaxy_active2_day}
 # Registered into kron_ppg.readers whichever of the two modules is imported first.

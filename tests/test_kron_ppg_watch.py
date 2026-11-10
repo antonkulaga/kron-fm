@@ -139,3 +139,55 @@ def test_galaxy_active2_unpacks_by_device_and_day_and_reads_inverted_10_hz(tmp_p
     assert lengths == [600, 600, 1200]  # the doubled stamp is averaged; the grid spans the times
     x = recs[2].load()
     assert recs[2].fs == 10.0 and np.isfinite(x).all() and x.mean() == pytest.approx(-2.6e6, rel=0.01)
+
+
+def write_xlsx(path, rows):
+    """A minimal one-sheet workbook with inline strings, cells placed by reference (empty ones left out)."""
+    def col(i):
+        name = ""
+        i += 1
+        while i:
+            i, r = divmod(i - 1, 26)
+            name = chr(65 + r) + name
+        return name
+
+    cells = "".join(
+        f'<row r="{r + 1}">' + "".join(f'<c r="{col(c)}{r + 1}" t="inlineStr"><is><t>{v}</t></is></c>'
+                                       for c, v in enumerate(row) if v != "") + "</row>"
+        for r, row in enumerate(rows))
+    sheet = ('<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+             f"<sheetData>{cells}</sheetData></worksheet>")
+    with zipfile.ZipFile(path, "w") as z:
+        z.writestr("xl/worksheets/sheet1.xml", sheet)
+
+
+def fake_vilnius(folder, chunk_s):
+    h5py = pytest.importorskip("h5py")
+    folder.mkdir(parents=True)
+    header = ["Patient ID", "Gender ( 0 - male, 1 - female)", "Age, years"] + [""] * 19 + ["Metabolic syndrome"]
+    second = [""] * 23 + ["Arterial blood pressure >140/80 mmHg"]
+    row = ["06", "1", "77", "162", "85"] + ["0"] * 17 + ["1", "?"] + ["0"] * 4 + ["2", "1", "1 x Metoprololi"]
+    write_xlsx(folder / "subject_info.xlsx", [header, second, row])
+    with h5py.File(folder / "006_PPG.mat", "w") as f:
+        refs = f.create_group("#refs#")
+        lengths = (int(2.5 * chunk_s * 100), int(0.5 * chunk_s * 100))
+        made = []
+        for k, n in enumerate(lengths):
+            made.append(refs.create_dataset(f"s{k}", data=(1e5 - 1e3 * synthetic_ppg(n / 100, 100.0, seed=k))[None, :]).ref)
+        f.create_dataset("PPG_GREEN", data=np.array(made, dtype=h5py.ref_dtype)[:, None])
+    (folder / "007_PPG.mat.part").write_bytes(b"partial")
+
+
+def test_vilnius_reads_the_subject_table_and_cuts_inverted_green_segments(tmp_path, monkeypatch):
+    from kron_ppg import watch_readers
+
+    monkeypatch.setattr(watch_readers, "VILNIUS_CHUNK_S", 20)
+    fake_vilnius(tmp_path / "vilnius_af", 20)
+    data = READERS["vilnius_af"](tmp_path / "vilnius_af")
+    (s,) = data.subjects
+    assert (s["subject"], s["age"], s["sex"], s["height"]) == ("006", "77", "F", "162")
+    assert s["bp_over_140_80"] == "" and s["metabolic_syndrome"] == "1" and s["hypertension_stage"] == "2"
+    recs = list(data.recordings)
+    assert [r.recording for r in recs] == ["006/0.0", "006/0.1", "006/0.2", "006/1.0"]
+    assert [len(r.load()) for r in recs] == [2000, 2000, 1000, 1000]
+    assert recs[0].fs == 100.0 and recs[0].load().mean() == pytest.approx(-1e5, rel=0.01)
