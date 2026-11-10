@@ -348,6 +348,8 @@ def run(folders: Sequence[Path], encoder_path: Path | str | None, out: Path, cap
             emb = embed(encoder, pool, idx, batch_size, device, cutoff)
         people = per_person(pool.subject[idx], pool.age[idx], emb)
         people.save(cache)
+        # each window's embedding too, for how many readings a person needs (float16 keeps it small)
+        np.savez(out / "windows.npz", subject=pool.subject[idx].astype(str), x=emb.astype(np.float16))
     result, cv = evaluate(people, folds, repeats, null, seed)
     result = {"encoder": str(encoder_path), "data": [str(f) for f in folders], "cap": cap, "lowpass_hz": cutoff,
               "folds": folds,
