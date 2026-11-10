@@ -340,3 +340,32 @@ def run(folders: Sequence[Path], encoder_path: Path | str | None, out: Path, cap
     torch.save({"encoder": str(encoder_path), "weight": torch.tensor(w, dtype=torch.float32), "bias": b,
                 "alpha": cv["final"].alpha}, out / "head.pt")
     return result
+
+
+def transfer(train: Sequence[People], test: People, calibrate: People | None = None, seed: int = 0) -> dict:
+    """A head fitted on ``train`` people (other sources), scored on ``test`` people it never saw.
+
+    ``calibrate``: people of the target kind (for example open wrist sets) on which a linear map
+    ``age = a + b * pred`` is fitted after the head, to move a finger-fitted scale onto the wrist; the test
+    people are never used for it. Scores against the test set's own median (an oracle constant that knows the
+    target's age distribution, so a harder baseline than any constant the head could have learnt).
+    """
+    x = np.concatenate([p.x for p in train])
+    y = np.concatenate([p.age for p in train])
+    head = fit_ridge(x, y)
+    pred = head.predict(test.x)
+    out = {"train_people": int(len(y)), "test_people": int(len(test.age)), "alpha": head.alpha}
+    if calibrate is not None:
+        c = head.predict(calibrate.x)
+        b, a = np.polyfit(c, calibrate.age, 1)
+        pred = a + b * pred
+        out["calibration"] = {"people": int(len(calibrate.age)), "a": float(a), "b": float(b)}
+    err = {"model": np.abs(pred - test.age), "oracle_median": np.abs(np.median(test.age) - test.age),
+           "train_median": np.abs(np.median(y) - test.age)}
+    out.update({"mae": float(err["model"].mean()), "mae_oracle_median": float(err["oracle_median"].mean()),
+                "mae_train_median": float(err["train_median"].mean()), "r": _r(pred, test.age),
+                "mean_error": float((pred - test.age).mean()), "interval95": bootstrap(err, seed=seed)})
+    # the ranking alone, with the scale refitted on the test people (an upper bound, not a deployable number)
+    b, a = np.polyfit(pred, test.age, 1)
+    out["mae_rescaled_on_test"] = float(np.abs(a + b * pred - test.age).mean())
+    return out

@@ -80,3 +80,15 @@ def test_handcrafted_reads_the_pulse_rate():
     f = handcrafted(x, fs)
     assert f.shape == (3, 12) and np.isfinite(f).all()
     np.testing.assert_allclose(f[:, 0], [55, 72, 110], rtol=0.05)
+
+
+def test_transfer_scores_a_foreign_head_and_calibration_moves_its_scale():
+    from kron_ppg.wrist_age import transfer
+
+    src = _people(n_per_source=(200,), signal=2.0, source_shift=(40.0,), seed=3)
+    tgt = _people(n_per_source=(100,), signal=2.0, source_shift=(0.0,), seed=4)
+    cal = _people(n_per_source=(50,), signal=2.0, source_shift=(0.0,), seed=5)
+    raw = transfer([src], tgt)
+    fixed = transfer([src], tgt, calibrate=cal)
+    assert raw["r"] > 0.5 and abs(raw["mean_error"]) > 20     # it ranks but reads 40 y off
+    assert abs(fixed["mean_error"]) < 3 and fixed["mae"] < raw["mae"]
