@@ -65,6 +65,29 @@ def test_causal_scaling_uses_only_past_blocks_and_masks_beyond_the_clip(tmp_path
     assert not oks[25 * 100] and xs[25 * 100] == 0.0
 
 
+def test_scale_free_mode_divides_each_block_by_its_own_scale(tmp_path):
+    from kron_ppg.stream_train import StreamPool
+
+    folder = tiny_streams(tmp_path, n=4)
+    causal, own = StreamPool([folder]), StreamPool([folder], scale_mode="own")
+    st = causal.sets[0]
+    sig, blocks = np.array(st.signal), np.array(st.blocks)
+    off = st.table.row(0, named=True)["offset"]
+    b0 = st.table.row(0, named=True)["block_offset"]
+    sig[off + 25 * 60:off + 25 * 110] *= 8.0  # 50 s at 8x amplitude (blocks 6-10 of stream 0)
+    blocks[b0 + 6:b0 + 11, 0] *= 8.0
+    for pool in (causal, own):
+        pool.sets[0].signal, pool.sets[0].blocks = sig, blocks
+    ref, _, _ = own.read(0, 25 * 30, 25 * 10)
+    xc, _, _ = causal.read(0, 25 * 80, 25 * 10)  # block 8: its past (blocks 0-7) is mostly at the old level
+    xo, _, _ = own.read(0, 25 * 80, 25 * 10)
+    level = lambda v: np.percentile(np.abs(v), 75)  # noqa: E731
+    assert level(xc) > 3 * level(ref)  # causal scaling lets the amplitude step through
+    assert 0.5 < level(xo) / level(ref) < 2.0  # scale-free: shape only
+    with pytest.raises(ValueError):
+        StreamPool([folder], scale_mode="window")
+
+
 def test_stream_pretraining_and_the_stream_clock_run_end_to_end(device, tmp_path):
     from kron_ppg.stream_train import StreamClockArgs, StreamPretrainArgs, fit_stream_clock, pretrain_streams
     from kron_ppg.train import load_encoder

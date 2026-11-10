@@ -9,7 +9,9 @@ weighted by the block's pulse periodicity.
 
 Scaling is causal, as on a watch: each sample is divided by the median robust scale of the previous
 ``scale_blocks`` 10 s blocks at least 80 % valid (the stream's first block uses its own), then clipped to
-``clip`` and marked invalid beyond it.
+``clip`` and marked invalid beyond it. With ``scale_mode="own"`` (scale-free) every 10 s block is divided by its
+own robust scale instead, so no amplitude level carries from one block to the next: a stream is seen, like a
+window, as shape only (at most 10 s of look-ahead, the block itself).
 
 * **pretraining**: next-patch L1 (masked, periodicity-weighted) plus, with ``subject_weight``, the
   participant InfoNCE of the window trainer: lanes come in pairs reading two places of the same person, and the
@@ -52,7 +54,11 @@ class StreamPool:
     """Streams of several variants: per stream its source, ``<source>/<subject>`` key and length; per key its
     age and subject-table row; the window trainer's split."""
 
-    def __init__(self, folders: list[Path], scale_blocks: int = 30, clip: float = 20.0) -> None:
+    def __init__(self, folders: list[Path], scale_blocks: int = 30, clip: float = 20.0,
+                 scale_mode: str = "causal") -> None:
+        if scale_mode not in ("causal", "own"):
+            raise ValueError(f"scale_mode is causal or own, not {scale_mode!r}")
+        self.scale_mode = scale_mode
         self.sets = [Streams(f) for f in folders]
         refuse_join(s.info["source"] for s in self.sets)  # a restricted source stays alone
         self.scale_blocks, self.clip = scale_blocks, clip
@@ -110,7 +116,10 @@ class StreamPool:
             prev = past[max(0, b - self.scale_blocks) - lo:b - lo]
             good = prev[(prev[:, 2] >= 0.8) & (prev[:, 0] > 0), 0]
             own = blocks[b, 0] if b < len(blocks) else 0.0
-            scale[j] = np.median(good) if len(good) else (own if own > 0 else 1.0)
+            if self.scale_mode == "own":
+                scale[j] = own if own > 0 else (np.median(good) if len(good) else 1.0)
+            else:
+                scale[j] = np.median(good) if len(good) else (own if own > 0 else 1.0)
             period[j] = blocks[b, 1] if b < len(blocks) else 0.0
         idx = (np.arange(start, stop) // self.block) - b0
         x[:stop - start] /= scale[idx]
@@ -251,6 +260,7 @@ class StreamPretrainArgs:
     eval_lanes: int = 32
     eval_chunks: int = 8
     scale_blocks: int = 30
+    scale_mode: str = "causal"
     seed: int = 0
     device: str = "cuda"
 
@@ -277,7 +287,7 @@ def pretrain_streams(a: StreamPretrainArgs) -> dict:
     torch.manual_seed(a.seed)
     rng = np.random.default_rng(a.seed)
     dev = torch.device(a.device)
-    pool = StreamPool(a.folders, a.scale_blocks)
+    pool = StreamPool(a.folders, a.scale_blocks, scale_mode=a.scale_mode)
     if abs(pool.sample_rate - a.config.sample_rate) > 1e-6:
         raise ValueError(f"the streams are at {pool.sample_rate} Hz and the model reads {a.config.sample_rate} Hz")
     chunk = int(round(a.chunk_s * pool.sample_rate)) // a.config.patch * a.config.patch
@@ -382,6 +392,7 @@ class StreamClockArgs:
     eval_hours: float = 4.0
     eval_lanes: int = 64
     scale_blocks: int = 30
+    scale_mode: str = "causal"
     #: ``uniform``: every valid patch counts the same in a person's pool; ``periodicity``: weighted by the pulse
     #: periodicity of its 10 s block (:data:`POOL_GATE`), a soft quality gate inside the stream
     pool: str = "uniform"
@@ -466,7 +477,7 @@ def fit_stream_clock(a: StreamClockArgs) -> dict:
     torch.manual_seed(a.seed)
     rng = np.random.default_rng(a.seed)
     dev = torch.device(a.device)
-    pool = StreamPool(a.folders, a.scale_blocks)
+    pool = StreamPool(a.folders, a.scale_blocks, scale_mode=a.scale_mode)
     encoder = load_encoder(a.encoder, dev) if a.encoder else KronPPG(a.config).to(dev)
     config = encoder.config
     chunk = int(round(a.chunk_s * pool.sample_rate)) // config.patch * config.patch
@@ -562,7 +573,9 @@ def _cli(argv: list[str]) -> None:
     if len(argv) >= 3 and argv[0] == "memory":  # memory CKPT OUT.json FOLDER... : cold vs warm on the same chunks
         dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         enc = load_encoder(Path(argv[1]), dev)
-        pool = StreamPool([Path(f) for f in argv[3:]])
+        rest = argv[3:]
+        mode = rest[rest.index("--scale-mode") + 1] if "--scale-mode" in rest else "causal"
+        pool = StreamPool([Path(f) for f in rest if not f.startswith("--") and f != mode], scale_mode=mode)
         chunk = int(round(120.0 * pool.sample_rate)) // enc.config.patch * enc.config.patch
         rows = memory_check(enc, pool, pool.keys("val"), 64, chunk, 15, dev)
         Path(argv[2]).write_text(json.dumps(rows, indent=2) + "\n")
