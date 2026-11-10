@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import time
 from pathlib import Path
 
@@ -168,7 +169,11 @@ def export_onnx(model: KronDNA, out_dir: str | Path, seq_len: int = 256, opset: 
     check = example_tokens(4, seq_len, seed=1)
     with torch.no_grad():
         torch_logits, _, torch_embedding = graph(check)
-    session = ort.InferenceSession(str(out / "kron_dna.onnx"), providers=["CPUExecutionProvider"])
+    options = ort.SessionOptions()
+    # The cores this process may use, not the machine's: ONNX Runtime pins one thread per machine core,
+    # which fails (and floods the log) inside a scheduler's CPU allocation.
+    options.intra_op_num_threads = len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else 0
+    session = ort.InferenceSession(str(out / "kron_dna.onnx"), options, providers=["CPUExecutionProvider"])
     ort_logits, _, ort_embedding = session.run(None, {"tokens": check.numpy()})
     valid = check != C.PAD_ID
     verification = [{"what": "ONNX Runtime vs PyTorch plain graph, logits over real tokens",
