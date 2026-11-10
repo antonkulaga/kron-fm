@@ -21,9 +21,10 @@ secretary on the maintainer's word).
   source-median baselines, permutation null, leave-one-source-out, `--lowpass`, `transfer`), commits 1cbae51,
   8642cbc, 68eaf93, 735a86f, e8c0e63, ffc1cd4, 550e798 (wrist-age-export: ONNX with the linear head, timed).
 - Owns since 2026-11-11 00:35 the watch-data work (wrist datasets, stream trainer; its handout and status file sit
-  beside the brief). Jobs: 6428101 kron-s5-chain (eta 01:10), 6428195 kron-w1-pretrain (eta 03:50), plain waiters
-  armed. Then probe-full.sh and the w1/s5 transfer test. Deployable predictor and draft note: see `<status file>`.
+  beside the brief). Jobs: s5 done 2026-11-11 00:52; 6428195 kron-w1-pretrain (eta 03:50), a plain waiter armed. Then probe-full.sh and the w1/s5 transfer test. Deployable predictor and draft note: see `<status file>`.
 - A public research note on the wrist results waits on desk #7 (default nothing public); the watch plan on desk #8.
+- The two Samsung Health exports (Anton's, Livia's) are reported privately (paths in `<status file>`); no PPG in
+  either. `src/kron_ppg/samsung_health.py` reads them; its R-peak detector failed on real watch ECGs.
 - Aurora-BP: research only, never product development (its DUA, read 2026-11-10); a head fitted on it is never the
   deployed model. Open-data heads may be scored on Aurora alone.
 
