@@ -31,6 +31,7 @@ import polars as pl
 import torch
 
 from kron_core.paths import interim_dir
+from kron_ppg.watch_sources import refuse_join
 
 DOMAIN = "ppg"
 
@@ -159,6 +160,7 @@ class Pool:
         lengths = {v.x.shape[1] for v in variants if len(v.x)}
         if len(rates) > 1 or len(lengths) > 1:
             raise ValueError(f"variants differ in rate {sorted(rates)} or window length {sorted(lengths)}")
+        refuse_join(v.info["source"] for v in variants)  # a restricted source stays alone
         self.variants = list(variants)
         self.sample_rate = rates.pop()
         self.which = np.concatenate([np.full(len(v.x), k) for k, v in enumerate(variants)])

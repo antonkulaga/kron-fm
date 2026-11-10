@@ -459,11 +459,60 @@ def read_ppg_sport(folder: Path) -> SourceData:
     return SourceData(subjects, gen())
 
 
+# ---- Aurora-BP (restricted) -------------------------------------------------------------------
+AURORA_FS = 500.0
+AURORA_PROTOCOLS = ("oscillometric", "auscultatory")
+
+
+def aurora_optical(data: bytes) -> np.ndarray:
+    """The optical (wrist PPG) column of one measurement TSV, on its 500 Hz grid. Upright as recorded: its
+    band-passed derivative is right-skewed, like the corrected wrist channels of the other sets."""
+    df = pl.read_csv(data, separator="\t", columns=["t", "optical"], infer_schema=False)
+    return uniform(_values(df["t"]), _values(df["optical"]), AURORA_FS)
+
+
+def read_aurora_bp(folder: Path) -> SourceData:
+    """Every measurement with waveforms of both protocols, ``<pid>/<file stem>``, 30 s each at 500 Hz; age, sex,
+    height, weight and the cardiovascular history per person from ``participants.tsv``. Restricted: the data use
+    agreement forbids joining it with any other source, so it is prepared, trained and probed on alone, and
+    everything written from it is owner-only (:func:`kron_ppg.watch_sources.owner_only`)."""
+    keep = ("age", "gender", "height", "weight", "self_report_htn", "high_blood_pressure", "coronary_artery_disease",
+            "diabetes", "arrythmia", "previous_heart_attack", "previous_stroke", "heart_failure", "aortic_stenosis",
+            "valvular_heart_disease", "other_cv_diseases", "cvd_meds", "fitzpatrick_scale")
+    subjects = [{"subject": r["pid"], **{("sex" if k == "gender" else k): r.get(k, "") for k in keep}}
+                for r in _table_tsv(folder / "participants.tsv") if r.get("pid", "").strip()]
+    measurements = []
+    for protocol in AURORA_PROTOCOLS:
+        table = folder / f"measurements_{protocol}.tsv"
+        if not table.exists():
+            continue
+        measurements += [(protocol, r["pid"], r["waveform_file_path"]) for r in _table_tsv(table)
+                         if r.get("waveforms_generated", "").strip() in ("1", "1.0") and r.get("waveform_file_path")]
+
+    def gen() -> Iterator[Recording]:
+        for protocol in AURORA_PROTOCOLS:
+            archive = folder / f"measurements_{protocol}.zip"
+            if not archive.exists():
+                continue
+            with zipfile.ZipFile(archive) as z:
+                members = set(z.namelist())
+                for proto, pid, name in measurements:
+                    if proto == protocol and name in members:
+                        stem = name.rsplit("/", 1)[-1].removesuffix(".tsv")
+                        yield Recording(pid, f"{pid}/{stem}", AURORA_FS, aurora_optical(z.read(name)))
+
+    return SourceData(subjects, gen())
+
+
+def _table_tsv(path: Path) -> list[dict[str, str]]:
+    return pl.read_csv(path, separator="\t", infer_schema=False).to_dicts()
+
+
 UNPACKERS = {"galaxy_active2": unpack_galaxy_active2}
 READERS = {"wf_ppg": read_wf_ppg, "multisite_ppg": read_multisite_ppg, "galaxy_active2": read_galaxy_active2,
            "vilnius_af": read_vilnius_af, "utsa_ppg": read_utsa_ppg,
            "ppg_dalia": read_ppg_dalia, "wesad": read_wesad,
-           "wildppg": read_wildppg, "ppg_sport": read_ppg_sport}
+           "wildppg": read_wildppg, "ppg_sport": read_ppg_sport, "aurora_bp": read_aurora_bp}
 PARSERS: dict[str, Callable[[Path], np.ndarray]] = {"multisite_watch": multisite_watch,
                                                     "galaxy_active2_day": galaxy_active2_day,
                                                     "galaxy_active2_device": galaxy_active2_device,

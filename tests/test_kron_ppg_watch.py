@@ -350,3 +350,91 @@ def test_whole_recordings_split_only_where_the_signal_stops_for_an_hour(monkeypa
     parts = list(watch_readers.sessions(t, x, 10.0))
     assert [j for j, _ in parts] == [0, 1] and len(parts[0][1]) == 600
     assert abs(len(parts[1][1]) - 19_200) <= 1 and np.isnan(parts[1][1][700])  # 60 + 1800 + 60 s at 10 Hz
+
+
+# ---- Aurora-BP (restricted) ---------------------------------------------------------------------
+def fake_aurora_bp(folder, seconds=32.0):
+    """Aurora-BP's layout: participants and measurement tables (TSV) and a zip of one TSV per measurement at
+    500 Hz, the optical channel upright; one measurement without waveforms."""
+    import os
+
+    folder.mkdir(parents=True)
+    (folder / "participants.tsv").write_text("pid\tage\tgender\theight\tweight\tarrythmia\n"
+                                             "o000\t33.0\tM\t68.0\t200.0\t0\no001\t71.0\tF\t62.0\t150.0\t1\n")
+    rows = ["pid\tphase\tmeasurement\twaveform_file_path\twaveforms_generated"]
+    fs = 500.0
+    t = np.arange(int(seconds * fs)) / fs
+    with zipfile.ZipFile(folder / "measurements_oscillometric.zip", "w") as z:
+        for k, (pid, stem) in enumerate([("o000", "o000.initial.Supine_1"), ("o001", "o001.ambulatory.measurement_3")]):
+            name = f"measurements_oscillometric/{pid}/{stem}.tsv"
+            rows.append(f"{pid}\tinitial\tSupine 1\t{name}\t1")
+            x = synthetic_ppg(seconds, fs, seed=k)
+            body = "\n".join(f"{a:.3f}\t133.5\t{v:.5f}\t2355.5\t0.1\t0.2\t0.3" for a, v in zip(t, x, strict=True))
+            z.writestr(name, "t\tekg\toptical\tpressure\taccel_x\taccel_y\taccel_z\n" + body + "\n")
+    rows.append("o001\tinitial\tSupine 2\tmeasurements_oscillometric/o001/missing.tsv\t0")
+    (folder / "measurements_oscillometric.tsv").write_text("\n".join(rows) + "\n")
+    os.chmod(folder, 0o700)
+
+
+def test_aurora_bp_is_read_upright_and_prepared_owner_only(tmp_path):
+    import os
+    import stat
+
+    fake_aurora_bp(tmp_path / "aurora_bp")
+    data = READERS["aurora_bp"](tmp_path / "aurora_bp")
+    assert [s["age"] for s in data.subjects] == ["33.0", "71.0"] and data.subjects[1]["sex"] == "F"
+    recs = list(data.recordings)
+    assert [r.recording for r in recs] == ["o000/o000.initial.Supine_1", "o001/o001.ambulatory.measurement_3"]
+    assert recs[0].fs == 500.0 and np.allclose(recs[0].signal, synthetic_ppg(32.0, 500.0), atol=1e-4)
+    saved = os.umask(0o022)
+    try:
+        info = prepare_source("aurora_bp", 25.0, 30.0, folder=tmp_path / "aurora_bp", out=tmp_path / "out" / "w",
+                              workers=1)
+    finally:
+        os.umask(saved)
+    assert info["windows"] == 2
+    for p in [tmp_path / "out", *(tmp_path / "out").rglob("*")]:
+        mode = stat.S_IMODE(p.stat().st_mode)
+        assert mode & 0o077 == 0, f"{p} is {oct(mode)}"
+
+
+def test_restricted_sources_are_never_exported_or_joined(tmp_path):
+    from kron_ppg.hub import export_hub
+    from kron_ppg.watch_sources import is_restricted, refuse_join
+
+    assert is_restricted("aurora_bp") and not is_restricted("vitaldb") and not is_restricted("galaxy_active2")
+    with pytest.raises(PermissionError, match="aurora_bp"):
+        export_hub(["bidmc", "aurora_bp"], tmp_path / "hub", "x/y", "t")
+    assert not (tmp_path / "hub").exists()  # refused before anything is written
+    with pytest.raises(PermissionError, match="never joined"):
+        refuse_join(["aurora_bp", "vitaldb"])
+    refuse_join(["aurora_bp"])  # alone is allowed
+    refuse_join(["vitaldb", "galaxy_active2", "wildppg"])
+
+
+def test_aurora_fetch_only_verifies_what_the_owner_placed(tmp_path):
+    import hashlib
+    import json
+    import os
+
+    from kron_ppg.sources import SOURCES
+
+    saved = os.umask(0o022)
+    try:
+        _check_aurora_fetch(SOURCES["aurora_bp"], tmp_path / "aurora_bp", hashlib, json)
+    finally:
+        os.umask(saved)
+
+
+def _check_aurora_fetch(source, folder, hashlib, json):
+    folder.mkdir()
+    with pytest.raises(FileNotFoundError, match="data use agreement"):
+        source.fetch(source, folder, False)
+    (folder / "README.md").write_text("terms")
+    record = {"files": [{"key": "README.md", "size": 5, "checksum": "md5:" + hashlib.md5(b"terms").hexdigest()}]}
+    (folder / "zenodo_record.json").write_text(json.dumps(record))
+    manifest = source.fetch(source, folder, False)
+    assert manifest["notes"]["restricted"] is True and manifest["files"][0]["verified"] == "zenodo md5"
+    (folder / "README.md").write_text("other")
+    with pytest.raises(ValueError, match="md5"):
+        source.fetch(source, folder, False)

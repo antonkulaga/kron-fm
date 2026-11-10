@@ -40,6 +40,7 @@ from kron_core.paths import input_dir, interim_dir
 from kron_ppg.data import DOMAIN, _subject_frame
 from kron_ppg.readers import READERS, Recording
 from kron_ppg.signal import HR_RANGE_BPM, IQR_TO_SD, prepare_signal
+from kron_ppg.watch_sources import owner_only
 
 BLOCK_S = 10.0
 
@@ -129,6 +130,7 @@ def _write_streams(source: str, sample_rate: float, block_s: float, folder: Path
     whole_recordings()
     if source not in READERS:
         raise ValueError(f"no reader for {source!r}; one of {sorted(READERS)}")
+    owner_only(source)  # a restricted source's streams are written owner-only
     folder = folder or input_dir(DOMAIN, source)
     out = out or streams_dir(source, sample_rate)
     out.mkdir(parents=True, exist_ok=True)

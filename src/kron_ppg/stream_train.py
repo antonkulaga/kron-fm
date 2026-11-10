@@ -43,6 +43,7 @@ from kron_ppg.clock import fit_bias, gap_associations, json_safe, scores
 from kron_ppg.data import subject_split
 from kron_ppg.model import AgeHead, KronPPG, KronPPGConfig, PPGAgeClock, patchify
 from kron_ppg.streams import Streams
+from kron_ppg.watch_sources import refuse_join
 from kron_ppg.train import _lr_at, _param_groups, load_encoder
 
 
@@ -53,6 +54,7 @@ class StreamPool:
 
     def __init__(self, folders: list[Path], scale_blocks: int = 30, clip: float = 20.0) -> None:
         self.sets = [Streams(f) for f in folders]
+        refuse_join(s.info["source"] for s in self.sets)  # a restricted source stays alone
         self.scale_blocks, self.clip = scale_blocks, clip
         rows = []
         for k, s in enumerate(self.sets):

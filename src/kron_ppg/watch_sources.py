@@ -34,10 +34,18 @@ and only sets that download without an account, a data-use agreement or a click-
   repository record; the GitHub repository states no licence.
 * ``wesad``: Empatica E4 wrist BVP (64 Hz) and RespiBAN chest ECG in a stress study, 15 people, ages in each
   ``S*_readme.txt``; pickles again, never unpickled.
+* ``aurora_bp`` (restricted): Microsoft Aurora-BP, 1,221 people aged 21-85, 30 s measurements of wrist optical PPG,
+  tonometry and ECG at 500 Hz with cuff blood pressure and cardiovascular history. **Under a data use agreement**
+  the owner accepted by hand: research only, never joined with other data, never redistributed. Never downloaded
+  by ``kron-data``: its fetch only checks the files the owner placed against the Zenodo record. ``notes.restricted``
+  makes ``prepare`` and ``streams`` write owner-only and ``hub-export`` refuse it.
+
+A source with ``notes["restricted"]`` true is never exported, uploaded, committed or joined with another source.
 """
 from __future__ import annotations
 
 import json
+import os
 import urllib.request
 from pathlib import Path
 
@@ -70,6 +78,7 @@ DALIA_URL = "https://archive.ics.uci.edu/static/public/495/ppg+dalia.zip"
 UTSA_URL = "https://drive.usercontent.google.com/download?id=1NP_mngn7YccQO09FdaqQ001wwTMmE0ks&export=download&confirm=t"
 PPG_SPORT_REPO = "LaserHu/PPG-Sport"
 WESAD_URL = "https://uni-siegen.sciebo.de/s/HGdUkoNlW1Ub0Gx/download"
+AURORA_BP_RECORD = 19099166
 
 
 def _get_text(url: str) -> str:
@@ -146,6 +155,50 @@ def github_files(repo: str, prefixes: tuple[str, ...], branch: str = "main") -> 
 def fetch_ppg_sport(source: Source, folder: Path, force: bool) -> dict:
     return fetch_tree(source, folder, force, github_files(PPG_SPORT_REPO, ("dataset/", "participants.xlsx",
                                                                            "readme.md", "cleaned_gt/")))
+
+
+def is_restricted(name: str) -> bool:
+    """Whether a source is held under terms that forbid redistribution or joining (``notes["restricted"]``)."""
+    from kron_ppg.sources import SOURCES as ALL
+
+    return bool(ALL.get(name) and ALL[name].notes.get("restricted"))
+
+
+def refuse_join(sources) -> None:
+    """Raise when a restricted source would be joined with any other source (one training or probe set)."""
+    names = set(sources)
+    if len(names) > 1 and (restricted := sorted(n for n in names if is_restricted(n))):
+        raise PermissionError(f"restricted sources are never joined with other data: {', '.join(restricted)} "
+                              f"with {', '.join(sorted(names - set(restricted)))}")
+
+
+def owner_only(name: str) -> None:
+    """For a restricted source, make everything this process writes from now on owner-only (umask 077)."""
+    if is_restricted(name):
+        os.umask(0o077)
+
+
+def fetch_aurora_bp(source: Source, folder: Path, force: bool) -> dict:
+    """Never downloads: the owner downloads Aurora-BP under its agreement. Checks each file the Zenodo record lists
+    (its ``zenodo_record.json``, saved beside them) by size and md5, and writes an owner-only ``SOURCE.json``."""
+    import hashlib
+
+    os.umask(0o077)
+    record = folder / "zenodo_record.json"
+    if not record.exists():
+        raise FileNotFoundError(f"{folder}: Aurora-BP is obtained by its owner under a data use agreement, not "
+                                "downloaded here; place its files and zenodo_record.json there first")
+    entries = []
+    for f in json.loads(record.read_text())["files"]:
+        path = folder / f["key"]
+        md5 = hashlib.md5()
+        with path.open("rb") as fh:
+            for block in iter(lambda: fh.read(1 << 24), b""):
+                md5.update(block)
+        if path.stat().st_size != f["size"] or f"md5:{md5.hexdigest()}" != f["checksum"]:
+            raise ValueError(f"{path.name}: size or md5 differs from the Zenodo record")
+        entries.append({"file": f["key"], "bytes": f["size"], "md5": md5.hexdigest(), "verified": "zenodo md5"})
+    return write_manifest(folder, source, entries, {"zenodo_record": AURORA_BP_RECORD})
 
 
 def fetch_files(source: Source, folder: Path, force: bool) -> dict:
@@ -268,5 +321,20 @@ SOURCES: dict[str, Source] = {
                "https://archive.ics.uci.edu/dataset/465/wesad+wearable+stress+and+affect+detection",
                {"format": "zip", "fs": 64, "sites": ["wrist"], "never_unpickle": True, "approx_mb": 2_250},
                fetch=fetch_files),
+        Source("aurora_bp", DOMAIN,
+               "Aurora-BP: wrist optical PPG, tonometry and ECG at 500 Hz in 30 s measurements with cuff blood "
+               "pressure, 1,221 people aged 21-85, age and cardiovascular history; restricted (data use agreement)",
+               (), "Microsoft Aurora-BP Data Use Agreement: research only, no joining with other data, no redistribution",
+               "Mieloszyk et al. (2022) A comparison of wearable tonometry, photoplethysmography, and "
+               "electrocardiography for cuffless measurement of blood pressure in an ambulatory setting. IEEE JBHI "
+               "26(7):2864-2875.",
+               "https://github.com/microsoft/aurorabp-sample-data",
+               {"format": "zip of tsv", "fs": 500, "sites": ["wrist"], "restricted": True,
+                "terms": "research only; never joined with other data (no pretraining or training set with any "
+                         "other source; a frozen encoder from elsewhere may be probed on it); never published, "
+                         "uploaded or committed; owner-only files; no diagnostic or product use; publications "
+                         "report results only and cite Mieloszyk et al. 2022",
+                "approx_mb": 6_700},
+               fetch=fetch_aurora_bp),
     )
 }

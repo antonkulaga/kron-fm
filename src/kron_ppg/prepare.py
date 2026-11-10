@@ -16,6 +16,7 @@ from kron_core.paths import input_dir
 from kron_ppg.data import DOMAIN, variant_dir, write_windows
 from kron_ppg.readers import READERS, Recording
 from kron_ppg.signal import cut_windows, prepare_signal
+from kron_ppg.watch_sources import owner_only
 
 
 def _cut(rec: Recording, sample_rate: float, seconds: float, hop: float, max_windows: int | None,
@@ -58,6 +59,7 @@ def prepare_source(source: str, sample_rate: float = 25.0, seconds: float = 30.0
     """
     if source not in READERS:
         raise ValueError(f"no reader for {source!r}; one of {sorted(READERS)}")
+    owner_only(source)  # a restricted source's windows are written owner-only
     folder = folder or input_dir(DOMAIN, source)
     if not folder.exists():
         raise FileNotFoundError(f"{folder} is missing: run `uv run kron-data download {source}` first")

@@ -30,6 +30,7 @@ import polars as pl
 
 from kron_ppg.data import subject_split, variant_dir
 from kron_ppg.sources import SOURCES
+from kron_ppg.watch_sources import is_restricted
 
 #: kron-ppg's split names -> the Hub's
 HUB_SPLITS = {"train": "train", "val": "validation", "test": "test"}
@@ -329,7 +330,11 @@ def export_hub(sources: list[str], out: Path, repo: str, name: str, rates: tuple
                with_vitals: bool = True) -> dict:
     """Export every (source, rate) with ``rate`` at or below the source's own, then write the card. A source
     whose windows have a ``vitals.parquet`` (:func:`find_vitals`) exports them joined, unless ``with_vitals``
-    is off."""
+    is off. A restricted source (``notes["restricted"]``, held under terms that forbid redistribution) is
+    refused before anything is written."""
+    refused = [s for s in sources if is_restricted(s)]
+    if refused:
+        raise PermissionError(f"restricted sources are never exported: {', '.join(refused)}")
     out.mkdir(parents=True, exist_ok=True)
     exported = [export_variant(s, r, out, seconds, folder=(folders or {}).get((s, r)),
                                vitals=find_vitals(s, seconds, (folders or {}).get((s, VITALS_RATE))) if with_vitals
