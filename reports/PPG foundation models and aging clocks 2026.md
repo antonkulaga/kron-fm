@@ -256,10 +256,12 @@ Read through a frozen encoder, it gives a clock with test MAE 6.48 y (r 0.83), a
 run 2's probe, and a trait head whose gain over age for ASA ≥ 3 is +0.148 (0.074–0.223; run 2: +0.12)
 and for `healthy` +0.037 (0.015–0.060); hypertension (+0.014, −0.001–0.029) and diabetes (+0.003) still
 gain nothing, and within-person r for pressure stays at 0.62–0.64. The age gap still carries nothing
-(AUC 0.53–0.55). So far more pretraining keeps paying on both age and the health traits. Over three
-seeds the run 3 clock gives 6.48 / 6.49 / 6.57 (mean 6.51, SD 0.05), against 6.80 ± 0.04 for run 2, so
-the clock's gain of 0.3 y is real; the trait head's is one seed. Run folders `r3-pretrain`,
-`r3-clock-probe` (and `-s1`, `-s2`), `r3-traits-probe`.
+(AUC 0.53–0.55). Over three seeds the run 3 clock gives 6.48 / 6.49 / 6.57 (mean 6.51, SD 0.05),
+against 6.80 ± 0.04 for run 2, so longer pretraining's gain on age, 0.3 y, is real. On the traits it is
+not settled: a second seed of the run 3 head gives ASA ≥ 3 +0.131 (0.058–0.207) and `healthy` +0.030,
+against +0.120 to +0.122 and +0.027 to +0.031 for run 2's three seeds, so the gain there is at most a
+little and within the spread between seeds. Run folders `r3-pretrain`,
+`r3-clock-probe` (and `-s1`, `-s2`), `r3-traits-probe` (and `-s1`).
 
 **Traits from PPG directly (run 2a).** The gap is not the only way to ask whether PPG carries health
 information. Run 2a trained one multi-task head (`kron-ppg traits`) on run 1's encoder for age, BMI,
