@@ -357,10 +357,39 @@ def read_wesad(folder: Path) -> SourceData:
     return SourceData(subjects, gen())
 
 
+# ---- WildPPG ---------------------------------------------------------------------------------------
+WILDPPG_FS = 128.0
+
+
+def read_wildppg(folder: Path) -> SourceData:
+    """The wrist device's green PPG (``wrist.ppg_g.v``, 530 nm, 128 Hz, already systole-up) of each
+    ``WildPPG_Part_<id>.mat`` (MATLAB 5, read with scipy.io.loadmat: arrays and structs only), cut into
+    recordings ``<id>/<chunk>`` of at most :data:`VILNIUS_CHUNK_S`. The files carry no ages; the forehead,
+    sternum and ankle sites, IR and red, and the ECG are left for the bridge."""
+    import scipy.io as sio
+
+    files = sorted(folder.glob("WildPPG_Part_*.mat"))
+    subjects = [{"subject": p.stem.removeprefix("WildPPG_Part_"), "age": ""} for p in files]
+    chunk = int(VILNIUS_CHUNK_S * WILDPPG_FS)
+
+    def gen() -> Iterator[Recording]:
+        for path, s in zip(files, subjects, strict=True):
+            wrist = sio.loadmat(path, variable_names=["wrist"], squeeze_me=True, struct_as_record=False)["wrist"]
+            fs = float(wrist.ppg_g.fs)
+            if fs != WILDPPG_FS:
+                raise ValueError(f"{path.name}: wrist green at {fs} Hz, expected {WILDPPG_FS}")
+            x = np.asarray(wrist.ppg_g.v, np.float64).ravel()
+            for j, start in enumerate(range(0, len(x), chunk)):
+                yield Recording(s["subject"], f"{s['subject']}/{j}", WILDPPG_FS, x[start:start + chunk])
+
+    return SourceData(subjects, gen())
+
+
 UNPACKERS = {"galaxy_active2": unpack_galaxy_active2}
 READERS = {"wf_ppg": read_wf_ppg, "multisite_ppg": read_multisite_ppg, "galaxy_active2": read_galaxy_active2,
            "vilnius_af": read_vilnius_af, "utsa_ppg": read_utsa_ppg,
-           "ppg_dalia": read_ppg_dalia, "wesad": read_wesad}
+           "ppg_dalia": read_ppg_dalia, "wesad": read_wesad,
+           "wildppg": read_wildppg}
 PARSERS: dict[str, Callable[[Path], np.ndarray]] = {"multisite_watch": multisite_watch,
                                                     "galaxy_active2_day": galaxy_active2_day}
 # Registered into kron_ppg.readers whichever of the two modules is imported first.

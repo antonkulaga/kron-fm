@@ -255,3 +255,22 @@ def test_wesad_reads_e4_bvp_and_the_readme_ages(tmp_path):
                               "dominant_hand": "right"}]
     (rec,) = list(data.recordings)
     assert rec.fs == 64.0 and len(rec.load()) == 3840
+
+
+def test_wildppg_reads_the_wrist_green_in_chunks(tmp_path, monkeypatch):
+    import scipy.io as sio
+
+    from kron_ppg import watch_readers
+
+    monkeypatch.setattr(watch_readers, "VILNIUS_CHUNK_S", 20)
+    folder = tmp_path / "wildppg"
+    folder.mkdir()
+    x = synthetic_ppg(50, 128.0)
+    channel = {"fs": 128, "descr": "reflective PPG at 530 nm wavelength", "v": x}
+    sio.savemat(folder / "WildPPG_Part_an0.mat", {"id": "an0", "notes": "", "wrist": {"ppg_g": channel,
+                                                                                         "ppg_ir": channel}})
+    data = READERS["wildppg"](folder)
+    assert data.subjects == [{"subject": "an0", "age": ""}]
+    recs = list(data.recordings)
+    assert [r.recording for r in recs] == ["an0/0", "an0/1", "an0/2"] and recs[0].fs == 128.0
+    assert np.allclose(np.concatenate([r.load() for r in recs]), x)
