@@ -235,12 +235,14 @@ def hub_export(sources: list[str] = typer.Argument(..., help="prepared sources")
                out: Path | None = typer.Option(None, help="output folder (default data/output/hub/<repo name>)"),
                rates: list[float] = typer.Option([25.0], help="rates to export (each prepared; a source "
                                                  "gets only rates at or below its own)"),
-               seconds: float = typer.Option(30.0)) -> None:
+               seconds: float = typer.Option(30.0),
+               vitals: bool = typer.Option(True, help="join per-window vitals where `kron-ppg vitals` wrote them")
+               ) -> None:
     """Prepared windows as a Hugging Face dataset folder: parquet shards per source, rate and split, and a card."""
     from kron_core.paths import output_dir
     from kron_ppg.hub import export_hub
 
     out = out or output_dir() / "hub" / repo.split("/")[-1]
-    summary = export_hub(sources, out, repo, name, tuple(rates), seconds)
+    summary = export_hub(sources, out, repo, name, tuple(rates), seconds, with_vitals=vitals)
     typer.echo(json.dumps(summary, indent=2))
     typer.echo(f"-> {out}")

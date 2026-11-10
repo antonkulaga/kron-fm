@@ -268,6 +268,37 @@ def test_the_hub_export_keeps_the_training_split(tmp_path):
     assert "hf://datasets/someone/ppg/bidmc/25hz" in card and "ODC Attribution License" in card
 
 
+def test_the_hub_export_joins_per_window_vitals_and_documents_them(tmp_path):
+    from kron_ppg.hub import export_hub
+
+    fake_bidmc(tmp_path / "in" / "bidmc")
+    folders = {}
+    for rate in (25.0, 125.0):
+        folders[("bidmc", rate)] = tmp_path / f"prep{rate:g}"
+        prepare_source("bidmc", rate, 30.0, folder=tmp_path / "in" / "bidmc", out=folders[("bidmc", rate)])
+    w = pl.read_parquet(folders[("bidmc", 25.0)] / "windows.parquet", columns=["recording", "start_s"])
+    keep = w.head(len(w) - 1)  # the last window has no vitals: it must come out null, not dropped
+    pl.DataFrame({"recording": keep["recording"], "start_s": keep["start_s"],
+                  "sbp": np.arange(len(keep), dtype=float) + 100, "pat_ms": np.full(len(keep), 210.0),
+                  "bp_source": ["art"] * len(keep)}).write_parquet(folders[("bidmc", 25.0)] / "vitals.parquet")
+    summary = export_hub(["bidmc"], tmp_path / "hub", "someone/ppg", "PPG", rates=(25.0, 125.0), folders=folders)
+    rows = pl.concat([pl.read_parquet(p) for p in sorted((tmp_path / "hub" / "bidmc" / "25hz").glob("*.parquet"))])
+    assert len(rows) == len(w) and {"sbp", "pat_ms", "bp_source"} <= set(rows.columns)
+    got = rows.join(keep.with_columns(pl.Series("want", np.arange(len(keep), dtype=float) + 100)),
+                    on=["recording", "start_s"], how="left")
+    assert got.filter(pl.col("want").is_not_null()).select((pl.col("sbp") == pl.col("want")).all()).item()
+    assert rows["sbp"].null_count() == 1
+    assert sum(s["with_vitals"] for s in summary["bidmc_25hz"]["splits"].values()) == len(keep)
+    rows125 = pl.concat([pl.read_parquet(p) for p in (tmp_path / "hub" / "bidmc" / "125hz").glob("*.parquet")])
+    assert "sbp" in rows125.columns and rows125["sbp"].is_not_null().sum() > 0  # 125 Hz windows join the 25 Hz vitals
+    card = (tmp_path / "hub" / "README.md").read_text()
+    assert "| `pat_ms` | float64 |" in card and "`bidmc_25hz`" in card and "{e0" not in card
+    plain = export_hub(["bidmc"], tmp_path / "hub2", "someone/ppg", "PPG", rates=(25.0,), folders=folders,
+                       with_vitals=False)
+    assert "with_vitals" not in plain["bidmc_25hz"]["splits"]["train"]
+    assert "sbp" not in pl.read_parquet(next((tmp_path / "hub2" / "bidmc" / "25hz").glob("*.parquet"))).columns
+
+
 def test_trait_values_from_the_subject_table():
     from kron_ppg.traits import TRAITS, trait_value
 

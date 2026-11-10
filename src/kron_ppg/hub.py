@@ -8,6 +8,10 @@
   ``train``, ``validation`` and ``test`` as the Hub expects; a source gets only the rates at or below
   its own (GalaxyPPG, recorded at 25 Hz, is never upsampled);
 * ``<source>/subjects.parquet``: the subject table with the same ``split`` column;
+* for VitalDB, once ``kron-ppg vitals vitaldb`` has run, every window also carries the per-window vitals
+  (:mod:`kron_ppg.vitals`: monitor numbers, ECG heart-rate variability, pulse arrival time), joined on
+  ``(recording, start_s)`` from the 25 Hz variant's ``vitals.parquet``; a window with no match there
+  (a 125 Hz window the 25 Hz gate dropped) gets nulls;
 * ``README.md``: the dataset card, with each source's licence, citation and the changes made to it.
 
 Each rate is prepared and quality-gated on its own, so the window sets of two rates overlap closely
@@ -95,10 +99,56 @@ def config_name(source: str, rate: float) -> str:
     return f"{source}_{rate:g}hz"
 
 
+#: vitals columns as the card documents them (:mod:`kron_ppg.vitals`)
+VITAL_DOCS: dict[str, tuple[str, str]] = {
+    "hr": ("float64", "monitor heart rate, bpm (median over the window)"),
+    "spo2": ("float64", "monitor oxygen saturation, %"),
+    "bt": ("float64", "body (core) temperature, degC"),
+    "nibp_sbp": ("float64", "cuff systolic pressure, mmHg (a reading is held until the next, every few minutes)"),
+    "nibp_dbp": ("float64", "cuff diastolic pressure, mmHg"),
+    "nibp_mbp": ("float64", "cuff mean pressure, mmHg"),
+    "art_sbp": ("float64", "arterial-line systolic pressure, mmHg (beat by beat; about half the cases)"),
+    "art_dbp": ("float64", "arterial-line diastolic pressure, mmHg"),
+    "art_mbp": ("float64", "arterial-line mean pressure, mmHg"),
+    "sbp": ("float64", "systolic pressure: the arterial line's where there is one, else the cuff's"),
+    "dbp": ("float64", "diastolic pressure, chosen the same way"),
+    "bp_source": ("string", "`art`, `nibp`, or empty: where `sbp`/`dbp` came from"),
+    "ecg_hr": ("float64", "heart rate from ECG lead II R peaks, bpm"),
+    "rr_ms": ("float64", "median R-R interval, ms"),
+    "sdnn_ms": ("float64", "SDNN over the window's R-R intervals, ms"),
+    "rmssd_ms": ("float64", "RMSSD over the window's R-R intervals, ms"),
+    "pat_ms": ("float64", "pulse arrival time: R peak to the steepest PPG upstroke after it, ms (median)"),
+    "beats": ("float64", "clean beats the ECG features rest on"),
+}
+#: the rate whose variant ``kron-ppg vitals`` writes vitals for
+VITALS_RATE = 25.0
+
+
+def find_vitals(source: str, seconds: float = 30.0, folder: Path | None = None) -> Path | None:
+    """The ``vitals.parquet`` a source's windows join to: the variant's own, else the 25 Hz variant's."""
+    for f in ([folder] if folder else []) + [variant_dir(source, VITALS_RATE, seconds)]:
+        if (f / "vitals.parquet").is_file():
+            return f / "vitals.parquet"
+    return None
+
+
+def join_vitals(windows: pl.LazyFrame, vitals: Path) -> pl.LazyFrame:
+    """Left-join per-window vitals on ``recording`` and ``start_s`` (to the millisecond); unmatched rows get nulls."""
+    v = pl.scan_parquet(vitals)
+    v = v.select([c for c in v.collect_schema().names() if c in ("recording", "start_s", *VITAL_DOCS)])
+    key = pl.col("start_s").mul(1000).round().cast(pl.Int64).alias("_start_ms")
+    v = v.with_columns(key, pl.col("recording").cast(pl.String)).drop("start_s").unique(
+        ["recording", "_start_ms"], keep="first")
+    return (windows.with_columns(key, pl.col("recording").cast(pl.String).alias("_rec"))
+            .join(v.rename({"recording": "_rec"}), on=["_rec", "_start_ms"], how="left")
+            .drop("_rec", "_start_ms"))
+
+
 def export_variant(source: str, rate: float, out: Path, seconds: float = 30.0, shard_rows: int | None = None,
-                   folder: Path | None = None) -> dict:
+                   folder: Path | None = None, vitals: Path | None = None) -> dict:
     """Write one prepared variant's shards under ``out/<source>/<rate>hz`` and the source's subject table;
-    returns its counts. Shards hold about 300 MB of signal each."""
+    returns its counts. Shards hold about 300 MB of signal each. With ``vitals`` (a ``vitals.parquet``),
+    each window gets its vitals columns."""
     folder = folder or variant_dir(source, rate, seconds)
     if not (folder / "windows.parquet").is_file():
         raise FileNotFoundError(f"{folder} is not prepared: run `uv run kron-ppg prepare {source} "
@@ -119,10 +169,17 @@ def export_variant(source: str, rate: float, out: Path, seconds: float = 30.0, s
     shard_rows = shard_rows or max(10_000, 150_000_000 // length)
     windows = pl.scan_parquet(folder / "windows.parquet").with_columns(
         pl.col("subject").replace_strict(split, return_dtype=pl.String).alias("split"))
+    vital_columns: list[str] = []
+    if vitals is not None:
+        windows = join_vitals(windows, vitals)
+        vital_columns = [c for c in windows.collect_schema().names() if c in VITAL_DOCS]
     counts = {}
     for name in HUB_SPLITS.values():
         part = windows.filter(pl.col("split") == name).drop("split").collect()
         counts[name] = {"windows": len(part), "subjects": part["subject"].n_unique()}
+        if vital_columns:
+            counts[name]["with_vitals"] = int(part.select(
+                pl.any_horizontal(pl.col(c).is_not_null() for c in vital_columns if c != "bp_source")).sum().item())
         n_shards = max(1, math.ceil(len(part) / shard_rows))
         for k in range(n_shards):
             part.slice(k * shard_rows, shard_rows).write_parquet(
@@ -131,7 +188,31 @@ def export_variant(source: str, rate: float, out: Path, seconds: float = 30.0, s
         del part
     return {"source": source, "sample_rate": float(info["sample_rate"]), "seconds": float(info["seconds"]),
             "length": length, "windows": info["windows"], "subjects": info["subjects"], "splits": counts,
-            "prepared": info}
+            "prepared": info, "vitals": vital_columns}
+
+
+def vitals_section(exported: list[dict]) -> str:
+    """The card's paragraph on per-window vitals, for the configs that carry them (empty when none do)."""
+    with_vitals = [e for e in exported if e.get("vitals")]
+    if not with_vitals:
+        return ""
+    columns = list(dict.fromkeys(c for e in with_vitals for c in e["vitals"]))
+    configs = ", ".join(f"`{config_name(e['source'], e['sample_rate'])}`" for e in with_vitals)
+    share = ", ".join(
+        f"`{config_name(e['source'], e['sample_rate'])}` "
+        f"{sum(s.get('with_vitals', 0) for s in e['splits'].values()) / max(1, e['windows']):.0%}"
+        for e in with_vitals)
+    rows = "\n".join(f"| `{c}` | {VITAL_DOCS[c][0]} | {VITAL_DOCS[c][1]} |" for c in columns)
+    return f"""{configs} also carry the vitals measured over each window, read from VitalDB's other tracks
+(monitor numerics and ECG lead II, 500 Hz), joined on `(recording, start_s)` from the 25 Hz windows. A
+value is null where its track is missing, out of a plausible range, or (ECG, pulse arrival time) too few
+clean beats were found; a window with no 25 Hz twin has none. Windows with at least one vital: {share}.
+
+| column | type | meaning |
+|---|---|---|
+{rows}
+
+"""
 
 
 def card(name: str, repo: str, exported: list[dict]) -> str:
@@ -187,7 +268,7 @@ Windows (`<source>_<rate>hz` configs):
 | `periodicity` | float32 | the autocorrelation at that beat period (the quality gate keeps >= {e0['prepared']['min_periodicity']}) |
 | `signal` | float16[{secs:g} x rate] | the window, robust-scaled (median 0, IQR/1.349 = 1): {", ".join(f"{int(round(r * secs))} samples at {r:g} Hz" for r in rates)} |
 
-Subjects (`<source>_subjects` configs): `subject`, `age` (years, null when unknown), `sex`, the source's
+""" + vitals_section(exported) + f"""Subjects (`<source>_subjects` configs): `subject`, `age` (years, null when unknown), `sex`, the source's
 other per-person fields, and `split`. VitalDB adds `caseid`, `asa`, `preop_htn`, `preop_dm`,
 `death_inhosp`, `department`, `optype`, `emop` and `bmi` from its case table.
 
@@ -241,10 +322,15 @@ the changes listed above.
 
 
 def export_hub(sources: list[str], out: Path, repo: str, name: str, rates: tuple[float, ...] = (25.0,),
-               seconds: float = 30.0, folders: dict[tuple[str, float], Path] | None = None) -> dict:
-    """Export every (source, rate) with ``rate`` at or below the source's own, then write the card."""
+               seconds: float = 30.0, folders: dict[tuple[str, float], Path] | None = None,
+               with_vitals: bool = True) -> dict:
+    """Export every (source, rate) with ``rate`` at or below the source's own, then write the card. A source
+    whose windows have a ``vitals.parquet`` (:func:`find_vitals`) exports them joined, unless ``with_vitals``
+    is off."""
     out.mkdir(parents=True, exist_ok=True)
-    exported = [export_variant(s, r, out, seconds, folder=(folders or {}).get((s, r)))
+    exported = [export_variant(s, r, out, seconds, folder=(folders or {}).get((s, r)),
+                               vitals=find_vitals(s, seconds, (folders or {}).get((s, VITALS_RATE))) if with_vitals
+                               else None)
                 for s in sources for r in rates if r <= native_rate(s)]
     (out / "README.md").write_text(card(name, repo, exported))
     summary = {config_name(e["source"], e["sample_rate"]): {"windows": e["windows"], "subjects": e["subjects"],
