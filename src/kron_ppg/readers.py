@@ -181,3 +181,7 @@ def _bidmc_pleth(path: Path) -> np.ndarray:
 
 PARSERS = {"bidmc": _bidmc_pleth, "vitaldb": read_vitaldb_track}
 READERS = {"bidmc": read_bidmc, "vitaldb": read_vitaldb, "galaxyppg": read_galaxyppg}
+
+from kron_ppg.watch_readers import PARSERS as _WATCH_PARSERS, READERS as _WATCH_READERS  # noqa: E402  wrist sets
+READERS.update(_WATCH_READERS)
+PARSERS.update(_WATCH_PARSERS)
