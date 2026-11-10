@@ -31,4 +31,4 @@ secretary on the maintainer's word).
   estimate moves (the rigger, agent-chat 2026-11-11).
 
 ## Items to file
-- (none yet)
+- `unattended`: fold `wrist_probe.py` (14ab76c, another session, AUC targets, paired encoder differences) and `wrist_age.py` into one module, keeping both CLIs; watch-data told 2026-11-11.
