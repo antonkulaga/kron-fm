@@ -101,6 +101,23 @@ CodonBench's `onehot_pos` canary). On CodonBERT's mRFP expression task (1,459 sy
 gene; its own 1,021/219/219 split; CAI against E. coli K-12), the baselines score test rho 0.30 (GC),
 0.47 (CAI), 0.59 (codon usage), 0.61 (k-mers) and **0.78 (`onehot_pos`)**: the bar a model has to clear.
 
+**The three objectives, matched** (default 68.6M model, human GRCh38 CDS with 5% of genes held out, 15,000
+steps of 32x1024 tokens each, ~3.3 h on one A100; one seed). `evaluate` on 4,096 rows of each set, bits per
+masked codon split into amino-acid (aa) and synonymous (syn) bits; mRFP is the probe's test rho:
+
+| objective | held-out human genes: total / aa / syn | yeast: total / syn | SynCodonLM test: total / syn | mRFP rho |
+|---|---|---|---|---|
+| mlm | **4.784** / **3.526** / 1.258 | **5.342** / 1.492 | **5.153** / 1.394 | **0.716** |
+| hierarchical (alpha 0.2) | 4.846 / 3.591 / **1.255** | 5.412 / **1.485** | 5.222 / **1.390** | 0.617 |
+| synonymous | 5.562 / 4.289 / 1.273 | 5.885 / 1.501 | 5.726 / 1.408 | 0.629 |
+| untrained twin | | | | 0.496 |
+
+At this budget plain `mlm` is best: lowest total bits everywhere, synonymous bits within 0.01 of the best,
+and the best probe. The synonymous loss does not win even on synonymous bits, its own target. No model
+reaches the `onehot_pos` canary (0.78) on mRFP, a task of one gene's variants where a per-position lookup
+is hard to beat. The GPU export of the hierarchical run matched ONNX Runtime to PyTorch within 4.8e-6
+(logits) and PyTorch to the Triton kernels within 3.3e-3 (max, fp32; mean 2.5e-4).
+
 ```bash
 uv run kron-data download ecoli-k12                    # CAI's reference codon usage
 uv run kron-dna probe mRFP_Expression.csv --run data/output/runs/kron-dna/<run>   # -> data/output/eval/<task>/probe.json
@@ -111,7 +128,8 @@ uv run kron-dna probe mRFP_Expression.csv --run data/output/runs/kron-dna/<run> 
   keeps every isoform of a gene on one side, but paralogs under other gene names still cross);
 - the rest of the evaluation harness: the other CodonBERT and SynCodonLM tasks, leave-one-gene-out
   splits for the multi-gene tasks, cross-validation over seeds (`probe` scores one task on its own split);
-- multi-GPU training and gradient checkpointing.
+- multi-GPU training and gradient checkpointing;
+- a model pretrained on the whole SynCodonLM corpus (training, with `mlm`; no numbers yet).
 
 ## kron-ppg
 
