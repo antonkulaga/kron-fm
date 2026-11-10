@@ -389,3 +389,80 @@ def transfer(train: Sequence[People], test: People, calibrate: People | None = N
     b, a = np.polyfit(pred, test.age, 1)
     out["mae_rescaled_on_test"] = float(np.abs(a + b * pred - test.age).mean())
     return out
+
+
+class LinearAgeHead(torch.nn.Module):
+    """The ridge head as one layer: ``age = weight @ pooled + bias`` (:func:`linear_head`)."""
+
+    def __init__(self, weight: torch.Tensor, bias: float) -> None:
+        super().__init__()
+        self.register_buffer("weight", weight.float().clone())
+        self.register_buffer("bias", torch.tensor(float(bias)))
+
+    def forward(self, pooled: torch.Tensor) -> torch.Tensor:
+        return pooled.float() @ self.weight + self.bias
+
+
+def export(run_dir: Path, out: Path | None = None, chunk: int = 25, window_s: float = 30.0,
+           seconds: float = 300.0, threads: int = 1) -> dict:
+    """The encoder and a run's ridge head as ``stream.onnx``, checked, timed and with the app's recipe.
+
+    The head was fitted on the mean of window embeddings, each window read from a cold memory. The graph
+    reproduces that when the app zeroes the layer memory (not the pool) at every window boundary: the pool
+    then holds the mean over windows of each window's mean hidden state. Checked here against :func:`embed`.
+    """
+    import time
+
+    import onnxruntime as ort
+
+    from kron_ppg.model import PPGAgeClock
+    from kron_ppg.onnx_export import _chunks, empty_state, export_stream, memory_shapes, synthetic_streams
+    from kron_ppg.train import load_encoder
+
+    head = torch.load(run_dir / "head.pt", map_location="cpu", weights_only=True)
+    encoder = load_encoder(head["encoder"], "cpu")
+    clock = PPGAgeClock(encoder, LinearAgeHead(head["weight"], head["bias"])).eval()
+    out = out or run_dir / "onnx"
+    record = export_stream(clock, out, chunk=chunk)
+    c = encoder.config
+    per_window = int(round(window_s / (chunk * c.patch_seconds)))
+    names = ["pool_sum", "pool_count", *[n for n, _ in memory_shapes(clock)]]
+    opts = ort.SessionOptions()
+    opts.intra_op_num_threads = opts.inter_op_num_threads = threads
+    session = ort.InferenceSession(str(out / "stream.onnx"), opts, providers=["CPUExecutionProvider"])
+
+    samples = synthetic_streams(1, seconds, c.sample_rate, seed=11)
+    state = [s.numpy() for s in empty_state(clock, 1)]
+    took = []
+    for k, (piece, ok) in enumerate(_chunks(samples, chunk * c.patch, c.patch)):
+        if k and k % per_window == 0:  # a new window: cold memory, the pool kept
+            state = state[:2] + [np.zeros_like(s) for s in state[2:]]
+        t0 = time.perf_counter()
+        age, *state = session.run(None, {"samples": piece.numpy(), "valid": ok.numpy(), **dict(zip(names, state))})
+        took.append(time.perf_counter() - t0)
+    length = int(window_s * c.sample_rate)
+    windows = samples[0, : (samples.shape[1] // length) * length].reshape(-1, length).numpy()
+
+    class _Pool:
+        sample_rate = c.sample_rate
+
+        def window(self, i):
+            return windows[i]
+
+    dev = "cuda" if torch.cuda.is_available() else "cpu"  # the trained layer's kernels need CUDA
+    reference = embed(encoder.to(dev), _Pool(), np.arange(len(windows)), device=dev).mean(0) @ head["weight"].numpy()
+    encoder.cpu()
+    reference = float(reference + head["bias"])
+    record["app"] = {
+        "recipe": f"band-pass 0.5-8 Hz, resample to {c.sample_rate:g} Hz, cut {window_s:g} s windows, robust-scale "
+                  "each (median, IQR/1.349), drop windows the quality gate refuses (periodicity < 0.35 or any "
+                  f"|x| > 20); feed each window as {per_window} chunks of {chunk * c.patch} samples; zero every "
+                  "recurrent_state/conv_state at each window's start, keep pool_sum/pool_count across windows; "
+                  "the age after the last chunk is the person's estimate",
+        "parity_vs_window_embedding_years": abs(float(np.asarray(age).ravel()[0]) - reference),
+        "parameters": int(sum(p.numel() for p in encoder.parameters())),
+        "chunk_ms_median": 1000 * float(np.median(took[1:])), "threads": threads,
+        "cpu_seconds_per_hour_of_signal": float(np.median(took[1:])) * 3600 / (chunk * c.patch_seconds),
+    }
+    (out / "stream.json").write_text(json.dumps(json_safe(record), indent=2) + "\n")
+    return record

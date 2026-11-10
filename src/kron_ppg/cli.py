@@ -201,6 +201,17 @@ def wrist_age(sources: list[str] = typer.Argument(..., help="prepared sources wi
     typer.echo(f"written to {out}")
 
 
+@app.command("wrist-age-export")
+def wrist_age_export(run: Path = typer.Argument(..., help="a wrist-age run folder (with head.pt)"),
+                     out: Path | None = typer.Option(None, help="folder for stream.onnx (default: <run>/onnx)"),
+                     chunk: int = 25, window: float = 30.0, threads: int = 1) -> None:
+    """The frozen encoder and the run's ridge head as one ONNX streaming graph, checked and timed on the CPU."""
+    from kron_ppg.wrist_age import export, json_safe
+
+    record = export(run, out, chunk, window, threads=threads)
+    typer.echo(json.dumps(json_safe({k: record[k] for k in ("bytes", "checks", "app")}), indent=2))
+
+
 @app.command()
 def vitals(source: str = typer.Argument("vitaldb"), sample_rate: float = 25.0, seconds: float = 30.0,
            workers: int | None = typer.Option(None, help="parallel processes (default: CPUs, at most 16)")) -> None:
