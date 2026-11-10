@@ -250,6 +250,16 @@ pretraining gain of about 1 y is some fifteen times the spread between seeds, an
 AUCs stay between 0.49 and 0.56 in every seed. Seeds show the results are not a training accident; they
 do not shrink the sampling uncertainty of 897 test people, which the bootstrap intervals carry.
 
+**Longer pretraining (run 3).** The run 2 encoder pretrained again for 80,000 steps instead of 40,000
+(same data, objective and seed; 1 h 40 min) reached a validation next-patch L1 of 0.152 (run 2: 0.156).
+Read through a frozen encoder, it gives a clock with test MAE 6.48 y (r 0.83), against 6.80 ± 0.04 for
+run 2's probe, and a trait head whose gain over age for ASA ≥ 3 is +0.148 (0.074–0.223; run 2: +0.12)
+and for `healthy` +0.037 (0.015–0.060); hypertension (+0.014, −0.001–0.029) and diabetes (+0.003) still
+gain nothing, and within-person r for pressure stays at 0.62–0.64. The age gap still carries nothing
+(AUC 0.53–0.55). So far more pretraining keeps paying on both age and the health traits. This is one
+seed; the clock's gain is about eight times the seed spread above. Run folders `r3-pretrain`,
+`r3-clock-probe`, `r3-traits-probe`.
+
 **Traits from PPG directly (run 2a).** The gap is not the only way to ask whether PPG carries health
 information. Run 2a trained one multi-task head (`kron-ppg traits`) on run 1's encoder for age, BMI,
 hypertension, diabetes, ASA ≥ 3 and sex, on the 3,986 people downloaded by then (2,735 train, 637
