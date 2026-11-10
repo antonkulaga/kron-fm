@@ -35,6 +35,25 @@ def pieces(x: np.ndarray, fs: float) -> Iterator[tuple[int, np.ndarray]]:
         yield j, x[start:start + step]
 
 
+#: For whole recordings (``CHUNK_S`` None), timestamped sets are split where no sample comes for this long, so a
+#: stream does not carry hours (or, from a stray clock, years) of empty grid. No signal is cut or dropped.
+SESSION_GAP_S = 3600.0
+
+
+def sessions(t: np.ndarray, x: np.ndarray, fs: float) -> Iterator[tuple[int, np.ndarray]]:
+    """``(j, uniform piece)`` of timestamped samples: one piece per stretch without a gap over
+    :data:`SESSION_GAP_S` (when ``CHUNK_S`` is set, the whole span as one grid, cut by :func:`pieces`)."""
+    if CHUNK_S is not None:
+        yield from pieces(uniform(t, x, fs), fs)
+        return
+    order = np.argsort(t, kind="stable")
+    t, x = t[order], x[order]
+    breaks = np.flatnonzero(np.diff(t) > SESSION_GAP_S) + 1
+    for j, (a, b) in enumerate(zip(np.r_[0, breaks], np.r_[breaks, len(t)], strict=True)):
+        if b - a >= 2:
+            yield j, uniform(t[a:b], x[a:b], fs)
+
+
 def uniform(t: np.ndarray, x: np.ndarray, fs: float) -> np.ndarray:
     """Samples ``x`` taken at times ``t`` (seconds, possibly jittered or unordered), linearly interpolated onto a
     grid at ``fs`` from the first time; samples sharing a time (a batch stamped once) are averaged. Grid points
@@ -146,8 +165,9 @@ def read_multisite_ppg(folder: Path) -> SourceData:
         for s in subjects:
             path = files[s["subject"]]
             if path.is_file():
-                x = multisite_watch(path)
-                for j, part in pieces(x, MULTISITE_FS):
+                with np.load(path, allow_pickle=False) as z:
+                    t, x = z["timestamp"] / 1000.0, -z["ppg_green"].astype(np.float64)
+                for j, part in sessions(t, x, MULTISITE_FS):
                     yield Recording(s["subject"], f"{s['subject']}/watch.{j}", MULTISITE_FS, part)
 
     return SourceData(subjects, gen())
@@ -230,9 +250,11 @@ def read_galaxy_active2(folder: Path) -> SourceData:
     days = sorted((d.parent.name, d.name, d) for d in root.glob("*/*") if d.is_dir())
 
     def gen() -> Iterator[Recording]:
-        if GALAXY_ACTIVE2_UNIT == "device":
+        if GALAXY_ACTIVE2_UNIT == "device":  # whole: a device's four weeks, split only where it went silent
             for device in sorted({d for d, _, _ in days}):
-                yield Recording(device, device, GALAXY_ACTIVE2_FS, path=root / device, parser="galaxy_active2_device")
+                df = pl.concat([pl.read_parquet(p) for p in sorted((root / device).glob("*/part-*.parquet"))])
+                for j, part in sessions(df["ts"].to_numpy() / 1000.0, -df["ppg"].to_numpy(), GALAXY_ACTIVE2_FS):
+                    yield Recording(device, f"{device}/{j}", GALAXY_ACTIVE2_FS, part)
             return
         for device, day, path in days:
             yield Recording(device, f"{device}/{day}", GALAXY_ACTIVE2_FS, path=path, parser="galaxy_active2_day")

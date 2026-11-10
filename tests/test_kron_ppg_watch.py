@@ -337,4 +337,15 @@ def test_wrist_readers_give_whole_recordings_for_streams(tmp_path, monkeypatch):
     fake_galaxy_active2(folder)
     watch_readers.unpack_galaxy_active2(folder, block=5000)
     recs = list(READERS["galaxy_active2"](folder).recordings)
-    assert [r.recording for r in recs] == ["ab12", "cd34"] and len(recs[0].load()) == 1200
+    assert [r.recording for r in recs] == ["ab12/0", "cd34/0"] and len(recs[0].load()) == 1200
+
+
+def test_whole_recordings_split_only_where_the_signal_stops_for_an_hour(monkeypatch):
+    from kron_ppg import watch_readers
+
+    monkeypatch.setattr(watch_readers, "CHUNK_S", None)
+    t = np.r_[np.arange(600) / 10, 1e5 + np.arange(600) / 10, 1e5 + 60 + 1800 + np.arange(600) / 10]  # a stray
+    x = np.arange(len(t), dtype=float)  # clock jump, then a 30 min gap that stays inside its session
+    parts = list(watch_readers.sessions(t, x, 10.0))
+    assert [j for j, _ in parts] == [0, 1] and len(parts[0][1]) == 600
+    assert abs(len(parts[1][1]) - 19_200) <= 1 and np.isnan(parts[1][1][700])  # 60 + 1800 + 60 s at 10 Hz
