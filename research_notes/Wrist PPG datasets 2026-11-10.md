@@ -44,19 +44,18 @@ Verdicts: **P** = pretraining (raw wrist volume), **B** = bridging (wrist with f
 ## Readers (kron-ppg prepare <name>, 25 Hz, 30 s windows)
 | Name | Channel | Polarity | Recording unit | Windows (real data) |
 |---|---|---|---|---|
-| `wf_ppg` | wrist green raw, regridded to 100 Hz | inverted | subject/session | 1,185 from 27 people |
-| `multisite_ppg` | watch green, 100 Hz | inverted | subject/watch.chunk (≤ 6 h) | 7,819 from 20 people |
-| `galaxy_active2` | wrist green, 10 Hz (needs `python -m kron_ppg.watch_readers unpack galaxy_active2`) | inverted | device/UTC day | **303,911 from 49 people** (≈2,530 h of 30 s windows; 682.6 M samples ≈ 19,000 h unpacked) |
-| `vilnius_af` | wrist green, 100 Hz | inverted | patient/segment.chunk (≤ 6 h) | **134,649 from 35 patients** (4 have no PPG) |
-| `utsa_ppg` | wrist green, 100 Hz | inverted | subject/scene | 1,939 from 12 people |
-| `ppg_dalia` | E4 BVP, 64 Hz | upright already | subject | 2,027 from 15 people |
-| `wesad` | E4 BVP, 64 Hz | upright already | subject | 1,395 from 15 people |
-| `wildppg` | wrist green, 128 Hz | upright already | subject/chunk (≤ 6 h) | 5,376 from 16 people |
-| `ppg_sport` | each wrist, 64 Hz | inverted | subject/wrist/activity | 3,512 from 30 people |
-**Outliers:** the long free-living sets carry windows the quality gate passes but robust scaling blows up
-(a spike in a quiet window): non-finite after the float16 cast in vilnius_af 101, galaxy_active2 33; |x| > 50 in
-vilnius_af 2,565, galaxy_active2 17,426, multisite_ppg 225, wildppg 243 (VitalDB: 0 non-finite). Drop them before
-training; the gate fix belongs in `signal.py` (not changed here).
+| `wf_ppg` | wrist green raw, regridded to 100 Hz | inverted | subject/session | 1,183 from 27 people |
+| `multisite_ppg` | watch green, 100 Hz | inverted | subject/watch.chunk (≤ 6 h) | 7,306 from 20 people |
+| `galaxy_active2` | wrist green, 10 Hz (needs `python -m kron_ppg.watch_readers unpack galaxy_active2`) | inverted | device/UTC day | **290,899 from 49 people** (≈2,420 h of 30 s windows; 682.6 M samples ≈ 19,000 h unpacked) |
+| `vilnius_af` | wrist green, 100 Hz | inverted | patient/segment.chunk (≤ 6 h) | **130,508 from 35 patients** (4 have no PPG) |
+| `utsa_ppg` | wrist green, 100 Hz | inverted | subject/scene | 1,924 from 12 people |
+| `ppg_dalia` | E4 BVP, 64 Hz | upright already | subject | 2,014 from 15 people |
+| `wesad` | E4 BVP, 64 Hz | upright already | subject | 1,370 from 15 people |
+| `wildppg` | wrist green, 128 Hz | upright already | subject/chunk (≤ 6 h) | 4,929 from 16 people |
+| `ppg_sport` | each wrist, 64 Hz | inverted | subject/wrist/activity | 3,501 from 30 people |
+**Outliers:** the long free-living sets had windows the first quality gate passed but robust scaling blew up (a
+spike in a quiet window; some became inf in float16). The gate now refuses scaled windows beyond |20| (kron-ppg
+eba8173); the counts above are after it, with no non-finite window left.
 
 Not read: `ptt_ppg` (finger, not wrist) and `wrist_exercise` (WFDB, 8 people; small). Windows use the default cap
 of 240 per recording; `--max-windows` takes more.
