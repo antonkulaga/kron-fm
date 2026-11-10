@@ -92,11 +92,23 @@ set aside (a fixed hash of the `[gene=...]` name, so all isoforms of a gene fall
 codon into amino-acid bits and synonymous bits (the codon given its amino acid), because a model trained
 with the `synonymous` loss never learns the amino acid: only its synonymous bits compare with the others.
 
+`probe` is the first piece of the evaluation harness: frozen features, a ridge head whose penalty is
+chosen on the task's validation split, and Spearman's rho on its test split, for a run's mean hidden
+state, its untrained twin and the model-free baselines (GC, codon usage, CAI, nucleotide k-mers and
+CodonBench's `onehot_pos` canary). On CodonBERT's mRFP expression task (1,459 synonymous variants of one
+gene; its own 1,021/219/219 split; CAI against E. coli K-12), the baselines score test rho 0.30 (GC),
+0.47 (CAI), 0.59 (codon usage), 0.61 (k-mers) and **0.78 (`onehot_pos`)**: the bar a model has to clear.
+
+```bash
+uv run kron-data download ecoli-k12                    # CAI's reference codon usage
+uv run kron-dna probe mRFP_Expression.csv --run data/output/runs/kron-dna/<run>   # -> data/output/eval/<task>/probe.json
+```
+
 **Not built yet:**
 - species-held-out splits within a corpus, and clustering of a genome's paralogs (`prepare --holdout-genes`
   keeps every isoform of a gene on one side, but paralogs under other gene names still cross);
-- the evaluation harness: CodonBERT and SynCodonLM tasks under leave-one-gene-out, the `onehot_pos`
-  canary, k-mer/GC/CAI baselines, and a random-init twin;
+- the rest of the evaluation harness: the other CodonBERT and SynCodonLM tasks, leave-one-gene-out
+  splits for the multi-gene tasks, cross-validation over seeds (`probe` scores one task on its own split);
 - multi-GPU training and gradient checkpointing.
 
 ## kron-ppg

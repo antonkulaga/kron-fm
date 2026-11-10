@@ -362,6 +362,64 @@ def evaluate(run: Path = typer.Argument(..., help="a `kron-dna train` run direct
         typer.echo(json.dumps(result))
 
 
+@app.command()
+def probe(task: Path = typer.Argument(..., help="a CodonBERT-style CSV (Sequence, Value, Split = train/val/test)"),
+          runs: list[Path] = typer.Option([], "--run", help="kron-dna run directories to probe (mean hidden state)"),
+          random_init: bool = typer.Option(True, help="also probe an untrained twin of the first run's configuration"),
+          baselines: bool = typer.Option(True, help="probe gc, codon_usage, cai, kmer and onehot_pos"),
+          cai_reference: str = typer.Option("ecoli-k12", help="a CDS source name or FASTA path for CAI's codon weights"),
+          out: Path | None = typer.Option(None, help="results JSON (default: data/output/eval/<task>/probe.json)"),
+          device: str = "cuda", seed: int = 0) -> None:
+    """Frozen features + ridge head (penalty by the val split), Spearman on the test split, for every feature set."""
+    from kron_dna import probe as P
+    from kron_dna.onnx_export import load_run
+    from kron_core.paths import output_dir
+
+    data = P.read_task(task)
+    missing = {"train", "val", "test"} - set(data)
+    if missing:
+        raise typer.BadParameter(f"{task} lacks the split(s) {sorted(missing)}")
+    seqs = {k: v[0] for k, v in data.items()}
+    ys = {k: v[1] for k, v in data.items()}
+    results: dict[str, dict] = {}
+
+    def run_probe(name: str, featurize) -> None:
+        x = {k: featurize(seqs[k]) for k in ("train", "val", "test")}
+        results[name] = P.ridge_probe(x, ys)
+        typer.echo(f"{name:40s} test rho {results[name]['test_spearman']:+.3f}  val rho "
+                   f"{results[name]['val_spearman']:+.3f}  ({results[name]['dims']} dims, alpha {results[name]['alpha']:g})")
+
+    if baselines:
+        if cai_reference in SOURCES:
+            ref_files = sequence_files(SOURCES[cai_reference].folder(input_dir()))
+            if not ref_files:
+                raise typer.BadParameter(f"run `kron-data download {cai_reference}` first")
+        else:
+            ref_files = [Path(cai_reference)]
+        from kron_dna.data import read_sequences
+        w = P.relative_adaptiveness(seq for f in ref_files for _, seq in read_sequences(f))
+        max_codons = max(len(s) // 3 for split in seqs.values() for s in split)
+        run_probe("gc", P.gc_features)
+        run_probe("codon_usage", P.codon_usage)
+        run_probe("cai", lambda s: P.cai(s, w))
+        run_probe("gc+cai", lambda s: np.concatenate([P.gc_features(s), P.cai(s, w)], axis=1))
+        run_probe("kmer", P.kmer_features)
+        run_probe("onehot_pos", lambda s: P.onehot_pos(s, max_codons))
+    dev = torch.device(device)
+    for i, run in enumerate(runs):
+        model, record = load_run(run)
+        run_probe(f"model:{run.name}", lambda s, m=model: P.model_embeddings(m, s, dev))
+        if i == 0 and random_init:
+            torch.manual_seed(seed)
+            twin = KronDNA(model.config if hasattr(model, "config") else KronDNAConfig(**record["config"]))
+            run_probe("random_init_twin", lambda s, m=twin: P.model_embeddings(m, s, dev))
+    out = out or output_dir("eval", task.stem) / "probe.json"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps({"task": str(task), "n": {k: len(v) for k, v in seqs.items()}, "head": "ridge",
+                               "metric": "spearman", "results": results}, indent=2) + "\n")
+    typer.echo(f"wrote {out}")
+
+
 @app.command("export-onnx")
 def export_onnx_cmd(run: Path = typer.Argument(..., help="a `kron-dna train` run directory or checkpoint"),
                     out: Path | None = typer.Option(None, help="output directory (default: <run>/onnx)"),
