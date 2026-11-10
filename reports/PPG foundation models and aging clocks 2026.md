@@ -263,6 +263,19 @@ against +0.120 to +0.122 and +0.027 to +0.031 for run 2's three seeds, so the ga
 little and within the spread between seeds. Run folders `r3-pretrain`,
 `r3-clock-probe` (and `-s1`, `-s2`), `r3-traits-probe` (and `-s1`).
 
+**Longer still (run 4).** At 160,000 steps (3 h 15 min) the validation L1 reached 0.149. The frozen
+clock gives 6.38 / 6.40 / 6.45 over three seeds (mean 6.41, SD 0.03), against 6.51 for run 3 and 6.80 for
+run 2: each doubling of pretraining has bought less, 0.3 y and then 0.1 y. The trait head did not move
+(ASA ≥ 3 +0.131, 0.053–0.209; `healthy` +0.032; hypertension +0.011; diabetes +0.007; within-person r
+for pressure 0.64), and the gap still carries nothing (AUC 0.52–0.57). More steps on the same 5.85M-
+parameter encoder and the same 4,000 training people are close to spent; the next gains, if any, should
+come from a larger encoder, more people, or other data. Run folders `r4-pretrain`, `r4-clock-probe` (and
+`-s1`, `-s2`), `r4-traits-probe`.
+
+**Not done in this run: foundation-model baselines.** Pulse-PPG, PaPaGei-S and AnyPPG embeddings on the
+same split were being computed by another session; its comparison was not finished when this was
+written, so kron-ppg is not yet compared with them here.
+
 **Traits from PPG directly (run 2a).** The gap is not the only way to ask whether PPG carries health
 information. Run 2a trained one multi-task head (`kron-ppg traits`) on run 1's encoder for age, BMI,
 hypertension, diabetes, ASA ≥ 3 and sex, on the 3,986 people downloaded by then (2,735 train, 637

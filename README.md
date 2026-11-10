@@ -157,7 +157,7 @@ A PPG age is a within-person trend, never a biological age. It must be shown wit
 band.
 
 Status: run 2 (5,887 VitalDB people, one A100) reached a held-out MAE of 6.8 y (r 0.82, 897 test people)
-with the pretrained encoder (6.5 y after twice the pretraining, run 3), against 7.75 y from scratch and 11.7 y for predicting the median age; run 1
+with the pretrained encoder (6.4 y after four times the pretraining, runs 3-4), against 7.75 y from scratch and 11.7 y for predicting the median age; run 1
 (2,000 people) reached 7.3 y. It does not transfer to BIDMC (no better than the median age), and its
 bias-corrected age gap still does not separate hypertension, diabetes or ASA ≥ 3 (AUC 0.49–0.55, every
 95% interval containing 0.5, against 0.62–0.73 for age alone). So it is an age regressor, not yet an
