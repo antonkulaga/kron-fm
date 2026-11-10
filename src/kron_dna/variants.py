@@ -234,8 +234,30 @@ def auroc(score: np.ndarray, label: np.ndarray) -> float | None:
     return float((ranks[pos].sum() - n1 * (n1 + 1) / 2) / (n1 * n0))
 
 
-def summarize(table: pl.DataFrame, scores: dict[str, np.ndarray]) -> list[dict]:
-    """AUROC of every score by consequence (synonymous, missense) and gene split (all, in training, held out)."""
+def bootstrap_ci(metric, *arrays: np.ndarray, n: int = 1000, seed: int = 0, level: float = 0.95) -> list[float] | None:
+    """Percentile interval of ``metric(*arrays)`` over ``n`` resamples of the rows, with replacement.
+
+    Resamples where the metric is undefined (``None``, e.g. one class drawn) are skipped; ``None`` when all are.
+    """
+    rng = np.random.default_rng(seed)
+    rows = len(arrays[0])
+    if rows == 0:
+        return None
+    values = []
+    for _ in range(n):
+        idx = rng.integers(0, rows, rows)
+        v = metric(*(a[idx] for a in arrays))
+        if v is not None:
+            values.append(v)
+    if not values:
+        return None
+    tail = (1 - level) / 2 * 100
+    return [float(np.percentile(values, tail)), float(np.percentile(values, 100 - tail))]
+
+
+def summarize(table: pl.DataFrame, scores: dict[str, np.ndarray], n_boot: int = 1000) -> list[dict]:
+    """AUROC of every score by consequence (synonymous, missense) and gene split (all, in training, held out),
+    with a 95% bootstrap interval over the variants as ``<score>_ci`` (``n_boot`` 0 leaves it out)."""
     out = []
     label = table["label"].to_numpy()
     cons = table["consequence"].to_numpy()
@@ -245,6 +267,9 @@ def summarize(table: pl.DataFrame, scores: dict[str, np.ndarray]) -> list[dict]:
             m = (cons == consequence) & keep
             row = {"consequence": consequence, "genes": split, "pathogenic": int((label[m] == 1).sum()),
                    "benign": int((label[m] == 0).sum())}
-            row |= {name: auroc(s[m], label[m]) for name, s in scores.items()}
+            for name, sc in scores.items():
+                row[name] = auroc(sc[m], label[m])
+                if n_boot:
+                    row[f"{name}_ci"] = bootstrap_ci(auroc, sc[m], label[m], n=n_boot)
             out.append(row)
     return out

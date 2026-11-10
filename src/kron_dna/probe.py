@@ -165,5 +165,9 @@ def ridge_probe(x: dict[str, np.ndarray], y: dict[str, np.ndarray],
     xall, xte2 = _standardize(np.concatenate([x["train"], x["val"]]), x["test"])
     yall = np.concatenate([y["train"], y["val"]])
     w = fit(xall, yall - yall.mean(), best)
-    return {"alpha": best, "val_spearman": scores[best], "test_spearman": rho(xte2 @ w, y["test"]),
+    pred = xte2 @ w
+    from kron_dna.variants import bootstrap_ci
+
+    return {"alpha": best, "val_spearman": scores[best], "test_spearman": rho(pred, y["test"]),
+            "test_spearman_ci": bootstrap_ci(rho, pred, np.asarray(y["test"])),   # 95%, over the test rows
             "dims": int(x["train"].shape[1])}

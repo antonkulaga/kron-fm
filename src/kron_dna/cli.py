@@ -398,7 +398,8 @@ def probe(task: Path = typer.Argument(..., help="a CodonBERT-style CSV (Sequence
     def run_probe(name: str, featurize) -> None:
         x = {k: featurize(seqs[k]) for k in ("train", "val", "test")}
         results[name] = P.ridge_probe(x, ys)
-        typer.echo(f"{name:40s} test rho {results[name]['test_spearman']:+.3f}  val rho "
+        lo, hi = results[name]["test_spearman_ci"] or (float("nan"), float("nan"))
+        typer.echo(f"{name:40s} test rho {results[name]['test_spearman']:+.3f} [{lo:+.3f}, {hi:+.3f}]  val rho "
                    f"{results[name]['val_spearman']:+.3f}  ({results[name]['dims']} dims, alpha {results[name]['alpha']:g})")
 
     if baselines:
@@ -491,8 +492,12 @@ def clinvar(vcf: Path = typer.Option(None, help="ClinVar GRCh38 VCF (default: da
     out = out or output_dir("eval", "clinvar") / "zero_shot.json"
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps({"vcf": str(vcf), "cds": str(fasta), "window": window, "max_per_class": max_per_class, "seed": seed, "score": "log p(alt) - log p(ref)",
-                               "metric": "AUROC of -score, pathogenic positive", "results": summary}, indent=2) + "\n")
-    typer.echo(f"wrote {out}")
+                               "metric": "AUROC of -score, pathogenic positive", "ci": "95% bootstrap over variants, 1000 resamples",
+                               "results": summary}, indent=2) + "\n")
+    per_variant = out.with_suffix(".parquet")         # every variant's scores, for later paired comparisons
+    table.select("id", "gene", "consequence", "label", "in_training").with_columns(
+        [pl.Series(name, s) for name, s in scores.items()]).write_parquet(per_variant)
+    typer.echo(f"wrote {out} and {per_variant}")
 
 
 @app.command("export-onnx")

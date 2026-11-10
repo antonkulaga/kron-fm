@@ -113,7 +113,8 @@ masked codon split into amino-acid (aa) and synonymous (syn) bits; mRFP is the p
 | untrained twin | | | | 0.496 |
 
 At this budget plain `mlm` is best: lowest total bits everywhere, synonymous bits within 0.01 of the best,
-and the best probe. The synonymous loss does not win even on synonymous bits, its own target. No model
+and the best probe point estimate, though its interval (0.632-0.780) overlaps those of hierarchical (0.511-0.693)
+and synonymous (0.548-0.698). The synonymous loss does not win even on synonymous bits, its own target. No model
 reaches the `onehot_pos` canary (0.78) on mRFP, a task of one gene's variants where a per-position lookup
 is hard to beat. The GPU export of the hierarchical run matched ONNX Runtime to PyTorch within 4.8e-6
 (logits) and PyTorch to the Triton kernels within 3.3e-3 (max, fp32; mean 2.5e-4).
@@ -133,27 +134,29 @@ codon, so all of those are kept. "Held-out" means genes of the human runs' 5% ge
 plain-PyTorch graph, the SynCodonLM snapshots on GPU (about a minute each). Every ClinVar gene is in their training
 corpus (it saw no ClinVar labels):
 
-| score | missense: all / held-out genes | synonymous: all / held-out genes |
-|---|---|---|
-| mlm (human, 15k steps) | 0.616 / 0.614 | 0.435 / 0.447 |
-| hierarchical (human, 15k steps) | 0.620 / 0.631 | 0.431 / 0.438 |
-| synonymous (human, 15k steps) | 0.537 / 0.617 | 0.433 / 0.411 |
-| mlm (SynCodonLM, 25k steps) | 0.649 / 0.623 | 0.427 / 0.431 |
-| mlm (SynCodonLM, 50k steps) | **0.705** / **0.658** | 0.423 / 0.435 |
-| codon-usage delta | 0.539 / 0.593 | 0.533 / 0.515 |
-| GC delta | 0.467 / 0.418 | **0.602** / **0.577** |
+| score | missense, all genes | missense, held-out genes | synonymous, all genes |
+|---|---|---|---|
+| mlm (human, 15k steps) | 0.616 (0.604-0.627) | 0.614 (0.561-0.662) | 0.435 (0.413-0.458) |
+| hierarchical (human, 15k steps) | 0.620 (0.609-0.632) | 0.631 (0.584-0.679) | 0.431 (0.410-0.453) |
+| synonymous (human, 15k steps) | 0.537 (0.525-0.548) | 0.618 (0.568-0.666) | 0.433 (0.411-0.455) |
+| mlm (SynCodonLM, 25k steps) | 0.649 (0.638-0.659) | 0.623 (0.571-0.672) | 0.427 (0.406-0.449) |
+| mlm (SynCodonLM, 50k steps) | **0.705** (0.695-0.716) | **0.658** (0.610-0.706) | 0.423 (0.402-0.445) |
+| codon-usage delta | 0.539 (0.528-0.550) | 0.593 (0.545-0.642) | 0.533 (0.510-0.556) |
+| GC delta | 0.467 (0.457-0.476) | 0.418 (0.373-0.465) | **0.602** (0.586-0.618) |
 
-Missense: 5,000 P / 5,000 B overall, of which 263 P / 213 B are in held-out genes. Synonymous: 756 P / 5,000 B
-overall, of which 55 P / 253 B are in held-out genes. The models separate missense variants only weakly, at about 0.62. Protein language models
-are reported near 0.9 on ClinVar missense; a codon model trained for 15k steps on one genome is far from that. Pretraining on many species helps:
-the SynCodonLM model reaches 0.649 after 25k steps and 0.705 after 50k.
-On synonymous variants the models sit below 0.5: pathogenic synonymous SNVs look *more* likely to them than
-benign ones. Pathogenic synonymous variants act mostly through splicing, which a CDS-only model cannot see,
-and the GC change of the substitution alone does better (0.60).
+In brackets: 95% bootstrap intervals over the variants (1,000 resamples). Missense: 5,000 P / 5,000 B overall, of
+which 263 P / 213 B are in held-out genes. Synonymous: 756 P / 5,000 B. Over all missense variants the
+SynCodonLM model at 50k steps is above every other score, its interval clear of theirs. It also improved from 25k to 50k.
+On the 476 held-out-gene variants every model's interval overlaps every other's. The models separate missense variants only weakly. Protein
+language models are reported near 0.9 on ClinVar missense, and a codon model is far from that. All five models sit
+below 0.5 on synonymous variants, their intervals included: pathogenic synonymous SNVs look *more* likely to them
+than benign ones. Pathogenic synonymous variants act mostly through splicing, which a CDS-only model cannot see,
+and the GC change of the substitution alone does better (0.60). The CPU and GPU paths gave the same AUROCs to within
+0.001.
 
 ```bash
 uv sync --inexact --all-groups                          # polars-bio is in the `genomics` group
-uv run kron-dna clinvar --run data/output/runs/kron-dna/<run>   # -> data/output/eval/clinvar/zero_shot.json
+uv run kron-dna clinvar --run data/output/runs/kron-dna/<run>   # -> data/output/eval/clinvar/zero_shot.{json,parquet}
 ```
 
 **SynCodonLM pretraining (running).** `mlm` on the whole corpus (`packed_1024_sp01`: 1% of species held out),
@@ -171,9 +174,9 @@ same 68.6M model and batch, up to 300k steps. Its snapshots, by `evaluate` on 4,
 After 25k steps the corpus model already beats the human-only model on yeast and on SynCodonLM; after 50k it
 also beats it on human genes (4.645 against 4.784), the human-only model's own domain. Human is ~0.1% of
 SynCodonLM, and its genes there are not split by the human hold-out, so the "held-out human genes" row is not
-held out for this model. On the mRFP probe the snapshots reach test rho 0.695 (25k) and 0.642 (50k), against 0.716
-for the human `mlm` model. That is one gene's 219 test variants, and no interval is computed yet, so the drop is not
-read as real.
+held out for this model. On the mRFP probe the snapshots reach test rho 0.695 (0.612-0.757) at 25k and 0.642 (0.545-0.715) at 50k, against 0.716
+(0.632-0.780) for the human `mlm` model. These are 95% bootstrap intervals over the 219 test variants, and they all
+overlap: one gene's split cannot rank these models.
 
 **Not built yet:**
 - clustering of a genome's paralogs (`prepare --holdout-genes`

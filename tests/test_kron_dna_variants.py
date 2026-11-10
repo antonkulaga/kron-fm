@@ -87,3 +87,13 @@ def test_sample_per_class():
     out = V.sample_per_class(t, 2)
     assert out.group_by("label").len().sort("label")["len"].to_list() == [2, 2]
     assert V.sample_per_class(t, 0).height == 10
+
+
+def test_bootstrap_ci_brackets_the_estimate():
+    rng = np.random.default_rng(0)
+    label = np.repeat([1, 0], 200)
+    score = rng.normal(size=400) - label                 # pathogenic lower: AUROC well above 0.5
+    est = V.auroc(score, label)
+    lo, hi = V.bootstrap_ci(V.auroc, score, label, n=200)
+    assert lo < est < hi and 0.5 < lo and hi - lo < 0.2
+    assert V.bootstrap_ci(V.auroc, np.zeros(3), np.ones(3, int), n=10) is None   # one class in every resample
