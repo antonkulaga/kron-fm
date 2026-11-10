@@ -62,6 +62,7 @@ uv run kron-dna train ecoli-k12 --objective hierarchical --steps 2000   # -> dat
 uv run kron-dna export-onnx data/output/runs/kron-dna/<run> --seq-len 256   # -> <run>/onnx/kron_dna.onnx
 uv run kron-dna prepare-stream syncodonlm --workers 6  # -> data/interim/cds/syncodonlm/packed_1024/{train,test}
 uv run kron-dna train <dir>/train --val-data <dir>/test --max-hours 20   # rerun with --out <run> to resume
+uv run kron-dna evaluate data/output/runs/kron-dna/<run> yeast-s288c <dir>/test   # -> <run>/eval/*.json
 uv run kron-dna info --d-model 768 --n-layers 12       # parameter count of a config
 ```
 
@@ -85,6 +86,10 @@ whatever the objective. A run directory that holds a checkpoint is resumed, and 
 cleanly before a job's time limit. By default validation is a random split of packed rows, which shares
 genes with training and only tracks the loss; `--val-data` validates on another prepared directory
 instead: the corpus's `Set=test` rows, or another species' genome.
+
+`evaluate` scores a run on prepared sets with the same masking for every run. It splits bits per masked
+codon into amino-acid bits and synonymous bits (the codon given its amino acid), because a model trained
+with the `synonymous` loss never learns the amino acid: only its synonymous bits compare with the others.
 
 **Not built yet:**
 - gene- and species-held-out splits within a corpus (`--val-data` takes a whole other genome or the

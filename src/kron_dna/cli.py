@@ -292,6 +292,72 @@ def train(data: str = typer.Argument(..., help="a prepared source name or a dire
                 break
 
 
+def masked_scores(logits: torch.Tensor, labels: torch.Tensor) -> dict[str, float]:
+    """Sums over the masked codons of a batch: nats for the codon, for its amino acid and for the codon given
+    its amino acid (the first is the sum of the other two), and correct codon and amino-acid guesses.
+
+    A model trained with the synonymous loss never learns the amino acid, so only its synonymous part is
+    comparable with the other objectives; that is why the parts are reported apart.
+    """
+    from kron_dna.codons import codon_amino_acid_index, synonym_matrix
+
+    keep = labels != -100
+    sel, lab = logits[keep].float(), labels[keep]
+    log_p = torch.log_softmax(sel, dim=-1)
+    allowed = synonym_matrix().to(sel.device)[lab]
+    log_p_aa = torch.logsumexp(log_p.masked_fill(~allowed, float("-inf")), dim=-1)
+    log_p_codon = log_p.gather(1, lab[:, None])[:, 0]
+    aa = codon_amino_acid_index().to(sel.device)
+    guess = sel.argmax(-1)
+    return {"n": float(lab.numel()), "codon_nats": float(-log_p_codon.sum()), "aa_nats": float(-log_p_aa.sum()),
+            "syn_nats": float(-(log_p_codon - log_p_aa).sum()), "codon_correct": float((guess == lab).sum()),
+            "aa_correct": float((aa[guess] == aa[lab]).sum())}
+
+
+@app.command()
+def evaluate(run: Path = typer.Argument(..., help="a `kron-dna train` run directory or checkpoint"),
+             data: list[str] = typer.Argument(..., help="prepared directories or source names to score"),
+             rows: int = typer.Option(4096, help="rows drawn (once, by seed) from each set"),
+             batch_size: int = 32, mask_prob: float = 0.15, seed: int = 0, device: str = "cuda",
+             bf16: bool = True) -> None:
+    """Masked-codon scores of a trained run on prepared sets, written to ``<run>/eval/<set>.json``.
+
+    Bits per masked codon = amino-acid bits + synonymous bits (the codon given its amino acid), and the
+    codon and amino-acid accuracies, with the same masking for every run (fixed seed).
+    """
+    from kron_dna.onnx_export import load_run
+
+    dev = torch.device(device)
+    model, record = load_run(run, map_location="cpu")
+    model = model.to(dev).eval()
+    run_dir = run if run.is_dir() else run.parent
+    autocast = torch.autocast(dev.type, dtype=torch.bfloat16, enabled=bf16 and dev.type == "cuda")
+    for item in data:
+        data_dir = resolve_packed(item)
+        n_total = PackedRows(data_dir).n_total
+        subset = PackedRows(data_dir, _fixed_rows(n_total, rows, seed))
+        loader = torch.utils.data.DataLoader(subset, batch_size=batch_size)
+        gen = torch.Generator(device=dev).manual_seed(seed)
+        totals: dict[str, float] = {}
+        with torch.no_grad(), autocast:
+            for batch in loader:
+                batch = batch.to(dev)
+                inputs, labels = mask_codons(batch, mask_prob, generator=gen)
+                logits, _ = model(inputs, doc_ids=doc_ids_from_tokens(batch))
+                for k, v in masked_scores(logits, labels).items():
+                    totals[k] = totals.get(k, 0.0) + v
+        n, ln2 = totals["n"], math.log(2)
+        result = {"run": str(run_dir), "step": record.get("step"), "objective": record.get("objective"),
+                  "data": str(data_dir), "rows": len(subset), "masked_codons": int(n), "mask_prob": mask_prob,
+                  "seed": seed, "bits_per_codon": totals["codon_nats"] / n / ln2,
+                  "amino_acid_bits": totals["aa_nats"] / n / ln2, "synonymous_bits": totals["syn_nats"] / n / ln2,
+                  "codon_accuracy": totals["codon_correct"] / n, "amino_acid_accuracy": totals["aa_correct"] / n}
+        name = item if item in SOURCES else "-".join(Path(data_dir).parts[-3:])
+        (run_dir / "eval").mkdir(exist_ok=True)
+        (run_dir / "eval" / f"{name}.json").write_text(json.dumps(result, indent=2) + "\n")
+        typer.echo(json.dumps(result))
+
+
 @app.command("export-onnx")
 def export_onnx_cmd(run: Path = typer.Argument(..., help="a `kron-dna train` run directory or checkpoint"),
                     out: Path | None = typer.Option(None, help="output directory (default: <run>/onnx)"),

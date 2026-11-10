@@ -211,3 +211,24 @@ def test_train_stops_on_time_and_resumes_from_its_checkpoint(tmp_path, monkeypat
     assert torch.load(run / "checkpoint.pt", weights_only=False)["step"] == 6
     steps = [int(line.split(",")[0]) for line in (run / "metrics.csv").read_text().splitlines()[1:]]
     assert steps == [1, 2, 4, 6]
+    result = CliRunner().invoke(app, ["evaluate", str(run), str(tmp_path / "packed"), "--device", "cpu", "--no-bf16",
+                                      "--rows", "8", "--batch-size", "4"])
+    assert result.exit_code == 0, result.output
+    scores = json.loads(next((run / "eval").glob("*.json")).read_text())
+    assert scores["step"] == 6 and scores["rows"] == 8
+    assert abs(scores["amino_acid_bits"] + scores["synonymous_bits"] - scores["bits_per_codon"]) < 1e-6
+
+
+def test_masked_scores_split_codon_bits_into_amino_acid_and_synonymous_parts():
+    from kron_dna.cli import masked_scores
+
+    gen = torch.Generator().manual_seed(0)
+    logits = torch.randn(2, 50, C.VOCAB_SIZE, generator=gen)
+    labels = torch.randint(C.FIRST_CODON_ID, C.VOCAB_SIZE, (2, 50), generator=gen)
+    labels[:, ::3] = IGNORE_INDEX
+    s = masked_scores(logits, labels)
+    keep = labels != IGNORE_INDEX
+    ce = torch.nn.functional.cross_entropy(logits[keep], labels[keep], reduction="sum")
+    assert s["n"] == keep.sum() and abs(s["codon_nats"] - float(ce)) < 1e-3
+    assert abs(s["aa_nats"] + s["syn_nats"] - s["codon_nats"]) < 1e-3 and s["syn_nats"] >= 0
+    assert 0 <= s["codon_correct"] <= s["aa_correct"] <= s["n"]
