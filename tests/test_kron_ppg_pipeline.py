@@ -58,6 +58,17 @@ def test_the_quality_gate_reads_the_heart_rate_and_refuses_noise_and_flat_lines(
     assert quality(np.zeros(750), fs).reason == "flat"
 
 
+def test_a_quiet_window_with_one_motion_spike_is_refused_rather_than_stored_past_float16():
+    fs = 25.0
+    x, valid = prepare_signal(synthetic_ppg(60, 125.0, hr=72), 125.0, fs)
+    spiked = x.copy()
+    spiked[100:110] += 2e4 * np.abs(x).max()  # a motion artefact: the IQR is untouched, the spike is huge
+    assert quality(robust_scale(spiked[:750]), fs, max_abs=20.0).reason == "outlier"
+    assert quality(robust_scale(x[:750]), fs, max_abs=20.0).ok
+    w, starts, _ = cut_windows(spiked, valid, fs, 30, 30)
+    assert 0.0 not in starts.tolist() and np.abs(w).max() <= 20.0
+
+
 def test_windows_are_cut_only_where_the_signal_is_valid_and_thinned_evenly():
     fs = 25.0
     x, valid = prepare_signal(synthetic_ppg(300, 500.0), 500.0, fs)

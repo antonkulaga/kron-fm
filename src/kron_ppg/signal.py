@@ -11,8 +11,8 @@ Every source is brought to one form before it is stored in ``data/interim``:
    interquartile range divided by 1.349, the normal-distribution IQR), as PaPaGei, Pulse-PPG and AI-PPG
    Age z-score each input. Amplitude differs by orders of magnitude between devices and placements;
    the shape is what is kept.
-4. A window is kept when it passes :func:`quality`: finite, not flat, not clipped, and periodic at a
-   plausible heart rate. This is a gate against dead or detached sensors, not a full SQI.
+4. A window is kept when it passes :func:`quality`: finite, not flat, not clipped, no scaled sample
+   beyond :data:`MAX_SCALED_ABS`, and periodic at a plausible heart rate. This is a gate against dead or detached sensors, not a full SQI.
 
 A phone does steps 1-3 the same way (a causal band-pass is close enough for the gate) before feeding
 the ONNX stream graph, which then reads the scaled samples patch by patch.
@@ -28,6 +28,10 @@ import numpy as np
 BAND_HZ = (0.5, 8.0)
 #: Heart rates the quality gate accepts, beats per minute.
 HR_RANGE_BPM = (30.0, 200.0)
+#: The largest robust-scaled sample a kept window may hold. A clean pulse stays under about 6 (VitalDB's
+#: 99.9th percentile is 6.3); a quiet window with one motion spike has a tiny IQR, so the spike scales
+#: into the thousands and past float16's 65,504 when the window is stored.
+MAX_SCALED_ABS = 20.0
 #: The normal distribution's interquartile range in standard deviations.
 IQR_TO_SD = 1.349
 
@@ -101,8 +105,10 @@ class Quality:
     periodicity: float
 
 
-def quality(seg: np.ndarray, fs: float, min_periodicity: float = 0.35) -> Quality:
-    """A gate for one scaled window: finite, not flat, not clipped, periodic at a heart rate in range.
+def quality(seg: np.ndarray, fs: float, min_periodicity: float = 0.35, max_abs: float | None = None
+            ) -> Quality:
+    """A gate for one window: finite, not flat, not clipped, periodic at a heart rate in range, and, with
+    ``max_abs`` (for a robust-scaled window), no sample beyond it (reason ``"outlier"``).
 
     Periodicity is the highest normalised autocorrelation at a lag inside :data:`HR_RANGE_BPM`; a clean
     pulse gives 0.7-0.95, motion and a detached sensor give less. The threshold is deliberately loose:
@@ -110,6 +116,8 @@ def quality(seg: np.ndarray, fs: float, min_periodicity: float = 0.35) -> Qualit
     """
     if not np.all(np.isfinite(seg)):
         return Quality(False, "non-finite", float("nan"), 0.0)
+    if max_abs is not None and np.max(np.abs(seg)) > max_abs:
+        return Quality(False, "outlier", float("nan"), 0.0)
     spread = np.percentile(seg, 95) - np.percentile(seg, 5)
     if spread < 1e-6:
         return Quality(False, "flat", float("nan"), 0.0)
@@ -156,7 +164,7 @@ def prepare_signal(raw: np.ndarray, fs: float, target_fs: float, max_gap_s: floa
 def cut_windows(x: np.ndarray, valid: np.ndarray, fs: float, seconds: float, hop_seconds: float,
                 max_windows: int | None = None, min_periodicity: float = 0.35
                 ) -> tuple[np.ndarray, np.ndarray, list[Quality]]:
-    """Robust-scaled windows that are wholly valid and pass :func:`quality`.
+    """Robust-scaled windows that are wholly valid and pass :func:`quality` within :data:`MAX_SCALED_ABS`.
 
     Returns ``(windows (N, L) float32, starts (N,) in seconds, qualities)``. With ``max_windows``, the
     accepted windows are thinned evenly over the recording rather than taken from its start, so a long
@@ -167,7 +175,7 @@ def cut_windows(x: np.ndarray, valid: np.ndarray, fs: float, seconds: float, hop
     out, kept, quals = [], [], []
     for s in starts:
         seg = robust_scale(x[s:s + size])
-        q = quality(seg, fs, min_periodicity)
+        q = quality(seg, fs, min_periodicity, max_abs=MAX_SCALED_ABS)
         if q.ok:
             out.append(seg.astype(np.float32))
             kept.append(s / fs)

@@ -116,7 +116,10 @@ def write_windows(folder: Path, windows: Sequence[np.ndarray], rows: list[dict],
     holding ``subject``, ``recording``, ``start_s``, ``hr_bpm`` and ``periodicity``."""
     folder.mkdir(parents=True, exist_ok=True)
     length = int(round(float(info["seconds"]) * float(info["sample_rate"])))
-    x = (np.concatenate(list(windows)) if len(windows) else np.zeros((0, length))).astype(np.float16)
+    x = np.concatenate(list(windows)) if len(windows) else np.zeros((0, length))
+    if not np.isfinite(x).all() or np.abs(x).max(initial=0.0) > np.finfo(np.float16).max:
+        raise ValueError("windows hold non-finite or out-of-float16-range samples; gate them with quality()")
+    x = x.astype(np.float16)
     if len(x) != len(rows):
         raise ValueError(f"{len(x)} windows and {len(rows)} rows")
     table = pl.DataFrame({
