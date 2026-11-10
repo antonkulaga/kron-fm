@@ -25,5 +25,10 @@ secretary on the maintainer's word).
 - Aurora-BP: research only, never product development (its DUA, read 2026-11-10); a head fitted on it is never the
   deployed model. Open-data heads may be scored on Aurora alone.
 
+## Cluster rules taken up
+- Every sbatch carries `--comment 'seat=kron-fm/ppg-trainer; what=<one line, no person or private data>;
+  eta=<ISO-8601 with offset, or ?>; cuda=<card or ->'`; `scontrol update JobId=<id> Comment='...'` when the
+  estimate moves (the rigger, agent-chat 2026-11-11).
+
 ## Items to file
 - (none yet)
