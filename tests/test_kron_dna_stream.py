@@ -75,3 +75,23 @@ def test_prepare_stream_shards_each_split_like_prepare(tmp_path):
             got = PackedRows(out / split)
             want = np.load(tmp_path / f"ref-{split}" / "tokens.npy")
             assert np.array_equal(np.stack([got[i].numpy() for i in range(len(got))]), want)
+
+
+def test_prepare_stream_holds_out_whole_species(tmp_path):
+    from kron_dna.data import held_out
+
+    rng = np.random.default_rng(2)
+    path = tmp_path / "corpus.csv"
+    with path.open("w", newline="") as fh:
+        w = csv.writer(fh)
+        w.writerow(["CDS", "Species", "Group", "Set"])
+        for i in range(400):
+            w.writerow(["ATG" + "GCC" * 40 + "TAA", f"sp{i % 40}", "plant", ["Train", "Test"][i % 4 == 0]])
+    summary = prepare_stream(path, tmp_path / "out", seq_len=64, holdout_species=0.2, chunk_size=37)
+    held = {f"sp{k}" for k in range(40) if held_out(f"sp{k}", 0.2)}
+    assert 0 < len(held) < 40
+    meta = json.loads((tmp_path / "out" / "species_holdout" / "meta.json").read_text())
+    assert set(meta["species"]) == held and meta["sequences"] == 10 * len(held)
+    for split in ("train", "test"):
+        assert not held & set(json.loads((tmp_path / "out" / split / "meta.json").read_text())["species"])
+    assert sum(v["sequences"] for v in summary["splits"].values()) == 400

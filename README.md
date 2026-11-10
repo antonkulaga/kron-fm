@@ -77,13 +77,15 @@ corpus: it reads the CSV line by line, checks and encodes sequences with numpy l
 processes (the same verdicts and tokens as `check_cds` and `encode`, which the tests check), and writes each
 value of the corpus's own `Set` column as its own directory of `uint8` shards (`tokens_00000.npy`, 256 MB
 each) with a `meta.json` listing the shards, the counts, the filter rejects and the species and group
-tallies. `PackedRows` reads either layout by memory map. The corpus is already MMseqs2-clustered per
+tallies. `--holdout-species 0.01` sends that fraction of species (a fixed hash of the name) to a third
+directory, `species_holdout`, whatever their `Set`. `PackedRows` reads either layout by memory map. The corpus is already MMseqs2-clustered per
 species at 90% identity by its authors, so it is not clustered again.
 
 `train` uses AdamW, a 10% linear warmup, cosine decay and bf16 autocast. It writes `checkpoint.pt` (with
 the optimizer state), `config.json` and `metrics.csv`; `val_bits_per_codon` is the plain cross-entropy
 whatever the objective. A run directory that holds a checkpoint is resumed, and `--max-hours` stops a run
-cleanly before a job's time limit. By default validation is a random split of packed rows, which shares
+cleanly before a job's time limit, and `--snapshot-every N` keeps the weights every N steps under
+`snapshots/` for later probing. By default validation is a random split of packed rows, which shares
 genes with training and only tracks the loss; `--val-data` validates on another prepared directory
 instead: the corpus's `Set=test` rows, another species' genome, or the genes `prepare --holdout-genes 0.05`
 set aside (a fixed hash of the `[gene=...]` name, so all isoforms of a gene fall on one side).
@@ -105,7 +107,7 @@ uv run kron-dna probe mRFP_Expression.csv --run data/output/runs/kron-dna/<run> 
 ```
 
 **Not built yet:**
-- species-held-out splits within a corpus, and clustering of a genome's paralogs (`prepare --holdout-genes`
+- clustering of a genome's paralogs (`prepare --holdout-genes`
   keeps every isoform of a gene on one side, but paralogs under other gene names still cross);
 - the rest of the evaluation harness: the other CodonBERT and SynCodonLM tasks, leave-one-gene-out
   splits for the multi-gene tasks, cross-validation over seeds (`probe` scores one task on its own split);

@@ -205,9 +205,10 @@ def test_train_stops_on_time_and_resumes_from_its_checkpoint(tmp_path, monkeypat
     assert result.exit_code == 0, result.output
     first = torch.load(run / "checkpoint.pt", weights_only=False)
     assert first["step"] == 1 and "optimizer" in first
-    result = CliRunner().invoke(app, args)
+    result = CliRunner().invoke(app, args + ["--snapshot-every", "3"])
     assert result.exit_code == 0, result.output
     assert "resuming at step 1" in result.output
+    assert sorted(p.name for p in (run / "snapshots").iterdir()) == ["step_3.pt", "step_6.pt"]
     assert torch.load(run / "checkpoint.pt", weights_only=False)["step"] == 6
     steps = [int(line.split(",")[0]) for line in (run / "metrics.csv").read_text().splitlines()[1:]]
     assert steps == [1, 2, 4, 6]

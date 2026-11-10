@@ -100,7 +100,10 @@ def prepare_stream_cmd(source: str = typer.Argument(..., help="a CSV source name
                        alt_starts: bool | None = typer.Option(None, help="also accept GTG and TTG starts (default: the source's setting)"),
                        shard_rows: int = typer.Option(262_144, help="rows per shard (256 MB at 1,024 tokens)"),
                        workers: int = typer.Option(1, help="processes that check and encode sequences"),
-                       max_rows: int | None = typer.Option(None, help="stop after this many CSV rows (for trials)")) -> None:
+                       max_rows: int | None = typer.Option(None, help="stop after this many CSV rows (for trials)"),
+                       holdout_species: float = typer.Option(0.0, help="this fraction of species (hashed names) to a "
+                                                                       "species_holdout split"),
+                       seed: int = typer.Option(0, help="seed of the species hash")) -> None:
     """Stream a large CSV corpus into sharded packed rows, keeping its own train/test split."""
     from kron_dna.stream import prepare_stream
 
@@ -121,7 +124,8 @@ def prepare_stream_cmd(source: str = typer.Argument(..., help="a CSV source name
                              species_column=notes.get("species_column", "Species"),
                              group_column=notes.get("group_column", "Group"),
                              sequence_column=notes.get("sequence_column", "CDS"),
-                             shard_rows=shard_rows, workers=workers, max_rows=max_rows)
+                             shard_rows=shard_rows, workers=workers, max_rows=max_rows,
+                             holdout_species=holdout_species, seed=seed)
     typer.echo(f"wrote {out}")
     typer.echo(json.dumps(summary, indent=2))
 
@@ -179,6 +183,8 @@ def train(data: str = typer.Argument(..., help="a prepared source name or a dire
           val_fraction: float = 0.01, eval_every: int = 500, eval_batches: int = 20,
           checkpoint_every: int = typer.Option(0, help="steps between checkpoints (default: every evaluation)"),
           max_hours: float = typer.Option(0.0, help="stop cleanly, with a checkpoint, after this many hours (0: no limit)"),
+          snapshot_every: int = typer.Option(0, help="also keep the weights (no optimizer) as snapshots/step_N.pt "
+                                                     "every this many steps (0: never)"),
           num_workers: int = 2, seed: int = 0, device: str = "cuda", bf16: bool = True) -> None:
     """Pretrain with AdamW, linear warmup and cosine decay (SynCodonLM's schedule); resumable."""
     if objective not in OBJECTIVES:
@@ -290,6 +296,10 @@ def train(data: str = typer.Argument(..., help="a prepared source name or a dire
                 hours = hours_before + (time.time() - t0) / 3600
                 _save_atomic({"model": model.state_dict(), "optimizer": opt.state_dict(), "config": config.to_dict(),
                               "step": step, "objective": objective, "steps": steps, "hours": hours}, ckpt_path)
+            if snapshot_every and step % snapshot_every == 0:
+                (out / "snapshots").mkdir(exist_ok=True)
+                _save_atomic({"model": model.state_dict(), "config": config.to_dict(), "step": step,
+                              "objective": objective}, out / "snapshots" / f"step_{step}.pt")
             if stop:
                 if out_of_time and step < steps:
                     typer.echo(f"stopped at step {step} of {steps} after {max_hours} h; rerun with --out {out} to resume")

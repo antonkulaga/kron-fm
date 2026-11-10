@@ -28,6 +28,7 @@ from pathlib import Path
 
 import numpy as np
 
+from kron_dna.data import held_out
 from kron_dna.codons import CLS_ID, EOS_ID, GENETIC_CODE, PAD_ID, STOP_CODONS, TOKEN_ID, UNK_ID, VOCAB_SIZE
 
 _BASE = np.full(256, 4, dtype=np.uint8)
@@ -206,8 +207,13 @@ def _bounded_map(pool: ProcessPoolExecutor, items: Iterator, window: int) -> Ite
 def prepare_stream(path: str | Path, out_dir: str | Path, seq_len: int = 1024, starts: tuple[str, ...] = ("ATG",),
                    split_column: str = "Set", species_column: str = "Species", group_column: str = "Group",
                    sequence_column: str = "CDS", shard_rows: int = 262_144, workers: int = 1,
-                   chunk_size: int = 20_000, max_rows: int | None = None, log_every: int = 1_000_000) -> dict:
-    """Stream one CSV into sharded packed rows, one prepared directory per value of ``split_column``."""
+                   chunk_size: int = 20_000, max_rows: int | None = None, log_every: int = 1_000_000,
+                   holdout_species: float = 0.0, seed: int = 0) -> dict:
+    """Stream one CSV into sharded packed rows, one prepared directory per value of ``split_column``.
+
+    With ``holdout_species`` > 0, that fraction of species (a fixed hash of the name, whatever their
+    ``split_column`` says) goes to its own directory, ``species_holdout``, for a species-held-out validation.
+    """
     path, out = Path(path), Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
     columns = (split_column, species_column, group_column)
@@ -227,7 +233,7 @@ def prepare_stream(path: str | Path, out_dir: str | Path, seq_len: int = 1024, s
     try:
         for result in results:
             for reason, tokens, set_name, species, group in result:
-                s = split(set_name)
+                s = split("species_holdout" if held_out(species, holdout_species, seed) else set_name)
                 if reason is not None:
                     s["rejected"][reason] += 1
                     continue
@@ -254,7 +260,9 @@ def prepare_stream(path: str | Path, out_dir: str | Path, seq_len: int = 1024, s
         meta = {"seq_len": seq_len, "rows": rows, "sequences": s["sequences"], "codons": s["codons"],
                 "fill": s["writer"].non_pad / max(1, rows * seq_len), "rejected": dict(s["rejected"]),
                 "starts": list(starts), "vocab_size": VOCAB_SIZE, "inputs": [str(path)],
-                "keep": {split_column: key}, "shards": shards, "n_species": len(s["species"]),
+                "keep": {split_column: key} if key != "species_holdout" else {"holdout_species": holdout_species,
+                                                                              "seed": seed},
+                "shards": shards, "n_species": len(s["species"]),
                 "groups": dict(s["groups"].most_common()), "species": dict(s["species"].most_common())}
         (out / key / "meta.json").write_text(json.dumps(meta, indent=1) + "\n")
         summary[key] = {k: meta[k] for k in ("rows", "sequences", "codons", "fill", "rejected", "n_species", "groups")}
