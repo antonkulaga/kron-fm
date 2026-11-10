@@ -326,10 +326,41 @@ def read_ppg_dalia(folder: Path) -> SourceData:
     return SourceData(subjects, gen())
 
 
+# ---- WESAD -------------------------------------------------------------------------------------------
+def _wesad_readme(text: str) -> dict[str, str]:
+    """``Age: 28``, ``Gender: male``, ``Height (cm): 178`` ... lines of a WESAD ``S*_readme.txt``."""
+    keys = {"age": "age", "gender": "sex", "height (cm)": "height", "weight (kg)": "weight",
+            "dominant hand": "dominant_hand"}
+    out = {}
+    for line in text.splitlines():
+        key, _, value = line.partition(":")
+        if key.strip().lower() in keys:
+            value = value.strip()
+            out[keys[key.strip().lower()]] = value[:1].upper() if key.strip().lower() == "gender" else value
+    return out
+
+
+def read_wesad(folder: Path) -> SourceData:
+    """The E4's wrist BVP (64 Hz, worn on the non-dominant wrist) per participant from ``S*_E4_Data.zip``, age
+    and body size from ``S*_readme.txt``; the ``S*.pkl`` files are pickles and are never opened."""
+    z = zipfile.ZipFile(folder / "WESAD.zip")
+    names = z.namelist()
+    ids = sorted({int(m[1]) for n in names if (m := re.search(r"/S(\d+)/S\d+_E4_Data\.zip$", n))})
+    subjects = [{"subject": f"S{i}", **_wesad_readme(z.read(f"WESAD/S{i}/S{i}_readme.txt").decode(errors="replace"))}
+                for i in ids]
+
+    def gen() -> Iterator[Recording]:
+        for i in ids:
+            x, fs = e4_bvp(z.read(f"WESAD/S{i}/S{i}_E4_Data.zip"))
+            yield Recording(f"S{i}", f"S{i}", fs, x)
+
+    return SourceData(subjects, gen())
+
+
 UNPACKERS = {"galaxy_active2": unpack_galaxy_active2}
 READERS = {"wf_ppg": read_wf_ppg, "multisite_ppg": read_multisite_ppg, "galaxy_active2": read_galaxy_active2,
            "vilnius_af": read_vilnius_af, "utsa_ppg": read_utsa_ppg,
-           "ppg_dalia": read_ppg_dalia}
+           "ppg_dalia": read_ppg_dalia, "wesad": read_wesad}
 PARSERS: dict[str, Callable[[Path], np.ndarray]] = {"multisite_watch": multisite_watch,
                                                     "galaxy_active2_day": galaxy_active2_day}
 # Registered into kron_ppg.readers whichever of the two modules is imported first.

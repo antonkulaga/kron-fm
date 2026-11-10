@@ -232,7 +232,8 @@ SOURCES: dict[str, Source] = {
                "WESAD: Empatica E4 wrist BVP (64 Hz) and chest ECG in a stress study, 15 people, age per person; "
                "the archive's pickles are never unpickled",
                (RemoteFile(WESAD_URL, "WESAD.zip", 2_249_444_501),),
-               "not yet verified: read the archive's readme (UCI dataset 465 lists it; the authors ask for citation)",
+               "none stated in the archive's readme, which asks for citation of Schmidt et al. 2018; distributed openly "
+               "through UCI (dataset 465), whose licence was not read",
                "Schmidt, Reiss, Duerichen, Marberger & Van Laerhoven (2018) Introducing WESAD, a multimodal dataset "
                "for wearable stress and affect detection. ICMI. UCI 465, doi 10.24432/C57K5T.",
                "https://archive.ics.uci.edu/dataset/465/wesad+wearable+stress+and+affect+detection",

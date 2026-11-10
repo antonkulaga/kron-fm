@@ -240,3 +240,18 @@ def test_ppg_dalia_reads_e4_bvp_from_the_nested_archive_and_never_the_pickles(tm
     assert [(s["subject"], s["age"], s["sex"]) for s in data.subjects] == [("S1", "34", "F"), ("S10", "55", "F")]
     recs = list(data.recordings)
     assert [r.recording for r in recs] == ["S1", "S10"] and recs[0].fs == 64.0 and len(recs[0].load()) == 3840
+
+
+def test_wesad_reads_e4_bvp_and_the_readme_ages(tmp_path):
+    folder = tmp_path / "wesad"
+    folder.mkdir()
+    with zipfile.ZipFile(folder / "WESAD.zip", "w") as z:
+        z.writestr("WESAD/S10/S10_E4_Data.zip", e4_export(40 * synthetic_ppg(60, 64.0, seed=3)))
+        z.writestr("WESAD/S10/S10_readme.txt", "### Personal information ###\nAge: 28\nHeight (cm): 178\n"
+                                               "Weight (kg): 76\nGender: male\nDominant hand: right\n")
+        z.writestr("WESAD/S10/S10.pkl", b"not to be opened")
+    data = READERS["wesad"](folder)
+    assert data.subjects == [{"subject": "S10", "age": "28", "height": "178", "weight": "76", "sex": "M",
+                              "dominant_hand": "right"}]
+    (rec,) = list(data.recordings)
+    assert rec.fs == 64.0 and len(rec.load()) == 3840
