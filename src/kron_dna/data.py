@@ -16,7 +16,9 @@ from __future__ import annotations
 import csv
 import gzip
 import json
+import re
 import sys
+import zlib
 from collections import Counter
 from collections.abc import Iterable, Iterator
 from pathlib import Path
@@ -121,44 +123,72 @@ def pack(docs: Iterable[list[int]], seq_len: int) -> Iterator[np.ndarray]:
         yield np.array(row + [PAD_ID] * (seq_len - len(row)), dtype=np.uint8)
 
 
+_GENE = re.compile(r"\[gene=([^\]]+)\]")
+
+
+def gene_of(header: str) -> str:
+    """The gene a FASTA record belongs to: NCBI's ``[gene=...]`` tag, else the whole header."""
+    m = _GENE.search(header)
+    return m.group(1) if m else header
+
+
+def held_out(gene: str, fraction: float, seed: int = 0) -> bool:
+    """Whether a gene falls in the held-out set: a fixed hash of its name, so every isoform goes the same way."""
+    return fraction > 0 and zlib.crc32(f"{seed}:{gene}".encode()) / 2**32 < fraction
+
+
 def prepare(paths: Iterable[str | Path], out_dir: str | Path, seq_len: int = 1024,
             starts: tuple[str, ...] = ("ATG",), max_sequences: int | None = None,
-            keep: dict[str, str] | None = None) -> dict:
+            keep: dict[str, str] | None = None, holdout_genes: float = 0.0, seed: int = 0) -> dict:
     """Filter, tokenize and pack coding sequences (FASTA or CSV) into ``out_dir/tokens.npy`` and ``meta.json``.
 
-    Holds the packed rows in memory, which is fine for tens of millions of codons; a corpus of
-    SynCodonLM's size (43.5M sequences, ~18B codons) needs sharded output, not written yet.
+    With ``holdout_genes`` > 0, that fraction of genes (by :func:`gene_of`, all isoforms together) goes to a
+    sibling directory ``<out_dir>_holdout`` instead, for a gene-held-out validation. Paralogs with other gene
+    names still cross the split; only clustering removes those.
+
+    Holds the packed rows in memory, which is fine for tens of millions of codons; for a corpus of
+    SynCodonLM's size use :func:`kron_dna.stream.prepare_stream`.
     """
     out = Path(out_dir)
-    out.mkdir(parents=True, exist_ok=True)
+    targets = {"train": out} | ({"holdout": out.parent / f"{out.name}_holdout"} if holdout_genes > 0 else {})
+    counts = {k: {"kept": 0, "codons": 0, "genes": set()} for k in targets}
     rejected: Counter[str] = Counter()
-    kept = codons = 0
-
-    def docs() -> Iterator[list[int]]:
-        nonlocal kept, codons
-        for path in paths:
-            for _, seq in read_sequences(path, keep=keep):
-                if max_sequences is not None and kept >= max_sequences:
-                    return
-                reason = check_cds(seq, starts=starts)
-                if reason is not None:
-                    rejected[reason] += 1
-                    continue
-                tokens = encode(seq)
-                kept += 1
-                codons += len(tokens) - 2
-                yield from documents(tokens, seq_len)
-
-    rows = list(pack(docs(), seq_len))
-    if not rows:
-        raise ValueError("no sequence passed the checks")
-    tokens = np.stack(rows)
-    np.save(out / "tokens.npy", tokens)
-    meta = {"seq_len": seq_len, "rows": int(tokens.shape[0]), "sequences": kept, "codons": codons,
-            "fill": float((tokens != PAD_ID).mean()), "rejected": dict(rejected), "starts": list(starts),
-            "vocab_size": VOCAB_SIZE, "inputs": [str(p) for p in paths], "keep": keep or {}}
-    (out / "meta.json").write_text(json.dumps(meta, indent=2) + "\n")
-    return meta
+    docs: dict[str, list[list[int]]] = {k: [] for k in targets}
+    kept = 0
+    for path in paths:
+        for header, seq in read_sequences(path, keep=keep):
+            if max_sequences is not None and kept >= max_sequences:
+                break
+            reason = check_cds(seq, starts=starts)
+            if reason is not None:
+                rejected[reason] += 1
+                continue
+            gene = gene_of(header)
+            split = "holdout" if held_out(gene, holdout_genes, seed) else "train"
+            tokens = encode(seq)
+            kept += 1
+            c = counts[split]
+            c["kept"] += 1
+            c["codons"] += len(tokens) - 2
+            c["genes"].add(gene)
+            docs[split].extend(documents(tokens, seq_len))
+    metas = {}
+    for split, target in targets.items():
+        rows = list(pack(docs[split], seq_len))
+        if not rows:
+            raise ValueError(f"no sequence passed the checks for the {split} split")
+        tokens = np.stack(rows)
+        target.mkdir(parents=True, exist_ok=True)
+        np.save(target / "tokens.npy", tokens)
+        c = counts[split]
+        meta = {"seq_len": seq_len, "rows": int(tokens.shape[0]), "sequences": c["kept"], "codons": c["codons"],
+                "fill": float((tokens != PAD_ID).mean()), "rejected": dict(rejected), "starts": list(starts),
+                "vocab_size": VOCAB_SIZE, "inputs": [str(p) for p in paths], "keep": keep or {}}
+        if holdout_genes > 0:
+            meta |= {"split": split, "genes": len(c["genes"]), "holdout_genes": holdout_genes, "seed": seed}
+        (target / "meta.json").write_text(json.dumps(meta, indent=2) + "\n")
+        metas[split] = meta
+    return metas["train"] if holdout_genes <= 0 else metas
 
 
 def doc_ids_from_tokens(tokens: torch.Tensor) -> torch.Tensor:

@@ -232,3 +232,19 @@ def test_masked_scores_split_codon_bits_into_amino_acid_and_synonymous_parts():
     assert s["n"] == keep.sum() and abs(s["codon_nats"] - float(ce)) < 1e-3
     assert abs(s["aa_nats"] + s["syn_nats"] - s["codon_nats"]) < 1e-3 and s["syn_nats"] >= 0
     assert 0 <= s["codon_correct"] <= s["aa_correct"] <= s["n"]
+
+
+def test_prepare_holds_out_whole_genes(tmp_path):
+    from kron_dna.data import gene_of, held_out
+
+    fasta = tmp_path / "cds.fa"
+    records = [(f"g{g}", _cds(40 + i, 10 * g + i)) for g in range(40) for i in range(3)]
+    fasta.write_text("".join(f">lcl|x_{n} [gene={gene}] [protein=p]\n{seq}\n" for n, (gene, seq) in enumerate(records)))
+    assert gene_of(">lcl|x [gene=OR4F5] [db_xref=a]") == "OR4F5" and gene_of("plain") == "plain"
+    metas = prepare([fasta], tmp_path / "packed", seq_len=128, holdout_genes=0.25)
+    out_genes = {g for g, _ in records if held_out(g, 0.25)}
+    assert 0 < len(out_genes) < 40
+    assert metas["holdout"]["genes"] == len(out_genes) and metas["train"]["genes"] == 40 - len(out_genes)
+    assert metas["holdout"]["sequences"] == 3 * len(out_genes)
+    assert metas["train"]["sequences"] + metas["holdout"]["sequences"] == 120
+    assert (tmp_path / "packed_holdout" / "tokens.npy").is_file() and (tmp_path / "packed" / "tokens.npy").is_file()

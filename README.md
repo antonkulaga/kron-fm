@@ -85,15 +85,16 @@ the optimizer state), `config.json` and `metrics.csv`; `val_bits_per_codon` is t
 whatever the objective. A run directory that holds a checkpoint is resumed, and `--max-hours` stops a run
 cleanly before a job's time limit. By default validation is a random split of packed rows, which shares
 genes with training and only tracks the loss; `--val-data` validates on another prepared directory
-instead: the corpus's `Set=test` rows, or another species' genome.
+instead: the corpus's `Set=test` rows, another species' genome, or the genes `prepare --holdout-genes 0.05`
+set aside (a fixed hash of the `[gene=...]` name, so all isoforms of a gene fall on one side).
 
 `evaluate` scores a run on prepared sets with the same masking for every run. It splits bits per masked
 codon into amino-acid bits and synonymous bits (the codon given its amino acid), because a model trained
 with the `synonymous` loss never learns the amino acid: only its synonymous bits compare with the others.
 
 **Not built yet:**
-- gene- and species-held-out splits within a corpus (`--val-data` takes a whole other genome or the
-  corpus's own test set);
+- species-held-out splits within a corpus, and clustering of a genome's paralogs (`prepare --holdout-genes`
+  keeps every isoform of a gene on one side, but paralogs under other gene names still cross);
 - the evaluation harness: CodonBERT and SynCodonLM tasks under leave-one-gene-out, the `onehot_pos`
   canary, k-mer/GC/CAI baselines, and a random-init twin;
 - multi-GPU training and gradient checkpointing.

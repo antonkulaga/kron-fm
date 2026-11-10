@@ -63,7 +63,10 @@ def prepare(inputs: list[str] = typer.Argument(..., help="a source name (`kron-d
             seq_len: int = typer.Option(1024, help="tokens per packed row"),
             alt_starts: bool | None = typer.Option(None, help="also accept GTG and TTG starts (default: the source's setting)"),
             keep_set: str | None = typer.Option(None, help="CSV sources: keep rows whose Set column has this value (train, test)"),
-            max_sequences: int | None = typer.Option(None, help="stop after this many accepted sequences")) -> None:
+            max_sequences: int | None = typer.Option(None, help="stop after this many accepted sequences"),
+            holdout_genes: float = typer.Option(0.0, help="this fraction of genes (all isoforms) to <out>_holdout, "
+                                                          "for gene-held-out validation"),
+            seed: int = typer.Option(0, help="seed of the gene hash")) -> None:
     """Filter, tokenize and pack coding sequences."""
     source = SOURCES.get(inputs[0]) if len(inputs) == 1 else None
     if source is not None:
@@ -83,7 +86,8 @@ def prepare(inputs: list[str] = typer.Argument(..., help="a source name (`kron-d
             raise typer.BadParameter("--out is needed when the inputs are paths")
         alt, keep = bool(alt_starts), ({"Set": keep_set} if keep_set else None)
     starts = ("ATG", "GTG", "TTG") if alt else ("ATG",)
-    meta = prepare_rows(paths, out, seq_len=seq_len, starts=starts, max_sequences=max_sequences, keep=keep)
+    meta = prepare_rows(paths, out, seq_len=seq_len, starts=starts, max_sequences=max_sequences, keep=keep,
+                        holdout_genes=holdout_genes, seed=seed)
     typer.echo(f"wrote {out}")
     typer.echo(json.dumps(meta, indent=2))
 
