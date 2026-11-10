@@ -22,8 +22,7 @@ secretary on the maintainer's word).
   8642cbc, 68eaf93, 735a86f. `wrist-age-export` (ONNX graph with the linear head, timed) uncommitted until its
   first job (wa5) passes.
 - Jobs wa3/wa4/wa5 (`kron-ppg-wa*`), watched by a background waiter.
-- A public research note on the wrist results waits on the desk (a scientific claim in a public file); the numbers
-  are in `<status file>` meanwhile.
+- A public research note on the wrist results waits on desk #7 (default nothing public); the watch plan on desk #8.
 - Aurora-BP: research only, never product development (its DUA, read 2026-11-10); a head fitted on it is never the
   deployed model. Open-data heads may be scored on Aurora alone.
 
