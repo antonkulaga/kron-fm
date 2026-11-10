@@ -1,29 +1,43 @@
 # kron-fm's seats (the seats kit, agent-seat-blueprints). Committed: it declares the seats and holds no key.
-# The messenger accounts stay on each machine, in its pool. Declared by the desk's secretary on the owner's word
-# (Anton, 2026-11-10: "allocate a seat for kron-fm ... a proper samsung-watch friendly age predictor").
+# The messenger accounts stay on each machine, in its pool.
 [repo]
 # Also the name of the repository's channel in the Zulip organisation, and the id the desk registers it under.
 id = "kron-fm"
 
-# The PPG trainer (docs/seats/PPG_TRAINER.md): trains kron-ppg toward a Samsung-watch age predictor.
+# The PPG trainer (docs/seats/PPG_TRAINER.md): trains kron_ppg, its runs, its verdicts. One clone of its own.
 [seat.ppg-trainer]
 roles = "trainer"
-role = "trainer"
-# The organisation's rigger says a share or a cluster fact changed; the desk's secretary relays the maintainers'
-# answers (a wake, never an instruction).
-wake_from = "desk-antonkulaga/rigger */secretary"
-# A quiet seat: it works whether the maintainer is there or not, its questions on the desk.
+role = "trainer"    # for kit releases up to v0.1.164, which read `role` only
+# A quiet seat (the kit's D159): it works whether the maintainers are there or not, questions on the desk.
 presence = false
+# The rigger keeps the cluster account and the shares; the desk's secretary relays the maintainers' answers.
+wake_from = "desk-antonkulaga/rigger */secretary"
 
 [seat.ppg-trainer.zulip]
 pool = "~/.config/agent-seat-blueprints/zulip/pool"
 
-# The desk's answers to this seat's questions, each said once.
+# The desk's answers to this seat's questions, each said once (the kit's D133).
 [seat.ppg-trainer.watch.desk]
 cmd = "sh kit:bin/py.sh kit:classes/desk/watch-answers.py kron-fm ppg-trainer"
 
-# The cluster's queue at every start: this repository's jobs by job_prefix. slurm/submit.sh names every job
-# kron-<name>; the PPG trainer's own are kron-ppg-<name>. The partition and the account are the cluster machine's.
+# The DNA trainer (docs/seats/DNA_TRAINER.md): trains kron_dna. A second clone of this repository.
+[seat.dna-trainer]
+roles = "trainer"
+role = "trainer"
+presence = false
+wake_from = "desk-antonkulaga/rigger */secretary"
+
+[seat.dna-trainer.zulip]
+pool = "~/.config/agent-seat-blueprints/zulip/pool"
+
+[seat.dna-trainer.watch.desk]
+cmd = "sh kit:bin/py.sh kit:classes/desk/watch-answers.py kron-fm dna-trainer"
+
+# The cluster's queue at every start: this repository's jobs by job_prefix (the kit's DESIGN §20). slurm/submit.sh
+# names every job kron-<name>, so kron- is the whole repository: both trainers and the data loop. Each trainer's
+# clone narrows it to its own in its untracked environment, JOB_PREFIX=kron-ppg- or JOB_PREFIX=kron-dna- (the
+# kit's facts take the environment over this table); a prefix per seat in the table is a kit wish (#394).
+# The partition and the account are the cluster machine's (its slurm.toml), never this file's.
 [slurm]
 job_prefix = "kron-"
 
