@@ -313,7 +313,9 @@ where each person's mean is removed first, which is what a watch tracking one we
 | SpO2 | 17,876 (897) | 0.19 / 0.18 | 0.10 / 0.10 |
 
 - **Blood pressure moves with the PPG within a person** (r 0.64–0.67), from a model never told who the
-  person is. Pressure here is the arterial line's where there is one, else the cuff's, which is held
+  person is. It is not heart rate in disguise: within a person, systolic pressure correlates with the
+  PPG's own heart rate at r 0.13 and with the monitor's at 0.29 (all 178,828 test windows), so the head
+  reads more of the pulse than its rate. Pressure here is the arterial line's where there is one, else the cuff's, which is held
   between readings, so part of each window's label is minutes old. SpO2 is not read: in surgery it sits
   at 97–100% with little to follow.
 - **RMSSD and PAT are read closely, and that needs care.** PPG beat-to-beat intervals carry RMSSD, so that
@@ -347,8 +349,9 @@ Run folders: `data/output/runs/kron-ppg/r2-{pretrain,clock-scratch,clock-finetun
 **The dataset.** `GlucoseDao/ppg-windows` holds the prepared windows of VitalDB (25 and 125 Hz), BIDMC
 (25 and 125 Hz) and GalaxyPPG (25 Hz), with the training split as the Hub's train/validation/test and a
 subject table per source; each config was loaded back from the Hub with polars. VitalDB at 125 Hz has
-183,618 test windows. Per-window vitals (blood pressure, SpO2, ECG heart-rate variability, pulse arrival
-time) are added to the VitalDB configs once `kron-ppg vitals` has run.
+183,618 test windows. The VitalDB configs (25 and 125 Hz) also carry the per-window vitals described
+below (blood pressure, SpO2, temperature, ECG heart rate and variability, pulse arrival time), from the
+corrected vitals table, with the device-delay caveat on pulse arrival time in the card.
 
 ## What is not done
 
