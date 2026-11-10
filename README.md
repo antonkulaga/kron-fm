@@ -130,22 +130,23 @@ Start and stop codons are dropped. The score is the masked marginal, log p(alt c
 codon masked in a 256-codon window, and the metric is the AUROC of -score with pathogenic as the positive class.
 The test draws 5,000 variants per (consequence, label) by seed; ClinVar has only 756 pathogenic synonymous SNVs on a
 codon, so all of those are kept. "Held-out" means genes of the human runs' 5% gene hold-out. The human runs were scored on CPU through the export's
-plain-PyTorch graph, the SynCodonLM snapshot on GPU (67 s). Every ClinVar gene is in that model's training
+plain-PyTorch graph, the SynCodonLM snapshots on GPU (about a minute each). Every ClinVar gene is in their training
 corpus (it saw no ClinVar labels):
 
 | score | missense: all / held-out genes | synonymous: all / held-out genes |
 |---|---|---|
 | mlm (human, 15k steps) | 0.616 / 0.614 | 0.435 / 0.447 |
-| hierarchical (human, 15k steps) | 0.620 / **0.631** | 0.431 / 0.438 |
+| hierarchical (human, 15k steps) | 0.620 / 0.631 | 0.431 / 0.438 |
 | synonymous (human, 15k steps) | 0.537 / 0.617 | 0.433 / 0.411 |
-| mlm (SynCodonLM, 25k steps) | **0.649** / 0.623 | 0.427 / 0.431 |
+| mlm (SynCodonLM, 25k steps) | 0.649 / 0.623 | 0.427 / 0.431 |
+| mlm (SynCodonLM, 50k steps) | **0.705** / **0.658** | 0.423 / 0.435 |
 | codon-usage delta | 0.539 / 0.593 | 0.533 / 0.515 |
 | GC delta | 0.467 / 0.418 | **0.602** / **0.577** |
 
 Missense: 5,000 P / 5,000 B overall, of which 263 P / 213 B are in held-out genes. Synonymous: 756 P / 5,000 B
 overall, of which 55 P / 253 B are in held-out genes. The models separate missense variants only weakly, at about 0.62. Protein language models
 are reported near 0.9 on ClinVar missense; a codon model trained for 15k steps on one genome is far from that. Pretraining on many species helps:
-after 25k steps the SynCodonLM model reaches 0.649.
+the SynCodonLM model reaches 0.649 after 25k steps and 0.705 after 50k.
 On synonymous variants the models sit below 0.5: pathogenic synonymous SNVs look *more* likely to them than
 benign ones. Pathogenic synonymous variants act mostly through splicing, which a CDS-only model cannot see,
 and the GC change of the substitution alone does better (0.60).
@@ -156,21 +157,23 @@ uv run kron-dna clinvar --run data/output/runs/kron-dna/<run>   # -> data/output
 ```
 
 **SynCodonLM pretraining (running).** `mlm` on the whole corpus (`packed_1024_sp01`: 1% of species held out),
-same 68.6M model and batch, up to 300k steps. The step-25k snapshot, by `evaluate` on 4,096 rows of each set
+same 68.6M model and batch, up to 300k steps. Its snapshots, by `evaluate` on 4,096 rows of each set
 (total / aa / syn bits per masked codon):
 
-| set | step 25k | human `mlm`, 15k steps |
-|---|---|---|
-| held-out species | 4.879 / 3.606 / 1.273 | |
-| SynCodonLM test (species seen in training) | 4.892 / 3.622 / 1.270 | |
-| SynCodonLM test, the step-1 sample | 4.882 / 3.610 / 1.272 | 5.153 / - / 1.394 |
-| yeast | 5.099 / 3.727 / 1.372 | 5.342 / - / 1.492 |
-| held-out human genes | 4.788 / 3.528 / 1.260 | 4.784 / 3.526 / 1.258 |
+| set | step 25k | step 50k | human `mlm`, 15k steps |
+|---|---|---|---|
+| held-out species | 4.879 / 3.606 / 1.273 | 4.735 / 3.474 / 1.261 | |
+| SynCodonLM test (species seen in training) | 4.892 / 3.622 / 1.270 | 4.757 / 3.498 / 1.259 | |
+| SynCodonLM test, the step-1 sample | 4.882 / 3.610 / 1.272 | 4.747 / 3.486 / 1.261 | 5.153 / - / 1.394 |
+| yeast | 5.099 / 3.727 / 1.372 | 5.018 / 3.650 / 1.368 | 5.342 / - / 1.492 |
+| held-out human genes | 4.788 / 3.528 / 1.260 | 4.645 / 3.401 / 1.245 | 4.784 / 3.526 / 1.258 |
 
-After 25k steps the corpus model already beats the human-only model on yeast and on SynCodonLM. It ties the human-only model on human
-genes, the human-only model's own domain. Human is ~0.1% of SynCodonLM, and its genes there are not split by
-the human hold-out, so the "held-out human genes" row is not held out for this model. On the mRFP probe the step-25k snapshot
-reaches test rho 0.695 (val 0.661), against 0.716 for the human `mlm` model.
+After 25k steps the corpus model already beats the human-only model on yeast and on SynCodonLM; after 50k it
+also beats it on human genes (4.645 against 4.784), the human-only model's own domain. Human is ~0.1% of
+SynCodonLM, and its genes there are not split by the human hold-out, so the "held-out human genes" row is not
+held out for this model. On the mRFP probe the snapshots reach test rho 0.695 (25k) and 0.642 (50k), against 0.716
+for the human `mlm` model. That is one gene's 219 test variants, and no interval is computed yet, so the drop is not
+read as real.
 
 **Not built yet:**
 - clustering of a genome's paralogs (`prepare --holdout-genes`
