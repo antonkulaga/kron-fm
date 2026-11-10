@@ -24,12 +24,12 @@ Verdicts: **P** = pretraining (raw wrist volume), **B** = bridging (wrist with f
 | `ppg_sport` | PPG-Sport, IMWUT 10(2) 2026, [GitHub LaserHu/PPG-Sport](https://github.com/LaserHu/PPG-Sport) | both wrists + ECG | 64 Hz, processed by the authors; IMU | 30, **21-34** | ~48 (8 min per activity per wrist) | activities incl. badminton, table tennis, basketball; ECG HR | CC BY-NC-ND 4.0 *(search: publication record)*; GitHub states none | open | 0.4 GB | P: low; B: two wrists + ECG; A: to read |
 | `galaxyppg` (existing) | Park, Zheng & Lee 2025, Zenodo 14635823 | Galaxy Watch5 + E4 + Polar H10 | green 25 Hz | 24, 20-29 | short protocol | ECG | CC BY 4.0 | open | 482 MB | device check; B: watch + ECG |
 
-## Not downloaded: access needs an account, a token or an agreement
+## Not downloaded: access needs an account, a request or an agreement
 
 | Dataset | Link | What is needed | Why it is worth it |
 |---|---|---|---|
-| DeepBeat | Synapse syn21985690 | a Synapse login (anonymous access sees the project but no files) | wrist PPG, AF labels, large (≈500k windows per the paper) |
-| PulseWatch (UMass) | [Synapse syn23565056](https://www.synapse.org/Synapse:syn23565056), folder `Pulsewatch2025` (syn64402376) | only a **valid Synapse login**: restriction level OPEN, no access requirement (verified anonymously 2026-11-10), but anonymous users cannot download | Samsung Gear S3 wrist PPG + acc at 50 Hz with ECG patch, **106 post-stroke patients, 14 days each** *(search)*; an earlier subset of 37 arrhythmia patients aged 50-91 *(search)*: **the wide-age Samsung set, thousands of hours** |
+| DeepBeat | Synapse syn21985690 | **contact the authors**: with a valid login (checked 2026-11-10 ~20:15) the project holds no files, folders or tables and has no wiki: the data are not published there | wrist PPG with AF labels, large (≈500k windows per the paper) |
+| PulseWatch (UMass, Pulsewatch2025) | [Synapse syn23565056](https://www.synapse.org/Synapse:syn23565056) → Google Drive | **a request**: Google Form https://forms.gle/azMMe3jq7HY4G3Mw5 and "request access" on the Google Drive folder (the ~2 TB live on the authors' Drive; Synapse holds only pointers, not downloadable even with a login) | **Samsung Gear S3 / Galaxy Watch 3 wrist green PPG 50 Hz + acc, 106 stroke survivors aged ≥ 50, 14 days free-living, ~30,000 h of aligned chest-patch ECG, expert NSR/AF/PAC-PVC labels per 30 s** (project page, verified). The best remaining set: Samsung, older, long, labelled |
 | DREAMT | [PhysioNet dreamt 2.2.0](https://physionet.org/content/dreamt/2.2.0/) | PhysioNet credentialed access + Restricted Health Data Use Agreement 1.5.0 (verified) | E4 BVP overnight in a sleep clinic, older and wider ages than lab sets |
 | HEART-Watch | [arXiv 2512.03988](https://arxiv.org/abs/2512.03988) | data use agreement / on request *(search, brief)* | Pixel Watch PPG + ECG, 40 adults aged 19-75 *(notes)*: wide age |
 | Aurora-BP (Microsoft) | *(notes)* | DUA; also forbids joining with other data | wrist PPG + BP, ages 18-80+ |
@@ -71,4 +71,4 @@ PPG-Sport (the readers invert them); positive on WildPPG's green and the E4 BVP 
 3. `wildppg`: long free-living multi-site with ECG.
 4. `wf_ppg`, `utsa_ppg`, `multisite_ppg`: wrist with finger (or ring) on the same seconds, for bridging.
 5. `ppg_dalia`, `wesad`, `wrist_exercise`, `ptt_ppg`: small, labelled, for checks.
-Behind an account or agreement, by value: **PulseWatch** (a Synapse login is enough: OPEN, no agreement) and DeepBeat, DREAMT, HEART-Watch.
+Behind a request or agreement, by value: **PulseWatch** (Google Form + Drive access request), DREAMT, HEART-Watch; DeepBeat (ask the authors: not on Synapse).
