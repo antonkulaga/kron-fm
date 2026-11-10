@@ -95,8 +95,8 @@ def test_multisite_reads_the_watch_green_inverted_without_pickles_and_keeps_the_
     fake_multisite(tmp_path / "multisite_ppg")
     data = READERS["multisite_ppg"](tmp_path / "multisite_ppg")
     assert [(s["subject"], s["age"]) for s in data.subjects] == [("P1", "51"), ("P2", "25")]
-    recs = list(data.recordings)  # P2 has no watch file
-    assert [r.recording for r in recs] == ["P1/watch"]
+    recs = list(data.recordings)  # P2 has no watch file; one 6 h chunk holds the whole 61 min span
+    assert [r.recording for r in recs] == ["P1/watch.0"]
     x = recs[0].load()
     assert recs[0].fs == 100.0 and len(x) == 366_000
     assert np.isfinite(x[:6000]).all() and np.isnan(x[6001:360_000]).all()
@@ -181,7 +181,7 @@ def fake_vilnius(folder, chunk_s):
 def test_vilnius_reads_the_subject_table_and_cuts_inverted_green_segments(tmp_path, monkeypatch):
     from kron_ppg import watch_readers
 
-    monkeypatch.setattr(watch_readers, "VILNIUS_CHUNK_S", 20)
+    monkeypatch.setattr(watch_readers, "CHUNK_S", 20)
     fake_vilnius(tmp_path / "vilnius_af", 20)
     data = READERS["vilnius_af"](tmp_path / "vilnius_af")
     (s,) = data.subjects
@@ -262,7 +262,7 @@ def test_wildppg_reads_the_wrist_green_in_chunks(tmp_path, monkeypatch):
 
     from kron_ppg import watch_readers
 
-    monkeypatch.setattr(watch_readers, "VILNIUS_CHUNK_S", 20)
+    monkeypatch.setattr(watch_readers, "CHUNK_S", 20)
     folder = tmp_path / "wildppg"
     folder.mkdir()
     x = synthetic_ppg(50, 128.0)

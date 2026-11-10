@@ -19,6 +19,9 @@ from kron_ppg.readers import Recording, SourceData, _table, _values
 
 #: A gap between two samples longer than this stays a gap (NaN) when a signal is put on a uniform grid.
 MAX_GAP_S = 0.5
+#: Long recordings (a Vilnius segment of up to 35 h, a WildPPG day, a Multisite span) are cut into recordings of
+#: at most this long, so the per-recording window cap of ``prepare`` samples all of them, not only their start.
+CHUNK_S = 6 * 3600
 
 
 def uniform(t: np.ndarray, x: np.ndarray, fs: float) -> np.ndarray:
@@ -119,7 +122,8 @@ def multisite_watch(path: Path) -> np.ndarray:
 
 
 def read_multisite_ppg(folder: Path) -> SourceData:
-    """The watch (wrist) green channel of each participant, one recording per participant. The ring, earring and
+    """The watch (wrist) green channel of each participant, in recordings ``<id>/watch.<chunk>`` of at most
+    :data:`CHUNK_S` (the sessions span about 27 h, mostly gaps between them). The ring, earring and
     necklace (``P*_<Site>_raw.npz``, same layout) and the Polar H10 ECG are left for the bridge."""
     raw = folder / "raw_data"
     subjects = [{"subject": r["Participant Index"], "age": r.get("Age", ""), "sex": r.get("Gender", ""),
@@ -127,11 +131,15 @@ def read_multisite_ppg(folder: Path) -> SourceData:
                 for r in _table(raw / "participants_demographics.csv")]
     files = {s["subject"]: raw / s["subject"] / f"{s['subject']}_Watch_raw.npz" for s in subjects}
 
+    chunk = int(CHUNK_S * MULTISITE_FS)
+
     def gen() -> Iterator[Recording]:
         for s in subjects:
             path = files[s["subject"]]
             if path.is_file():
-                yield Recording(s["subject"], f"{s['subject']}/watch", MULTISITE_FS, path=path, parser="multisite_watch")
+                x = multisite_watch(path)
+                for j, start in enumerate(range(0, len(x), chunk)):
+                    yield Recording(s["subject"], f"{s['subject']}/watch.{j}", MULTISITE_FS, x[start:start + chunk])
 
     return SourceData(subjects, gen())
 
@@ -212,7 +220,7 @@ def read_galaxy_active2(folder: Path) -> SourceData:
 VILNIUS_FS = 100.0
 #: A synchronised segment (up to 35 h) is cut into recordings of at most this long, so the per-recording window
 #: cap of ``prepare`` samples every part of a week-long recording rather than its first day.
-VILNIUS_CHUNK_S = 6 * 3600
+CHUNK_S = 6 * 3600
 #: Columns 0-29 of ``subject_info.xlsx`` (the last two, free-text medication lists, are left out); ``?`` = unknown.
 VILNIUS_COLUMNS = (
     "subject", "sex_female", "age", "height", "weight", "alcohol", "smoking", "physical_inactivity",
@@ -226,7 +234,7 @@ VILNIUS_COLUMNS = (
 def read_vilnius_af(folder: Path) -> SourceData:
     """Wrist green PPG (``PPG_GREEN``, inverted) of each ECG-synchronised segment of each ``NNN_PPG.mat``
     (MATLAB 7.3, read with h5py as HDF5 datasets), cut into recordings ``<NNN>/<segment>.<chunk>`` of at most
-    :data:`VILNIUS_CHUNK_S`. Subjects: age, sex, body size, risk factors and comorbidities per patient."""
+    :data:`CHUNK_S`. Subjects: age, sex, body size, risk factors and comorbidities per patient."""
     import h5py
 
     rows = xlsx_rows(folder / "subject_info.xlsx")
@@ -240,7 +248,7 @@ def read_vilnius_af(folder: Path) -> SourceData:
         rec["sex"] = {"0": "M", "1": "F"}.get(rec["sex_female"], "")
         subjects.append(rec)
     files = sorted(folder.glob("[0-9][0-9][0-9]_PPG.mat"))
-    chunk = int(VILNIUS_CHUNK_S * VILNIUS_FS)
+    chunk = int(CHUNK_S * VILNIUS_FS)
 
     def gen() -> Iterator[Recording]:
         for path in files:
@@ -364,13 +372,13 @@ WILDPPG_FS = 128.0
 def read_wildppg(folder: Path) -> SourceData:
     """The wrist device's green PPG (``wrist.ppg_g.v``, 530 nm, 128 Hz, already systole-up) of each
     ``WildPPG_Part_<id>.mat`` (MATLAB 5, read with scipy.io.loadmat: arrays and structs only), cut into
-    recordings ``<id>/<chunk>`` of at most :data:`VILNIUS_CHUNK_S`. The files carry no ages; the forehead,
+    recordings ``<id>/<chunk>`` of at most :data:`CHUNK_S`. The files carry no ages; the forehead,
     sternum and ankle sites, IR and red, and the ECG are left for the bridge."""
     import scipy.io as sio
 
     files = sorted(folder.glob("WildPPG_Part_*.mat"))
     subjects = [{"subject": p.stem.removeprefix("WildPPG_Part_"), "age": ""} for p in files]
-    chunk = int(VILNIUS_CHUNK_S * WILDPPG_FS)
+    chunk = int(CHUNK_S * WILDPPG_FS)
 
     def gen() -> Iterator[Recording]:
         for path, s in zip(files, subjects, strict=True):
