@@ -48,6 +48,9 @@ explicit = true
 dev = [
     "pytest>=8.3",
 ]
+genomics = [
+    "polars-bio>=0.37.0",
+]
 # ONNX export and its checks (krontime.onnx_export, kron_dna.onnx_export), the same pins as the glucose repo.
 onnx = [
     "onnx>=1.17,<2",
