@@ -12,8 +12,11 @@ one row per window keyed by ``(recording, start_s)``, from the tracks ``kron-ppg
 * from ECG lead II (500 Hz, the watch's ECG spot check is a single lead too): R peaks, ``ecg_hr``,
   ``rr_ms``, and the 30 s heart-rate variability ``sdnn_ms`` and ``rmssd_ms``;
 * ``pat_ms``, the pulse arrival time: from each R peak to the steepest upstroke of the finger PPG that
-  follows it (80-600 ms later), median over the window's beats. It shortens as arteries stiffen and as
-  pressure rises, and the watch can measure it in its ECG spot check, which records green PPG alongside.
+  follows it before the next beat (80 ms to 1 s later; a maximum on the search's edge drops the beat),
+  median over the window's beats. VitalDB's PLETH lags its ECG by a device delay, so values run long
+  (often 0.5-0.8 s) and are comparable within a person and a monitor, not with published PATs. It
+  shortens as arteries stiffen and as pressure rises, and the watch can measure it in its ECG spot check,
+  which records green PPG alongside.
 
 A value is NaN where its track is missing, out of range, or (ECG, PAT) too few clean beats are found.
 """
@@ -84,9 +87,57 @@ def r_peaks(ecg: np.ndarray, fs: float = FS_WAVE) -> np.ndarray:
     return peaks
 
 
+#: an R-R interval further than this share from the window's median is not normal-to-normal (ectopic,
+#: missed or extra beat); HRV is read on the rest, and a window with under 80% of them has none
+NN_TOLERANCE = 0.2
+#: ECG features are dropped when the ECG's heart rate and the PPG's pulse rate differ by more than this
+MAX_RATE_MISMATCH = 0.2
+#: ... or when more than this share of successive R-R intervals jump by 1.5x or more (T waves taken for R)
+MAX_ALTERNATION = 0.4
+#: pulse arrival time search, seconds after each R peak; the window ends at the next R peak plus ``PAT_MIN_S``
+PAT_MIN_S, PAT_MAX_S = 0.08, 1.0
+#: a beat's PAT is dropped when its steepest upstroke sits this close to either end of the search
+PAT_EDGE_S = 0.01
+#: the window's PAT is dropped when its beats' interquartile range exceeds this (ms)
+PAT_MAX_IQR_MS = 60.0
+
+
+def ppg_rate(ppg: np.ndarray, fs: float = FS_WAVE) -> float:
+    """The PPG's pulse rate (bpm) from its autocorrelation, as the windows' quality gate reads it; NaN when
+    the segment is not periodic."""
+    from kron_ppg.signal import quality
+
+    q = quality(bandpass(ppg, fs, (0.5, 8.0)), fs)
+    return q.hr_bpm if q.ok else float("nan")
+
+
+def pulse_arrival(peaks: np.ndarray, slope: np.ndarray, fs: float = FS_WAVE) -> np.ndarray:
+    """Per beat, ms from the R peak to the steepest PPG upstroke in ``[R + 80 ms, min(next R + 80 ms, R + 1 s)]``.
+
+    Bounding the search by the next R peak keeps each beat's upstroke its own, and a maximum on either
+    edge of the search means the upstroke lies outside it, so that beat is dropped (NaN) rather than read
+    as the edge. VitalDB's PLETH channel lags the ECG by a device delay, so PATs there run long (often
+    0.5-0.8 s); within a person they still move with pressure and stiffness."""
+    lo, edge = int(PAT_MIN_S * fs), int(PAT_EDGE_S * fs)
+    out = np.full(max(0, len(peaks) - 1), np.nan)
+    for i, (r, nxt) in enumerate(zip(peaks[:-1], peaks[1:], strict=True)):
+        a, b = r + lo, min(nxt + lo, r + int(PAT_MAX_S * fs), len(slope))
+        if b - a <= 2 * edge:
+            continue
+        k = int(np.argmax(slope[a:b]))
+        if edge <= k < (b - a) - edge:
+            out[i] = (lo + k) / fs * 1000.0
+    return out
+
+
 def ecg_features(ecg: np.ndarray, ppg: np.ndarray | None, fs: float = FS_WAVE, min_beats: int = 10
                  ) -> dict[str, float]:
-    """``ecg_hr``, ``rr_ms``, ``sdnn_ms``, ``rmssd_ms``, ``pat_ms`` and ``beats`` of one window."""
+    """``ecg_hr``, ``rr_ms``, ``sdnn_ms``, ``rmssd_ms``, ``pat_ms`` and ``beats`` of one window.
+
+    SDNN and RMSSD are read on normal-to-normal intervals (:data:`NN_TOLERANCE`). The R-R features are
+    NaN when the beats are too few or implausible, when R-R intervals alternate short
+    and long (the detector took T waves for R peaks), or, with a PPG, when the ECG's rate and the PPG's
+    pulse rate disagree by more than :data:`MAX_RATE_MISMATCH`; PAT then is NaN too."""
     out = dict.fromkeys(ECG_COLUMNS, float("nan"))
     if np.isnan(ecg).mean() > 0.05:
         return out
@@ -97,19 +148,32 @@ def ecg_features(ecg: np.ndarray, ppg: np.ndarray | None, fs: float = FS_WAVE, m
     out["beats"] = float(len(peaks))
     if len(peaks) < min_beats or ok.mean() < 0.8:
         return out
+    # normal-to-normal intervals, as HRV is defined: an ectopic, missed or extra beat is left out
+    ok &= np.abs(rr - np.median(rr[ok])) <= NN_TOLERANCE * np.median(rr[ok])
+    if ok.mean() < 0.8:
+        return out
+    jumps = np.abs(np.log(rr[1:] / rr[:-1])) >= np.log(1.5)
+    if jumps.mean() > MAX_ALTERNATION:
+        return out
     good = rr[ok]
-    pairs = ok[1:] & ok[:-1]
-    out["rr_ms"] = float(np.median(good))
-    out["ecg_hr"] = 60000.0 / out["rr_ms"]
-    out["sdnn_ms"] = float(np.std(good))
-    out["rmssd_ms"] = float(np.sqrt(np.mean(np.diff(rr)[pairs] ** 2))) if pairs.any() else float("nan")
     if ppg is not None and np.isnan(ppg).mean() <= 0.05:
         ppg, _ = fill_gaps(ppg, int(0.2 * fs))
-        slope = np.gradient(bandpass(ppg, fs, (0.5, 8.0)))
-        lo, hi = int(0.08 * fs), int(0.6 * fs)
-        pats = [(r + lo + int(np.argmax(slope[r + lo:r + hi]))) - r for r in peaks if r + hi <= len(slope)]
-        pats = np.asarray(pats, dtype=float) / fs * 1000.0
-        if len(pats) >= min_beats and np.subtract(*np.percentile(pats, [75, 25])) <= 80:
+    else:
+        ppg = None
+    ecg_hr = 60000.0 / float(np.median(good))
+    if ppg is not None:
+        rate = ppg_rate(ppg, fs)
+        if not (np.isfinite(rate) and abs(ecg_hr - rate) <= MAX_RATE_MISMATCH * rate):
+            return out
+    pairs = ok[1:] & ok[:-1]
+    out["rr_ms"] = float(np.median(good))
+    out["ecg_hr"] = ecg_hr
+    out["sdnn_ms"] = float(np.std(good))
+    out["rmssd_ms"] = float(np.sqrt(np.mean(np.diff(rr)[pairs] ** 2))) if pairs.any() else float("nan")
+    if ppg is not None:
+        pats = pulse_arrival(peaks, np.gradient(bandpass(ppg, fs, (0.5, 8.0))), fs)
+        pats = pats[np.isfinite(pats)]
+        if len(pats) >= min_beats and np.subtract(*np.percentile(pats, [75, 25])) <= PAT_MAX_IQR_MS:
             out["pat_ms"] = float(np.median(pats))
     return out
 

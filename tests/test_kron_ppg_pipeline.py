@@ -362,6 +362,32 @@ def test_ecg_features_find_beats_and_the_pulse_arrival_time():
     assert np.isnan(ecg_features(np.full(15000, np.nan), ppg)["rr_ms"])
 
 
+def test_ecg_features_refuse_t_waves_taken_for_r_peaks_and_a_rate_the_ppg_contradicts():
+    from kron_ppg.vitals import ecg_features
+
+    ecg, ppg, _ = synthetic_ecg_ppg()
+    t = np.arange(len(ecg)) / 500.0
+    with_t = ecg + sum(0.9 * np.exp(-((t - b - 0.33) / 0.02) ** 2) for b in np.arange(0.3, 29.3, 0.9))
+    f = ecg_features(with_t, ppg)  # R and T alternate 330 / 570 ms: no R-R features, no PAT
+    assert np.isnan(f["rr_ms"]) and np.isnan(f["rmssd_ms"]) and np.isnan(f["pat_ms"])
+    _, fast_ppg, _ = synthetic_ecg_ppg(rr=0.6)
+    g = ecg_features(ecg, fast_ppg)  # ECG at 67 bpm, PPG at 100 bpm: one of them is wrong
+    assert np.isnan(g["rr_ms"]) and np.isnan(g["pat_ms"])
+    assert abs(ecg_features(ecg, None)["rr_ms"] - 900) < 5  # without a PPG only the alternation check applies
+    missed = ecg * (np.abs(t - 0.3 - 0.9 * 10) > 0.05)  # one dropped R peak: an 1,800 ms interval
+    assert ecg_features(missed, None)["rmssd_ms"] < 10  # left out of the normal-to-normal intervals
+
+
+def test_pulse_arrival_reads_long_delays_and_drops_an_upstroke_outside_the_search():
+    from kron_ppg.vitals import ecg_features, pulse_arrival
+
+    ecg, ppg, _ = synthetic_ecg_ppg(pat=0.7)  # a monitor's PLETH lagging its ECG: PAT near the next beat
+    assert abs(ecg_features(ecg, ppg)["pat_ms"] - 700) < 30
+    peaks = np.arange(100, 15000, 450)
+    rising = np.arange(15000, dtype=float)  # steepest at the end of every search: the upstroke is beyond it
+    assert np.isnan(pulse_arrival(peaks, rising)).all()
+
+
 def test_window_medians_respect_ranges_and_gaps():
     from kron_ppg.vitals import window_medians
 
