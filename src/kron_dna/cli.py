@@ -334,7 +334,8 @@ def evaluate(run: Path = typer.Argument(..., help="a `kron-dna train` run direct
              rows: int = typer.Option(4096, help="rows drawn (once, by seed) from each set"),
              batch_size: int = 32, mask_prob: float = 0.15, seed: int = 0, device: str = "cuda",
              bf16: bool = True) -> None:
-    """Masked-codon scores of a trained run on prepared sets, written to ``<run>/eval/<set>.json``.
+    """Masked-codon scores of a trained run on prepared sets, written to ``<run>/eval/<set>.json``
+    (``<dir>/eval/<stem>/<set>.json`` for a checkpoint file, so snapshots keep their own scores).
 
     Bits per masked codon = amino-acid bits + synonymous bits (the codon given its amino acid), and the
     codon and amino-acid accuracies, with the same masking for every run (fixed seed).
@@ -367,8 +368,9 @@ def evaluate(run: Path = typer.Argument(..., help="a `kron-dna train` run direct
                   "amino_acid_bits": totals["aa_nats"] / n / ln2, "synonymous_bits": totals["syn_nats"] / n / ln2,
                   "codon_accuracy": totals["codon_correct"] / n, "amino_acid_accuracy": totals["aa_correct"] / n}
         name = item if item in SOURCES else "-".join(Path(data_dir).parts[-3:])
-        (run_dir / "eval").mkdir(exist_ok=True)
-        (run_dir / "eval" / f"{name}.json").write_text(json.dumps(result, indent=2) + "\n")
+        eval_dir = run_dir / "eval" if run.is_dir() else run.parent / "eval" / run.stem   # one folder per snapshot
+        eval_dir.mkdir(parents=True, exist_ok=True)
+        (eval_dir / f"{name}.json").write_text(json.dumps(result, indent=2) + "\n")
         typer.echo(json.dumps(result))
 
 
@@ -479,7 +481,8 @@ def clinvar(vcf: Path = typer.Option(None, help="ClinVar GRCh38 VCF (default: da
             from kron_dna.onnx_export import KronDNAGraph
             model = KronDNAGraph(model).eval()
         t1 = time.time()
-        scores[f"model:{(run if run.is_dir() else run.parent).name}@{record.get('step')}"] = V.masked_marginals(
+        run_dir = run if run.is_dir() else run.parent.parent if run.parent.name == "snapshots" else run.parent
+        scores[f"model:{run_dir.name}@{record.get('step')}"] = V.masked_marginals(
             model, table, transcripts, dev, window=window, batch_size=batch_size)
         typer.echo(f"scored {run} ({time.time() - t1:.0f} s)")
     summary = V.summarize(table, scores)
