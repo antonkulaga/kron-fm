@@ -436,6 +436,7 @@ def clinvar(vcf: Path = typer.Option(None, help="ClinVar GRCh38 VCF (default: da
             runs: list[Path] = typer.Option([], "--run", help="kron-dna run directories (or checkpoints) to score"),
             window: int = typer.Option(256, help="tokens of context around the masked codon"),
             holdout_genes: float = typer.Option(0.05, help="the gene fraction `prepare --holdout-genes` set aside"),
+            max_per_class: int = typer.Option(5000, help="variants kept per (consequence, label), by seed; 0 = all"),
             batch_size: int = 32, device: str = "cuda", seed: int = 0,
             out: Path | None = typer.Option(None, help="results JSON (default: data/output/eval/clinvar/zero_shot.json)"),
             ) -> None:
@@ -466,12 +467,17 @@ def clinvar(vcf: Path = typer.Option(None, help="ClinVar GRCh38 VCF (default: da
         typer.echo(f"{table.height:,} placed on a codon; dropped {dict(dropped)}")
         cache.parent.mkdir(parents=True, exist_ok=True)
         table.write_parquet(cache)
-    table = table.filter(pl.col("consequence").is_in(["synonymous", "missense"]))
+    table = V.sample_per_class(table.filter(pl.col("consequence").is_in(["synonymous", "missense"])),
+                               max_per_class, seed)
+    typer.echo(f"{table.height:,} variants scored (at most {max_per_class or 'all'} per consequence and label)")
     seqs = [t["seq"] for t in transcripts.values()]
     scores = V.baseline_scores(table, V.codon_frequencies(seqs), P.relative_adaptiveness(seqs))
     dev = torch.device(device)
     for run in runs:
         model, record = load_run(run)
+        if dev.type == "cpu":                       # the Triton kernels need CUDA; the export's plain graph does not
+            from kron_dna.onnx_export import KronDNAGraph
+            model = KronDNAGraph(model).eval()
         t1 = time.time()
         scores[f"model:{(run if run.is_dir() else run.parent).name}@{record.get('step')}"] = V.masked_marginals(
             model, table, transcripts, dev, window=window, batch_size=batch_size)
@@ -481,7 +487,7 @@ def clinvar(vcf: Path = typer.Option(None, help="ClinVar GRCh38 VCF (default: da
         typer.echo(json.dumps(row))
     out = out or output_dir("eval", "clinvar") / "zero_shot.json"
     out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(json.dumps({"vcf": str(vcf), "cds": str(fasta), "window": window, "score": "log p(alt) - log p(ref)",
+    out.write_text(json.dumps({"vcf": str(vcf), "cds": str(fasta), "window": window, "max_per_class": max_per_class, "seed": seed, "score": "log p(alt) - log p(ref)",
                                "metric": "AUROC of -score, pathogenic positive", "results": summary}, indent=2) + "\n")
     typer.echo(f"wrote {out}")
 

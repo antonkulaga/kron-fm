@@ -64,3 +64,26 @@ def test_auroc():
     assert V.auroc(np.array([3.0, 2.0, -1.0, -2.0]), label) == 0.0
     assert V.auroc(np.zeros(4), label) == pytest.approx(0.5)
     assert V.auroc(np.zeros(2), np.array([1, 1])) is None
+
+
+def test_masked_marginals_cpu_plain_graph():
+    import torch
+    from kron_dna.model import KronDNA, KronDNAConfig
+    from kron_dna.onnx_export import KronDNAGraph
+
+    torch.manual_seed(0)
+    model = KronDNAGraph(KronDNA(KronDNAConfig(d_model=32, n_heads=2, n_layers=2, ff_units=64))).eval()
+    seq = "ATG" + "GCT" * 40 + "TAA"
+    tx = {"G": {"name": "tx", "gene": "G", "chrom": "1", "strand": "+", "exons": [(1, len(seq))], "seq": seq}}
+    table = pl.DataFrame({"transcript": ["tx", "tx", "tx"], "codon_index": [5, 5, 30],
+                          "ref_codon": ["GCT", "GCT", "GCT"], "alt_codon": ["GCC", "GCT", "ACT"]})
+    s = V.masked_marginals(model, table, tx, torch.device("cpu"), window=16, batch_size=2)
+    assert s.shape == (3,) and np.isfinite(s).all() and s[1] == 0.0
+
+
+def test_sample_per_class():
+    t = pl.DataFrame({"id": [str(i) for i in range(10)], "consequence": ["missense"] * 10,
+                      "label": [1] * 3 + [0] * 7})
+    out = V.sample_per_class(t, 2)
+    assert out.group_by("label").len().sort("label")["len"].to_list() == [2, 2]
+    assert V.sample_per_class(t, 0).height == 10

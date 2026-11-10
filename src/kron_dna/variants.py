@@ -174,6 +174,17 @@ def baseline_scores(table: pl.DataFrame, freqs: dict[str, float], w: dict[str, f
             "gc_delta": np.array([gc(b) - gc(a) for a, b in zip(ref, alt)], dtype=float)}
 
 
+def sample_per_class(table: pl.DataFrame, n: int, seed: int = 0) -> pl.DataFrame:
+    """At most ``n`` variants of each (consequence, label), drawn by seed; ``n <= 0`` keeps all.
+
+    AUROC does not depend on class balance, so capping the benign synonymous majority only costs precision."""
+    if n <= 0:
+        return table
+    parts = [g.sample(min(n, g.height), seed=seed) for _, g in
+             table.sort("id").group_by(["consequence", "label"], maintain_order=True)]
+    return pl.concat(parts).sort("id")
+
+
 @torch.no_grad()
 def masked_marginals(model: torch.nn.Module, table: pl.DataFrame, transcripts: dict[str, dict],
                      device: torch.device, window: int = 256, batch_size: int = 32, bf16: bool = True) -> np.ndarray:
@@ -199,7 +210,7 @@ def masked_marginals(model: torch.nn.Module, table: pl.DataFrame, transcripts: d
         for i, (p, _) in enumerate(rows):
             batch[i, :len(p)] = torch.tensor(p)
         with autocast:
-            logits, _ = model(batch.to(device))
+            logits = model(batch.to(device))[0]     # KronDNA or its plain-PyTorch KronDNAGraph (CPU)
         at = torch.tensor([c for _, c in rows], device=device)
         sel = logits[torch.arange(len(rows), device=device), at, FIRST_CODON_ID:].float()
         lp = torch.log_softmax(sel, dim=-1).cpu().numpy()
