@@ -92,3 +92,13 @@ def test_transfer_scores_a_foreign_head_and_calibration_moves_its_scale():
     fixed = transfer([src], tgt, calibrate=cal)
     assert raw["r"] > 0.5 and abs(raw["mean_error"]) > 20     # it ranks but reads 40 y off
     assert abs(fixed["mean_error"]) < 3 and fixed["mae"] < raw["mae"]
+
+
+def test_lowpass_keeps_slow_and_removes_fast_components():
+    from kron_ppg.wrist_age import lowpass
+
+    fs = 25.0
+    t = np.arange(750) / fs
+    slow, fast = np.sin(2 * np.pi * 1.2 * t), np.sin(2 * np.pi * 7.0 * t)
+    out = lowpass(np.stack([slow + fast]), fs, 5.0)[0]
+    np.testing.assert_allclose(out, slow, atol=1e-4)

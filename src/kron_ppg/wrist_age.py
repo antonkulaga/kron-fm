@@ -48,16 +48,30 @@ def spread_index(subjects: np.ndarray, cap: int, seed: int = 0) -> np.ndarray:
     return np.sort(np.concatenate(keep)) if keep else np.zeros(0, dtype=int)
 
 
+def lowpass(x: np.ndarray, fs: float, cutoff: float) -> np.ndarray:
+    """Windows ``(n, L)`` with every frequency above ``cutoff`` Hz removed (an FFT brick wall).
+
+    What a watch sampling at ``2 * cutoff`` Hz keeps: Galaxy Watch Active 2 records at 10 Hz, so ``cutoff`` 5
+    shows what a model loses on its signal.
+    """
+    spec = np.fft.rfft(x.astype(np.float64), axis=1)
+    spec[:, np.fft.rfftfreq(x.shape[1], 1 / fs) > cutoff] = 0
+    return np.fft.irfft(spec, n=x.shape[1], axis=1).astype(np.float32)
+
+
 @torch.no_grad()
 def embed(encoder: KronPPG, pool: Pool, idx: np.ndarray, batch_size: int = 256,
-          device: torch.device | str = "cpu") -> np.ndarray:
-    """The pooled embedding ``(len(idx), d_model)`` of each window at ``idx``."""
+          device: torch.device | str = "cpu", cutoff: float | None = None) -> np.ndarray:
+    """The pooled embedding ``(len(idx), d_model)`` of each window at ``idx`` (low-passed at ``cutoff`` Hz)."""
     encoder.eval()
     dev = torch.device(device)
     out = []
     for start in range(0, len(idx), batch_size):
         chunk = idx[start:start + batch_size]
-        x = torch.from_numpy(np.stack([pool.window(int(i)) for i in chunk])).to(dev)
+        w = np.stack([pool.window(int(i)) for i in chunk])
+        if cutoff:
+            w = lowpass(w, pool.sample_rate, cutoff)
+        x = torch.from_numpy(w).to(dev)
         patches, ok = patchify(x, encoder.config.patch)
         out.append(encoder.embedding(encoder.encode(patches, ok), ok).float().cpu().numpy())
     return np.concatenate(out) if out else np.zeros((0, encoder.config.d_model), np.float32)
@@ -300,7 +314,8 @@ def json_safe(value):
 
 
 def run(folders: Sequence[Path], encoder_path: Path | str | None, out: Path, cap: int = 200, folds: int = 10,
-        repeats: int = 5, null: int = 20, batch_size: int = 256, device: str = "cuda", seed: int = 0) -> dict:
+        repeats: int = 5, null: int = 20, batch_size: int = 256, device: str = "cuda", seed: int = 0,
+        cutoff: float | None = None) -> dict:
     """Embed (``encoder_path`` a checkpoint, ``"random"`` for an untrained encoder, None for hand-made
     features), cross-validate and write ``people.npz``, ``predictions.parquet``, ``metrics.json``, ``head.pt``."""
     import polars as pl
@@ -316,8 +331,12 @@ def run(folders: Sequence[Path], encoder_path: Path | str | None, out: Path, cap
         aged = np.flatnonzero(np.isfinite(pool.age))
         idx = aged[spread_index(pool.subject[aged], cap, seed)]
         if encoder_path is None:  # the hand-made baseline
-            emb = np.concatenate([handcrafted(np.stack([pool.window(int(i)) for i in idx[k:k + 4096]]),
-                                              pool.sample_rate) for k in range(0, len(idx), 4096)])
+            def windows(part):
+                w = np.stack([pool.window(int(i)) for i in part])
+                return lowpass(w, pool.sample_rate, cutoff) if cutoff else w
+
+            emb = np.concatenate([handcrafted(windows(idx[k:k + 4096]), pool.sample_rate)
+                                  for k in range(0, len(idx), 4096)])
         else:
             if str(encoder_path) == "random":  # an untrained encoder of the default shape
                 from kron_ppg.model import KronPPGConfig
@@ -326,11 +345,12 @@ def run(folders: Sequence[Path], encoder_path: Path | str | None, out: Path, cap
                 encoder = KronPPG(KronPPGConfig(sample_rate=pool.sample_rate)).to(device)
             else:
                 encoder = load_encoder(encoder_path, device)
-            emb = embed(encoder, pool, idx, batch_size, device)
+            emb = embed(encoder, pool, idx, batch_size, device, cutoff)
         people = per_person(pool.subject[idx], pool.age[idx], emb)
         people.save(cache)
     result, cv = evaluate(people, folds, repeats, null, seed)
-    result = {"encoder": str(encoder_path), "data": [str(f) for f in folders], "cap": cap, "folds": folds,
+    result = {"encoder": str(encoder_path), "data": [str(f) for f in folders], "cap": cap, "lowpass_hz": cutoff,
+              "folds": folds,
               "repeats": repeats, **result}
     (out / "metrics.json").write_text(json.dumps(json_safe(result), indent=2) + "\n")
     pl.DataFrame({"subject": people.subject.astype(str), "source": people.source.astype(str), "age": people.age,

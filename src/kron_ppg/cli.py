@@ -183,6 +183,8 @@ def wrist_age(sources: list[str] = typer.Argument(..., help="prepared sources wi
               cap: int = typer.Option(200, help="windows per person, spread over the record"),
               folds: int = 10, repeats: int = 5,
               null: int = typer.Option(20, help="permutation-null repeats (ages shuffled within source)"),
+              lowpass: float | None = typer.Option(None, help="remove frequencies above this many Hz first "
+                                                   "(5: what a 10 Hz watch keeps)"),
               sample_rate: float = 25.0, seconds: float = 30.0, batch_size: int = 256, seed: int = 0,
               device: str = "cuda") -> None:
     """Per-person age from a frozen encoder: ridge head, grouped CV, baselines, null, leave-source-out."""
@@ -191,7 +193,7 @@ def wrist_age(sources: list[str] = typer.Argument(..., help="prepared sources wi
     folders = _variants(sources, sample_rate, seconds)
     out = out or runs_dir(MODEL) / run_name("wrist-age", *sources)
     enc = None if encoder == "hand" else (encoder if encoder == "random" else Path(encoder))
-    result = run(folders, enc, out, cap, folds, repeats, null, batch_size, device, seed)
+    result = run(folders, enc, out, cap, folds, repeats, null, batch_size, device, seed, lowpass)
     keep = {k: result[k] for k in ("pooled", "per_source", "leave_source_out", "null") if k in result}
     if "null" in keep:
         keep["null"] = {k: v for k, v in keep["null"].items() if k != "mae"}
