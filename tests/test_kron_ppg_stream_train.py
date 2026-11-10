@@ -100,3 +100,14 @@ def test_lanes_pair_one_person_and_reset_only_when_a_stream_changes(tmp_path):
         assert lanes.pos[0] != lanes.pos[1]
     resets = [lanes.batch()[3] for _ in range(6)]
     assert not all(r.all() for r in resets)
+
+
+def test_memory_check_scores_identical_chunks_cold_and_warm(device, tmp_path):
+    from kron_ppg.model import KronPPG
+    from kron_ppg.stream_train import StreamPool, memory_check
+
+    pool = StreamPool([tiny_streams(tmp_path, n=6)])
+    model = KronPPG(KronPPGConfig(**SMALL)).to(device)
+    rows = memory_check(model, pool, pool.keys("train") + pool.keys("val"), 4, 25 * 20, 3, device)
+    assert [r["chunk"] for r in rows] == [0, 1, 2]
+    assert abs(rows[0]["warm"] - rows[0]["cold"]) < 1e-5  # no context yet: the two are the same pass

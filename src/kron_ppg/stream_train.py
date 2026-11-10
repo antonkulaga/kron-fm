@@ -336,6 +336,29 @@ def pretrain_streams(a: StreamPretrainArgs) -> dict:
     return {**record, "best_val_next": best}
 
 
+def memory_check(encoder: KronPPG, pool: StreamPool, keys: list[str], lanes: int, chunk: int, chunks: int,
+                 dev, seed: int = 12345) -> list[dict]:
+    """The same validation chunks scored twice: from an empty memory (``cold``) and with the memory carried in
+    from the chunks before them (``warm``). Per chunk index ``c``: both next-patch losses on identical samples,
+    so their difference is what the carried memory is worth after ``c`` chunks of context."""
+    lane = Lanes(pool, keys, lanes, chunk, 10 ** 9, np.random.default_rng(seed))
+    batches = [lane.batch() for _ in range(chunks)]
+    encoder.eval()
+    out = []
+    with torch.no_grad():
+        states = LayerStates.empty(encoder.config.n_layers)
+        for c, (x, ok, w, reset, _) in enumerate(batches):
+            patches, pv, _ = _tensors(x, ok, w, encoder.config.patch, dev)
+            if c:
+                states = states.reset(torch.from_numpy(reset).to(dev))
+            warm = float(encoder.next_patch_loss(encoder.encode(patches, pv, states), patches, pv))
+            cold = float(encoder.next_patch_loss(encoder.encode(patches, pv, LayerStates.empty(encoder.config.n_layers)),
+                                                 patches, pv))
+            out.append({"chunk": c, "context_s": c * chunk / pool.sample_rate, "cold": cold, "warm": warm,
+                        "warm_minus_cold": warm - cold, "resets": int(reset.sum()) if c else len(reset)})
+    return out
+
+
 # ---- the clock -------------------------------------------------------------------------------------
 @dataclass
 class StreamClockArgs:
@@ -500,6 +523,17 @@ def fit_stream_clock(a: StreamClockArgs) -> dict:
 
 def _cli(argv: list[str]) -> None:
     """``python -m kron_ppg.stream_train pretrain|clock OUT FOLDER... [--key value ...]``"""
+    if len(argv) >= 3 and argv[0] == "memory":  # memory CKPT OUT.json FOLDER... : cold vs warm on the same chunks
+        dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        enc = load_encoder(Path(argv[1]), dev)
+        pool = StreamPool([Path(f) for f in argv[3:]])
+        chunk = int(round(120.0 * pool.sample_rate)) // enc.config.patch * enc.config.patch
+        rows = memory_check(enc, pool, pool.keys("val"), 64, chunk, 15, dev)
+        Path(argv[2]).write_text(json.dumps(rows, indent=2) + "\n")
+        for r in rows:
+            print(f"chunk {r['chunk']:2d} ({r['context_s'] / 60:4.0f} min of context): cold {r['cold']:.4f}  "
+                  f"warm {r['warm']:.4f}  diff {r['warm_minus_cold']:+.4f}  resets {r['resets']}")
+        return
     if len(argv) < 3 or argv[0] not in ("pretrain", "clock"):
         sys.exit("usage: python -m kron_ppg.stream_train pretrain|clock OUT FOLDER... [--steps N --lanes N "
                  "--chunk-s S --encoder CKPT --freeze --seed N --device cuda]")
