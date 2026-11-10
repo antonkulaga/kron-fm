@@ -459,6 +459,109 @@ def read_ppg_sport(folder: Path) -> SourceData:
     return SourceData(subjects, gen())
 
 
+# ---- PulseWatch2025 (restricted until its terms are known) -----------------------------------------
+PULSEWATCH_FS = 50.0
+#: Every PPG segment file holds 30 s at 50 Hz, one value per line.
+PULSEWATCH_SEGMENT = 1500
+PULSEWATCH_TRIALS = ("Synapse/01_Clinical_Trial", "Synapse/02_AF_Trial")
+#: ``<subject>_<YYYY_MM_DD_HH_MM_SS session start>_ppg_<4-digit index>[<13-digit epoch ms>].txt``; the file with
+#: the epoch suffix is a byte-identical copy of the one without.
+PULSEWATCH_PPG = re.compile(r"(?:^|/)(\d{3})_(\d{4})_(\d\d)_(\d\d)_(\d\d)_(\d\d)_(\d\d)_ppg_(\d{4})(?:\d{13})?\.txt$")
+
+
+def pulsewatch_segments(tar: Path) -> dict[str, list[tuple[float, int, str]]]:
+    """The PPG segments of one subject's tar by session day: ``day -> [(session start s, index, member)]``,
+    one member per (session, index), sorted. Session starts are the watch's local clock read as UTC (only
+    differences are used)."""
+    import calendar
+    import tarfile
+
+    seen: dict[tuple[float, int], tuple[str, str]] = {}
+    with tarfile.open(tar) as t:
+        for name in t.getnames():
+            if (m := PULSEWATCH_PPG.search(name)):
+                y, mo, d, h, mi, se, idx = (int(g) for g in m.groups()[1:])
+                start = float(calendar.timegm((y, mo, d, h, mi, se)))
+                key = (start, idx)
+                if key not in seen or len(name) < len(seen[key][1]):  # prefer the copy without the epoch suffix
+                    seen[key] = (f"{y:04d}-{mo:02d}-{d:02d}", name)
+    days: dict[str, list[tuple[float, int, str]]] = {}
+    for (start, idx), (day, name) in sorted(seen.items()):
+        days.setdefault(day, []).append((start, idx, name))
+    return days
+
+
+def pulsewatch_text(data: bytes) -> np.ndarray:
+    """One segment file as float64 (whitespace-separated numbers), padded with NaN or cut to 30 s."""
+    x = np.array(data.split(), dtype=np.float64)
+    out = np.full(PULSEWATCH_SEGMENT, np.nan)
+    out[:min(len(x), PULSEWATCH_SEGMENT)] = x[:PULSEWATCH_SEGMENT]
+    return out
+
+
+def _pulsewatch_day(spec: Path, grid: bool) -> np.ndarray:
+    import tarfile
+
+    tar, day = str(spec).rsplit("::", 1)
+    segments = pulsewatch_segments(Path(tar))[day]
+    with tarfile.open(tar) as t:
+        parts = [pulsewatch_text(t.extractfile(name).read()) for _, _, name in segments]
+    x = -np.concatenate(parts)  # raw counts fall as blood volume rises
+    if not grid:
+        return x
+    t0 = segments[0][0]
+    starts = np.array([s - t0 + 30.0 * i for s, i, _ in segments])
+    t = (starts[:, None] + np.arange(PULSEWATCH_SEGMENT) / PULSEWATCH_FS).ravel()
+    return uniform(t, x, PULSEWATCH_FS)
+
+
+def pulsewatch_day(spec: Path) -> np.ndarray:
+    """One subject-day (``<tar>::<YYYY-MM-DD>``) as its 30 s segments back to back, so each 30 s window of the
+    day is one segment; inverted."""
+    return _pulsewatch_day(spec, grid=False)
+
+
+def pulsewatch_day_grid(spec: Path) -> np.ndarray:
+    """One subject-day on a 50 Hz time grid from session start + 30 s x index (whole recordings, for streams):
+    the minutes between sessions are NaN gaps."""
+    return _pulsewatch_day(spec, grid=True)
+
+
+def read_pulsewatch(folder: Path) -> SourceData:
+    """Samsung Gear S3 / Galaxy Watch 3 wrist PPG of the PulseWatch clinical and AF trials, one recording per
+    subject-day (``<subject>/<YYYY-MM-DD>``), read from the per-subject tars without unpacking them. The data hold
+    no age or demographics; the subject table carries the adjudicated rhythm labels per person (counts of each
+    code in ``Synapse/03_Labels``: 0, 1, 2 are taken to be NSR, AF and PAC/PVC, negatives noise or unsure;
+    *unverified*). Whole recordings (``CHUNK_S`` None) put each day on its time grid instead."""
+    tars = sorted(p for trial in PULSEWATCH_TRIALS for p in (folder / trial).glob("*_final.tar"))
+    labels: dict[str, dict[str, int]] = {}
+    for path in sorted((folder / "Synapse" / "03_Labels").glob("*_final_attemp_4_1_Dong.csv")):
+        counts = labels.setdefault(path.name[:3], {})
+        for r in _table(path):
+            value = _readers._float(r.get("final_AF_GT_20230921", ""))
+            if np.isfinite(value):
+                code = str(int(value))
+                counts[code] = counts.get(code, 0) + 1
+    subjects = []
+    for tar in tars:
+        sid = tar.name[:3]
+        c = labels.get(sid, {})
+        n = sum(v for k, v in c.items() if int(k) >= 0)
+        subjects.append({"subject": sid, "trial": tar.parent.name, "labelled_segments": str(n),
+                         "af_fraction": f"{c.get('1', 0) / n:.4f}" if n else "",
+                         "pacpvc_fraction": f"{c.get('2', 0) / n:.4f}" if n else "",
+                         "any_af": ("1" if c.get("1", 0) else "0") if n else ""})
+
+    def gen() -> Iterator[Recording]:
+        parser = "pulsewatch_day_grid" if CHUNK_S is None else "pulsewatch_day"
+        for tar in tars:
+            for day in pulsewatch_segments(tar):
+                yield Recording(tar.name[:3], f"{tar.name[:3]}/{day}", PULSEWATCH_FS, path=Path(f"{tar}::{day}"),
+                                parser=parser)
+
+    return SourceData(subjects, gen())
+
+
 # ---- Aurora-BP (restricted) -------------------------------------------------------------------
 AURORA_FS = 500.0
 AURORA_PROTOCOLS = ("oscillometric", "auscultatory")
@@ -512,11 +615,14 @@ UNPACKERS = {"galaxy_active2": unpack_galaxy_active2}
 READERS = {"wf_ppg": read_wf_ppg, "multisite_ppg": read_multisite_ppg, "galaxy_active2": read_galaxy_active2,
            "vilnius_af": read_vilnius_af, "utsa_ppg": read_utsa_ppg,
            "ppg_dalia": read_ppg_dalia, "wesad": read_wesad,
-           "wildppg": read_wildppg, "ppg_sport": read_ppg_sport, "aurora_bp": read_aurora_bp}
+           "wildppg": read_wildppg, "ppg_sport": read_ppg_sport, "aurora_bp": read_aurora_bp,
+           "pulsewatch": read_pulsewatch}
 PARSERS: dict[str, Callable[[Path], np.ndarray]] = {"multisite_watch": multisite_watch,
                                                     "galaxy_active2_day": galaxy_active2_day,
                                                     "galaxy_active2_device": galaxy_active2_device,
-                                                    "ppg_sport_npy": ppg_sport_npy}
+                                                    "ppg_sport_npy": ppg_sport_npy,
+                                                    "pulsewatch_day": pulsewatch_day,
+                                                    "pulsewatch_day_grid": pulsewatch_day_grid}
 # Registered into kron_ppg.readers whichever of the two modules is imported first.
 _readers.READERS.update(READERS)
 _readers.PARSERS.update(PARSERS)

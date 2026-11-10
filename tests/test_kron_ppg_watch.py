@@ -410,6 +410,10 @@ def test_restricted_sources_are_never_exported_or_joined(tmp_path):
         refuse_join(["aurora_bp", "vitaldb"])
     refuse_join(["aurora_bp"])  # alone is allowed
     refuse_join(["vitaldb", "galaxy_active2", "wildppg"])
+    assert is_restricted("pulsewatch")  # never exported, but may be pretrained on with the open wrist sets
+    refuse_join(["pulsewatch", "galaxy_active2", "vilnius_af"])
+    with pytest.raises(PermissionError, match="pulsewatch"):
+        export_hub(["pulsewatch"], tmp_path / "hub2", "x/y", "t")
 
 
 def test_aurora_fetch_only_verifies_what_the_owner_placed(tmp_path):
@@ -438,3 +442,52 @@ def _check_aurora_fetch(source, folder, hashlib, json):
     (folder / "README.md").write_text("other")
     with pytest.raises(ValueError, match="md5"):
         source.fetch(source, folder, False)
+
+
+# ---- PulseWatch2025 (restricted) ------------------------------------------------------------------
+def fake_pulsewatch(folder):
+    """One subject tar per trial folder, two sessions on two days; every segment twice (with and without the
+    epoch-ms suffix), 1,500 lines of fixed-width numbers, the raw counts inverted; one label file."""
+    import io
+    import tarfile
+
+    x = synthetic_ppg(120.0, 50.0)
+    root = "ENGR_Chon/NIH_Pulsewatch_Database/Final_Clinical_Trial_Data"
+    for trial, sid in (("01_Clinical_Trial", "002"), ("02_AF_Trial", "401")):
+        (folder / "Synapse" / trial).mkdir(parents=True)
+        with tarfile.open(folder / "Synapse" / trial / f"{sid}_final.tar", "w") as t:
+            for session in ("2019_09_03_15_48_17", "2019_09_04_08_00_00"):
+                for i in range(2):
+                    seg = 4.19e6 - 1e3 * x[i * 1500:(i + 1) * 1500]
+                    data = "".join(f"{v:22.14e}\n" for v in seg).encode()
+                    for suffix in ("", "1567521072227"):
+                        info = tarfile.TarInfo(f"{root}/{sid}_final/{sid}_{session}_ppg_{i:04d}{suffix}.txt")
+                        info.size = len(data)
+                        t.addfile(info, io.BytesIO(data))
+                info = tarfile.TarInfo(f"{root}/{sid}_final/{sid}_{session}_accel_0000.txt")
+                info.size = 4
+                t.addfile(info, io.BytesIO(b"1.0\n"))
+    (folder / "Synapse" / "03_Labels").mkdir()
+    (folder / "Synapse" / "03_Labels" / "002_final_attemp_4_1_Dong.csv").write_text(
+        "table_file_name,final_AF_GT_20230921\n002_x_ppg_0000,0\n002_x_ppg_0001,1.0\n002_x_ppg_0002,-1\n"
+        "002_x_ppg_0003,2\n")
+    return x
+
+
+def test_pulsewatch_reads_each_subject_day_inverted_with_labels(tmp_path, monkeypatch):
+    from kron_ppg import watch_readers
+
+    x = fake_pulsewatch(tmp_path / "pw")
+    data = READERS["pulsewatch"](tmp_path / "pw")
+    subjects = {s["subject"]: s for s in data.subjects}
+    assert subjects["002"]["labelled_segments"] == "3" and subjects["002"]["af_fraction"] == "0.3333"
+    assert subjects["002"]["any_af"] == "1" and subjects["401"]["af_fraction"] == ""
+    assert subjects["401"]["trial"] == "02_AF_Trial"
+    recs = list(data.recordings)
+    assert [r.recording for r in recs] == ["002/2019-09-03", "002/2019-09-04", "401/2019-09-03", "401/2019-09-04"]
+    y = recs[0].load()
+    assert recs[0].fs == 50.0 and len(y) == 3000  # two segments back to back, the twin copies read once
+    assert np.allclose(y + 4.19e6, 1e3 * x[:3000], atol=1e-3)
+    monkeypatch.setattr(watch_readers, "CHUNK_S", None)
+    grid = list(READERS["pulsewatch"](tmp_path / "pw").recordings)[0].load()
+    assert len(grid) == 3000 and np.allclose(grid, y)  # index x 30 s continues the session without a gap

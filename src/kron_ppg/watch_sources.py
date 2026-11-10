@@ -38,9 +38,17 @@ and only sets that download without an account, a data-use agreement or a click-
   tonometry and ECG at 500 Hz with cuff blood pressure and cardiovascular history. **Under a data use agreement**
   the owner accepted by hand: research only, never joined with other data, never redistributed. Never downloaded
   by ``kron-data``: its fetch only checks the files the owner placed against the Zenodo record. ``notes.restricted``
-  makes ``prepare`` and ``streams`` write owner-only and ``hub-export`` refuse it.
+  makes ``prepare`` and ``streams`` write owner-only and ``hub-export`` refuse it; ``notes.no_join`` makes the
+  trainers refuse it beside any other source.
 
-A source with ``notes["restricted"]`` true is never exported, uploaded, committed or joined with another source.
+* ``pulsewatch`` (restricted): PulseWatch2025 (UMass / UConn), Samsung Gear S3 and Galaxy Watch 3 wrist PPG at 50 Hz
+  in 30 s segments with accelerometer, a chest-patch ECG and adjudicated rhythm labels, stroke survivors aged 50+
+  over about 14 days each. Shared by its authors on request (a form and a Google Drive folder); the owner was
+  granted access and downloads it. Treated as restricted until its own terms are known: no terms were found in
+  the shared folder (its code is MIT). Its fetch only records the files placed.
+
+A source with ``notes["restricted"]`` true is never exported, uploaded or committed, and is written owner-only; one
+with ``notes["no_join"]`` (Aurora-BP) is also never joined with another source in a training or probe set.
 """
 from __future__ import annotations
 
@@ -165,11 +173,15 @@ def is_restricted(name: str) -> bool:
 
 
 def refuse_join(sources) -> None:
-    """Raise when a restricted source would be joined with any other source (one training or probe set)."""
+    """Raise when a source whose terms forbid joining (``notes["no_join"]``) would be joined with any other
+    source in one training or probe set."""
+    from kron_ppg.sources import SOURCES as ALL
+
     names = set(sources)
-    if len(names) > 1 and (restricted := sorted(n for n in names if is_restricted(n))):
-        raise PermissionError(f"restricted sources are never joined with other data: {', '.join(restricted)} "
-                              f"with {', '.join(sorted(names - set(restricted)))}")
+    alone = sorted(n for n in names if ALL.get(n) and ALL[n].notes.get("no_join"))
+    if len(names) > 1 and alone:
+        raise PermissionError(f"these sources are never joined with other data: {', '.join(alone)} "
+                              f"with {', '.join(sorted(names - set(alone)))}")
 
 
 def owner_only(name: str) -> None:
@@ -199,6 +211,18 @@ def fetch_aurora_bp(source: Source, folder: Path, force: bool) -> dict:
             raise ValueError(f"{path.name}: size or md5 differs from the Zenodo record")
         entries.append({"file": f["key"], "bytes": f["size"], "md5": md5.hexdigest(), "verified": "zenodo md5"})
     return write_manifest(folder, source, entries, {"zenodo_record": AURORA_BP_RECORD})
+
+
+def fetch_pulsewatch(source: Source, folder: Path, force: bool) -> dict:
+    """Never downloads (the shared folder is by request): records the per-subject tars and label files the owner
+    placed, with their sizes, in an owner-only ``SOURCE.json``."""
+    os.umask(0o077)
+    found = sorted(p for p in folder.rglob("*") if p.is_file() and p.suffix in (".tar", ".csv")
+                   and p.name != "SOURCE.json")
+    if not found:
+        raise FileNotFoundError(f"{folder}: PulseWatch2025 is shared by its authors on request; place it there first")
+    entries = [{"file": str(p.relative_to(folder)), "bytes": p.stat().st_size} for p in found]
+    return write_manifest(folder, source, entries)
 
 
 def fetch_files(source: Source, folder: Path, force: bool) -> dict:
@@ -329,12 +353,25 @@ SOURCES: dict[str, Source] = {
                "electrocardiography for cuffless measurement of blood pressure in an ambulatory setting. IEEE JBHI "
                "26(7):2864-2875.",
                "https://github.com/microsoft/aurorabp-sample-data",
-               {"format": "zip of tsv", "fs": 500, "sites": ["wrist"], "restricted": True,
+               {"format": "zip of tsv", "fs": 500, "sites": ["wrist"], "restricted": True, "no_join": True,
                 "terms": "research only; never joined with other data (no pretraining or training set with any "
                          "other source; a frozen encoder from elsewhere may be probed on it); never published, "
                          "uploaded or committed; owner-only files; no diagnostic or product use; publications "
                          "report results only and cite Mieloszyk et al. 2022",
                 "approx_mb": 6_700},
                fetch=fetch_aurora_bp),
+        Source("pulsewatch", DOMAIN,
+               "PulseWatch2025: Samsung Gear S3 / Galaxy Watch 3 wrist PPG (50 Hz, 30 s segments) with accelerometer, "
+               "chest-patch ECG and adjudicated NSR/AF/PAC-PVC labels, stroke survivors aged 50+, ~14 days each; "
+               "restricted (shared on request)",
+               (), "shared by the authors on request (Google Form and Drive access); no data licence found in the "
+                   "shared folder (code MIT): treated as restricted, research only, never redistributed",
+               "The Pulsewatch study (UMass / UConn), Synapse syn23565056; Dong Han et al., ICASSP 2025 "
+               "(PulsewatchRelease code, MIT).",
+               "https://www.synapse.org/Synapse:syn23565056",
+               {"format": "tar of txt", "fs": 50, "sites": ["wrist"], "device": "Samsung Gear S3 / Galaxy Watch 3",
+                "restricted": True, "terms": "unknown until the authors' terms are read; treated like a DUA set",
+                "approx_mb": 946_000},
+               fetch=fetch_pulsewatch),
     )
 }
