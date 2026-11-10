@@ -20,6 +20,8 @@ and only sets that download without an account, a data-use agreement or a click-
   varied contact pressure; 27 people aged 20-32. CC BY 4.0.
 * ``ptt_ppg``: PhysioNet pulse transit time PPG: green, red and IR PPG at two finger sites with ECG, sitting,
   walking and running, 22 people. ODbL 1.0.
+* ``wrist_exercise``: PhysioNet Wrist PPG During Exercise: wrist green PPG with chest ECG on a treadmill and
+  an exercise bike, 8 people aged 22-32; 50 MB. ODC-By 1.0.
 * ``ppg_dalia``: Empatica E4 wrist BVP (64 Hz) and chest ECG over about 2.5 h of daily activities each,
   15 people, with age in each ``S*_quest.csv``. CC BY 4.0. The archive also holds Python pickles: never
   unpickle them; read the E4 CSVs and the questionnaire.
@@ -59,6 +61,7 @@ WILDPPG_FILES = {
 }
 WF_PPG_URL = "https://ndownloader.figshare.com/files/50956401"
 PTT_PPG = "https://physionet.org/files/pulse-transit-time-ppg/1.1.0"
+WRIST_EXERCISE = "https://physionet.org/files/wrist/1.0.0"
 DALIA_URL = "https://archive.ics.uci.edu/static/public/495/ppg+dalia.zip"
 UTSA_URL = "https://drive.usercontent.google.com/download?id=1NP_mngn7YccQO09FdaqQ001wwTMmE0ks&export=download&confirm=t"
 WESAD_URL = "https://uni-siegen.sciebo.de/s/HGdUkoNlW1Ub0Gx/download"
@@ -101,14 +104,18 @@ def fetch_multisite(source: Source, folder: Path, force: bool) -> dict:
     return fetch_tree(source, folder, force, multisite_files(), {"subset": "README, croissant.json, raw_data/"})
 
 
-def ptt_files() -> list[tuple[str, str, int | None]]:
-    """Every file PhysioNet's ``SHA256SUMS.txt`` lists for the project (WFDB records and their CSV copies)."""
-    names = [line.split(maxsplit=1)[1] for line in _get_text(f"{PTT_PPG}/SHA256SUMS.txt").splitlines() if line.strip()]
-    return [(f"{PTT_PPG}/{n}", n, None) for n in ["SHA256SUMS.txt", *names]]
+def physionet_files(base: str) -> list[tuple[str, str, int | None]]:
+    """Every file PhysioNet's ``SHA256SUMS.txt`` lists for a project (WFDB records and any CSV copies)."""
+    names = [line.split(maxsplit=1)[1] for line in _get_text(f"{base}/SHA256SUMS.txt").splitlines() if line.strip()]
+    return [(f"{base}/{n}", n, None) for n in ["SHA256SUMS.txt", *names]]
 
 
 def fetch_ptt(source: Source, folder: Path, force: bool) -> dict:
-    return fetch_tree(source, folder, force, ptt_files())
+    return fetch_tree(source, folder, force, physionet_files(PTT_PPG))
+
+
+def fetch_wrist_exercise(source: Source, folder: Path, force: bool) -> dict:
+    return fetch_tree(source, folder, force, physionet_files(WRIST_EXERCISE))
 
 
 def zenodo_files(record: int) -> list[tuple[str, str, int | None]]:
@@ -192,6 +199,15 @@ SOURCES: dict[str, Source] = {
                "https://physionet.org/content/pulse-transit-time-ppg/1.1.0/",
                {"format": "wfdb+csv", "fs": 500, "sites": ["finger proximal", "finger distal"], "approx_mb": 2_900},
                fetch=fetch_ptt),
+        Source("wrist_exercise", DOMAIN,
+               "PhysioNet Wrist PPG During Exercise: wrist PPG with chest ECG, treadmill and bike, 8 people aged 22-32",
+               (), "ODC-By 1.0",
+               "Jarchi & Casson (2016) Description of a database containing wrist PPG signals recorded during "
+               "physical exercise with both accelerometer and gyroscope measures of motion. Data 2(1):1. "
+               "Goldberger et al. (2000) PhysioNet. Circulation 101:e215.",
+               "https://physionet.org/content/wrist/1.0.0/",
+               {"format": "wfdb", "fs": 256, "sites": ["wrist"], "approx_mb": 50},
+               fetch=fetch_wrist_exercise),
         Source("ppg_dalia", DOMAIN,
                "PPG-DaLiA: Empatica E4 wrist BVP (64 Hz) and chest ECG over daily activities, 15 people, age per "
                "person; the archive's pickles are never unpickled",
