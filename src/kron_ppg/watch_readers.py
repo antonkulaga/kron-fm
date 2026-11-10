@@ -276,9 +276,60 @@ def read_utsa_ppg(folder: Path) -> SourceData:
     return SourceData(subjects, gen())
 
 
+# ---- Empatica E4 sets: PPG-DaLiA ---------------------------------------------------------------------
+def e4_bvp(archive: bytes) -> tuple[np.ndarray, float]:
+    """``BVP.csv`` of an Empatica E4 export (a zip): its first line is the start time, its second the rate,
+    then one sample per line."""
+    with zipfile.ZipFile(__import__("io").BytesIO(archive)) as z:
+        lines = z.read("BVP.csv").decode().split()
+    fs = float(lines[1].split(",")[0])
+    return np.array([_float(v.split(",")[0]) for v in lines[2:]]), fs
+
+
+def _float(text: str) -> float:
+    try:
+        return float(text)
+    except ValueError:
+        return float("nan")
+
+
+def _quest(text: str) -> dict[str, str]:
+    """``# AGE, 55`` lines of a PPG-DaLiA ``S*_quest.csv``."""
+    out = {}
+    for line in text.splitlines():
+        key, _, value = line.lstrip("# ").partition(",")
+        if key.strip():
+            out[key.strip().lower()] = value.strip()
+    return out
+
+
+def read_ppg_dalia(folder: Path) -> SourceData:
+    """The E4's wrist BVP (64 Hz) per participant, read from ``S*_E4.zip`` inside the nested ``data.zip``;
+    age, sex, height, weight, skin type and sport level from ``S*_quest.csv``. The ``S*.pkl`` files are
+    Python pickles and are never opened."""
+    outer = zipfile.ZipFile(folder / "ppg_dalia.zip")
+    inner = zipfile.ZipFile(outer.open("data.zip"))
+    names = inner.namelist()
+    ids = sorted({int(m[1]) for n in names if (m := re.search(r"/S(\d+)/S\d+_E4\.zip$", n))})
+    subjects = []
+    for i in ids:
+        q = _quest(inner.read(f"PPG_FieldStudy/S{i}/S{i}_quest.csv").decode(errors="replace"))
+        subjects.append({"subject": f"S{i}", "age": q.get("age", ""), "sex": q.get("gender", "").upper(),
+                         "height": q.get("height", ""), "weight": q.get("weight", ""), "skin": q.get("skin", ""),
+                         "sport": q.get("sport", "")})
+
+    def gen() -> Iterator[Recording]:
+        for i in ids:
+            x, fs = e4_bvp(inner.read(f"PPG_FieldStudy/S{i}/S{i}_E4.zip"))
+            yield Recording(f"S{i}", f"S{i}", fs, x)
+
+    return SourceData(subjects, gen())
+
+
 UNPACKERS = {"galaxy_active2": unpack_galaxy_active2}
 READERS = {"wf_ppg": read_wf_ppg, "multisite_ppg": read_multisite_ppg, "galaxy_active2": read_galaxy_active2,
-           "vilnius_af": read_vilnius_af, "utsa_ppg": read_utsa_ppg}
+           "vilnius_af": read_vilnius_af, "utsa_ppg": read_utsa_ppg,
+           "ppg_dalia": read_ppg_dalia}
 PARSERS: dict[str, Callable[[Path], np.ndarray]] = {"multisite_watch": multisite_watch,
                                                     "galaxy_active2_day": galaxy_active2_day}
 # Registered into kron_ppg.readers whichever of the two modules is imported first.

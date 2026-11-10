@@ -207,3 +207,36 @@ def test_utsa_reads_wrist_green_inverted_per_scene(tmp_path):
     recs = list(data.recordings)
     assert [r.recording for r in recs] == ["02/sleep", "10/sit"] and recs[0].fs == 100.0
     assert np.allclose(recs[0].load(), 5 * synthetic_ppg(30, 100.0, seed=2), atol=1e-3)
+
+
+def e4_export(x, fs=64.0):
+    import io
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as z:
+        z.writestr("BVP.csv", "1531385666.00\n" + f"{fs:f}\n" + "".join(f"{v:.2f}\n" for v in x))
+        z.writestr("HR.csv", "1531385666.00\n1.000000\n70\n")
+    return buf.getvalue()
+
+
+def test_ppg_dalia_reads_e4_bvp_from_the_nested_archive_and_never_the_pickles(tmp_path, monkeypatch):
+    import io
+    import pickle
+
+    folder = tmp_path / "ppg_dalia"
+    folder.mkdir()
+    inner = io.BytesIO()
+    with zipfile.ZipFile(inner, "w") as z:
+        for i, age in ((1, 34), (10, 55)):
+            z.writestr(f"PPG_FieldStudy/S{i}/S{i}_E4.zip", e4_export(50 * synthetic_ppg(60, 64.0, seed=i)))
+            z.writestr(f"PPG_FieldStudy/S{i}/S{i}_quest.csv",
+                       f"# SUBJECT_ID, S{i}\n# AGE, {age}\n# GENDER, f\n# HEIGHT, 164\n# WEIGHT, 56\n# SKIN, 4\n")
+            z.writestr(f"PPG_FieldStudy/S{i}/S{i}.pkl", b"not to be opened")
+    with zipfile.ZipFile(folder / "ppg_dalia.zip", "w", zipfile.ZIP_STORED) as z:
+        z.writestr("data.zip", inner.getvalue())
+    monkeypatch.setattr(pickle, "load", lambda *a, **k: pytest.fail("a pickle was opened"))
+    monkeypatch.setattr(pickle, "loads", lambda *a, **k: pytest.fail("a pickle was opened"))
+    data = READERS["ppg_dalia"](folder)
+    assert [(s["subject"], s["age"], s["sex"]) for s in data.subjects] == [("S1", "34", "F"), ("S10", "55", "F")]
+    recs = list(data.recordings)
+    assert [r.recording for r in recs] == ["S1", "S10"] and recs[0].fs == 64.0 and len(recs[0].load()) == 3840
