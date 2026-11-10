@@ -254,9 +254,31 @@ def read_vilnius_af(folder: Path) -> SourceData:
     return SourceData(subjects, gen())
 
 
+# ---- UTSA-PPG --------------------------------------------------------------------------------------
+UTSA_FS = 100.0
+
+
+def read_utsa_ppg(folder: Path) -> SourceData:
+    """Wrist green (``green``, inverted: the authors' filtered channels fall as blood volume rises) of each
+    ``subject<N>_<scene>_signals.csv`` (sit, sleep, office), ``<N>/<scene>``. The set gives no ages; the
+    fingertip ``ir`` and ``red`` channels are left for the bridge."""
+    names, opener = _zip_or_tree(folder, "dataset.zip")
+    pattern = re.compile(r"(?:^|/)subject(\d+)_([a-z]+)_signals\.csv$")
+    found = sorted((int(m[1]), m[2], n) for n in names if (m := pattern.search(n)))
+    subjects = [{"subject": f"{i:02d}", "age": ""} for i in sorted({i for i, _, _ in found})]
+
+    def gen() -> Iterator[Recording]:
+        for i, scene, name in found:
+            df = pl.read_csv(opener(name), columns=["time", "green"], infer_schema=False)
+            x = uniform(_values(df["time"]), -_values(df["green"]), UTSA_FS)
+            yield Recording(f"{i:02d}", f"{i:02d}/{scene}", UTSA_FS, x)
+
+    return SourceData(subjects, gen())
+
+
 UNPACKERS = {"galaxy_active2": unpack_galaxy_active2}
 READERS = {"wf_ppg": read_wf_ppg, "multisite_ppg": read_multisite_ppg, "galaxy_active2": read_galaxy_active2,
-           "vilnius_af": read_vilnius_af}
+           "vilnius_af": read_vilnius_af, "utsa_ppg": read_utsa_ppg}
 PARSERS: dict[str, Callable[[Path], np.ndarray]] = {"multisite_watch": multisite_watch,
                                                     "galaxy_active2_day": galaxy_active2_day}
 # Registered into kron_ppg.readers whichever of the two modules is imported first.

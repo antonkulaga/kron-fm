@@ -191,3 +191,19 @@ def test_vilnius_reads_the_subject_table_and_cuts_inverted_green_segments(tmp_pa
     assert [r.recording for r in recs] == ["006/0.0", "006/0.1", "006/0.2", "006/1.0"]
     assert [len(r.load()) for r in recs] == [2000, 2000, 1000, 1000]
     assert recs[0].fs == 100.0 and recs[0].load().mean() == pytest.approx(-1e5, rel=0.01)
+
+
+def test_utsa_reads_wrist_green_inverted_per_scene(tmp_path):
+    folder = tmp_path / "utsa_ppg"
+    folder.mkdir()
+    with zipfile.ZipFile(folder / "dataset.zip", "w") as z:
+        for i, scene in ((2, "sleep"), (10, "sit")):
+            x = -5 * synthetic_ppg(30, 100.0, seed=i)
+            rows = "".join(f"{k / 100:.2f},1,2,{v:.4f},0,0,0\n" for k, v in enumerate(x))
+            z.writestr(f"dataset/subject{i}_{scene}_signals.csv", "time,ir,red,green,x,y,z\n" + rows)
+        z.writestr("dataset/subject2_sleep_ecg.csv", "time,rr,hr\n0,1,60\n")
+    data = READERS["utsa_ppg"](folder)
+    assert [s["subject"] for s in data.subjects] == ["02", "10"]
+    recs = list(data.recordings)
+    assert [r.recording for r in recs] == ["02/sleep", "10/sit"] and recs[0].fs == 100.0
+    assert np.allclose(recs[0].load(), 5 * synthetic_ppg(30, 100.0, seed=2), atol=1e-3)
