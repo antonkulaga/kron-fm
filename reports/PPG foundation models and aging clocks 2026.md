@@ -262,10 +262,76 @@ these counts (run 2a had no intervals; the code now bootstraps `delta_auc`). BMI
 for the median, r 0.38. Both heads reached their best validation loss at step 500 of 6,000, so the
 encoder's features were read almost as they are. These trait heads are the more promising route to
 outcome evidence than the gap, and run 2's traits (every target, on the run 2 encoder, with the
-window-level vitals below) test it with intervals.
+window-level vitals) test it with intervals.
 
-Run folders: `data/output/runs/kron-ppg/r2-{pretrain,clock-scratch,clock-finetune,clock-probe}`
-and `r2a-traits-{probe,finetune}`. Each clock holds `metrics.json`, `predictions.parquet` and `bidmc.json`.
+**Traits on the run 2 encoder (run 2b).** The same multi-task head, now on the run 2 encoder and all 5,887
+people (4,071 train, 912 validation, 897 test), with every target the code has: the outcome flags, sex,
+height, weight, BMI, four preoperative lab values, `healthy` (ASA 1 with neither hypertension nor
+diabetes), and five vitals read per window (below). 8,000 steps, frozen and fine-tuned encoder; the two
+agree within about 0.02 everywhere, and the table gives frozen / fine-tuned. `Δ` is the AUC of age + PPG
+minus the AUC of age alone (both logistic fits on validation people), with a 95% bootstrap interval over
+the test people.
+
+| trait (test positives / negatives) | AUC of PPG | AUC of age | AUC of age + PPG | Δ (95% interval) |
+|---|---|---|---|---|
+| hypertension (273 / 624) | 0.71 / 0.71 | 0.73 | 0.74 | +0.009 (−0.006–0.025) / +0.007 (−0.005–0.018) |
+| diabetes (101 / 796) | 0.67 / 0.67 | 0.69 | 0.68 | −0.006 (−0.05–0.04) / −0.008 (−0.05–0.04) |
+| ASA ≥ 3 (87 / 794) | 0.76 / 0.74 | 0.62 | 0.75 / 0.73 | **+0.12 (0.045–0.20)** / **+0.11 (0.034–0.18)** |
+| healthy (256 / 631) | 0.75 / 0.75 | 0.74 | 0.76 | **+0.027 (0.004–0.05)** / **+0.027 (0.006–0.049)** |
+| male sex (448 / 449) | 0.77 / 0.77 | 0.59 | 0.78 | +0.19 (0.15–0.23) |
+
+- **PPG adds to age for overall health, not for hypertension or diabetes.** For ASA ≥ 3 (severe systemic
+  disease, as the anaesthetist graded it) PPG alone ranks people better than age does, and adding it to
+  age gains about 0.11–0.12 AUC with an interval clear of zero. For `healthy` the gain is small (0.03) but
+  also clear of zero. For hypertension and diabetes PPG alone is nearly as good as age, but it carries
+  nothing age does not: the gain is 0.01 or less, with intervals across zero. That is the first outcome
+  evidence kron-ppg has, and it comes from a trait head, not from the age gap.
+- **Body and blood.** Height (MAE 6.4 cm against 7.3 for the median, r 0.50), weight (8.0 kg against 9.3,
+  r 0.55), BMI (r 0.39), haemoglobin (r 0.41) and albumin (r 0.41) are read weakly; glucose (r 0.28) and
+  creatinine (r 0.16–0.19, MAE no better than the median) are not.
+- **Age**, as a by-product of the multi-task head: MAE 7.7–7.8 y, worse than the dedicated clock (6.8).
+
+Vitals, per 30 s window on the test people (window-level r across all windows, and *within-person* r,
+where each person's mean is removed first, which is what a watch tracking one wearer needs):
+
+| vital | windows (people) | r | within-person r |
+|---|---|---|---|
+| systolic pressure | 17,390 (897) | 0.58 / 0.59 | 0.65 / 0.67 |
+| diastolic pressure | 17,389 (897) | 0.58 / 0.58 | 0.64 / 0.64 |
+| RMSSD (ECG) | 8,124 (765) | 0.80 / 0.89 | 0.70 / 0.82 |
+| pulse arrival time | 7,883 (758) | 0.87 / 0.90 | 0.76 / 0.80 |
+| SpO2 | 17,876 (897) | 0.19 / 0.18 | 0.10 / 0.10 |
+
+- **Blood pressure moves with the PPG within a person** (r 0.64–0.67), from a model never told who the
+  person is. Pressure here is the arterial line's where there is one, else the cuff's, which is held
+  between readings, so part of each window's label is minutes old. SpO2 is not read: in surgery it sits
+  at 97–100% with little to follow.
+- **RMSSD and PAT are read closely, and that needs care.** PPG beat-to-beat intervals carry RMSSD, so that
+  one is expected. PAT is not cleanly physiological here: VitalDB's PLETH lags its ECG by a device delay,
+  the measured PAT is a median 0.83 of the R–R interval (0.6–0.8 s), and it correlates with the R–R
+  interval (r 0.51 across windows, 0.37 within a person). The PPG's r of 0.87–0.90 is more than heart
+  rate explains, but part of it may be the PPG recognising the monitor and its delay. PAT from this data
+  should not be read as arterial stiffness.
+
+**The healthy-only clock.** If a clock trained only on healthy people (1,103 train, 268 validation people
+with ASA 1 and neither hypertension nor diabetes; frozen run 2 encoder) read the sick as older, its gap
+would separate them. It does not: on all 897 test people, MAE 7.75 y (r 0.79), and gap AUCs of 0.50
+(0.46–0.54) for hypertension, 0.48 (0.42–0.54) for diabetes and 0.50 (0.43–0.56) for ASA ≥ 3.
+
+**A vitals bug, caught in this run.** The first vitals table had pulse arrival times piled at the two ends
+of the 80–600 ms search (10% at 80 ms, over a quarter at 598 ms) and a median RMSSD of 106 ms, absurd
+under anaesthesia. Two causes: the upstroke often lay beyond 600 ms (the device delay above), so an edge
+maximum passed as a value; and in some recordings the R-peak detector took T waves for R peaks (R–R
+alternating 320/640 ms, ECG rate twice the monitor's). `kron_ppg.vitals` now searches to the next beat
+and drops edge maxima, drops R–R features that alternate or disagree with the PPG's pulse rate, and reads
+HRV on normal-to-normal intervals. ECG features now cover 539,315 windows (from 1,038,202), median RMSSD
+is 7.2 ms and the ECG rate agrees with the monitor's to a median 0.6 bpm. The first traits run
+(`r2-traits-*`) used the broken table: its subject-level results match run 2b's, its PAT and RMSSD ones
+are void.
+
+Run folders: `data/output/runs/kron-ppg/r2-{pretrain,clock-scratch,clock-finetune,clock-probe}`,
+`r2a-traits-{probe,finetune}`, `r2b-traits-{probe,finetune}` and
+`r2-clock-healthy-probe`. Each clock holds `metrics.json`, `predictions.parquet` and `bidmc.json`.
 
 **The dataset.** `GlucoseDao/ppg-windows` holds the prepared windows of VitalDB (25 and 125 Hz), BIDMC
 (25 and 125 Hz) and GalaxyPPG (25 Hz), with the training split as the Hub's train/validation/test and a

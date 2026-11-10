@@ -161,11 +161,13 @@ with the pretrained encoder, against 7.75 y from scratch and 11.7 y for predicti
 (2,000 people) reached 7.3 y. It does not transfer to BIDMC (no better than the median age), and its
 bias-corrected age gap still does not separate hypertension, diabetes or ASA ≥ 3 (AUC 0.49–0.55, every
 95% interval containing 0.5, against 0.62–0.73 for age alone). So it is an age regressor, not yet an
-aging clock. Trait heads read from the same encoder rank ASA ≥ 3 (AUC 0.73) and sex (0.75) better than
-age does. The prepared windows are public as
+aging clock. A multi-task trait head on the same encoder is where the first outcome evidence is: added
+to age, PPG raises the AUC for ASA ≥ 3 by 0.11–0.12 (95% interval 0.03–0.20) and for being healthy by
+0.03 (0.004–0.05), though not for hypertension or diabetes, and it follows blood pressure within a
+person (r 0.65 per 30 s window). The prepared windows are public as
 [`GlucoseDao/ppg-windows`](https://huggingface.co/datasets/GlucoseDao/ppg-windows) (`kron-ppg hub-export`).
-Details are in the report. Next: trait heads with intervals and per-window vitals, foundation-model
-baselines on the same split, and wrist data.
+Details are in the report. Next: foundation-model baselines on the same split, the trait head on
+wrist data, and outcome evidence outside one hospital.
 
 ## Data and the cluster
 
