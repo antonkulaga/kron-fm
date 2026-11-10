@@ -146,3 +146,15 @@ def test_kron_dna_prepare_and_train_use_the_layout(tmp_path, data_root, monkeypa
         assert (runs[0] / "checkpoint.pt").is_file() and (runs[0] / "metrics.csv").is_file()
     finally:
         sources.SOURCES.pop("demo-cds")
+
+
+def test_wrist_sources_are_registered_with_licence_and_rate():
+    from kron_core.data_cli import all_sources
+    from kron_ppg.watch_sources import SOURCES as WATCH
+
+    sources = all_sources()
+    assert set(WATCH) <= set(sources)
+    for s in WATCH.values():
+        assert s.domain == "ppg" and s.license and s.citation and s.homepage, s.name
+        assert s.fetch is not None, f"{s.name} writes SOURCE.json file by file through fetch_tree"
+    assert sum(f.size for f in WATCH["wildppg"].files) > 19e9

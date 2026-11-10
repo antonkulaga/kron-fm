@@ -177,3 +177,6 @@ SOURCES: dict[str, Source] = {
                fetch=fetch_galaxyppg),
     )
 }
+
+from kron_ppg.watch_sources import SOURCES as _WATCH  # noqa: E402  wrist and smartwatch sets
+SOURCES.update(_WATCH)
