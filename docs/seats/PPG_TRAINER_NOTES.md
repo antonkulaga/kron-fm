@@ -19,9 +19,8 @@ secretary on the maintainer's word).
 
 - Work so far: `kron-ppg wrist-age` (per-person age from a frozen encoder, ridge head, grouped CV, constant and
   source-median baselines, permutation null, leave-one-source-out, `--lowpass`, `transfer`), commits 1cbae51,
-  8642cbc, 68eaf93, 735a86f. `wrist-age-export` (ONNX graph with the linear head, timed) uncommitted until its
-  first job (wa5) passes.
-- Jobs wa3/wa4/wa5 (`kron-ppg-wa*`), watched by a background waiter.
+  8642cbc, 68eaf93, 735a86f, e8c0e63, ffc1cd4, 550e798 (wrist-age-export: ONNX with the linear head, timed).
+- No job running (wa1-wa7 done 2026-11-10 23:36). Deployable predictor and draft note: see `<status file>`.
 - A public research note on the wrist results waits on desk #7 (default nothing public); the watch plan on desk #8.
 - Aurora-BP: research only, never product development (its DUA, read 2026-11-10); a head fitted on it is never the
   deployed model. Open-data heads may be scored on Aurora alone.
