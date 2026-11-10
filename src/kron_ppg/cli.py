@@ -177,7 +177,8 @@ def traits(sources: list[str] = typer.Argument(..., help="prepared sources with 
 
 @app.command("wrist-age")
 def wrist_age(sources: list[str] = typer.Argument(..., help="prepared sources with ages (a restricted one alone)"),
-              encoder: Path = typer.Option(..., help="a pretraining or clock checkpoint, read frozen"),
+              encoder: str = typer.Option(..., help="a pretraining or clock checkpoint, read frozen; 'random' "
+                                          "for an untrained encoder, 'hand' for hand-made pulse features"),
               out: Path | None = typer.Option(None, help="run folder (default data/output/runs/kron-ppg/...)"),
               cap: int = typer.Option(200, help="windows per person, spread over the record"),
               folds: int = 10, repeats: int = 5,
@@ -189,7 +190,8 @@ def wrist_age(sources: list[str] = typer.Argument(..., help="prepared sources wi
 
     folders = _variants(sources, sample_rate, seconds)
     out = out or runs_dir(MODEL) / run_name("wrist-age", *sources)
-    result = run(folders, encoder, out, cap, folds, repeats, null, batch_size, device, seed)
+    enc = None if encoder == "hand" else (encoder if encoder == "random" else Path(encoder))
+    result = run(folders, enc, out, cap, folds, repeats, null, batch_size, device, seed)
     keep = {k: result[k] for k in ("pooled", "per_source", "leave_source_out", "null") if k in result}
     if "null" in keep:
         keep["null"] = {k: v for k, v in keep["null"].items() if k != "mae"}

@@ -63,6 +63,41 @@ def embed(encoder: KronPPG, pool: Pool, idx: np.ndarray, batch_size: int = 256,
     return np.concatenate(out) if out else np.zeros((0, encoder.config.d_model), np.float32)
 
 
+def handcrafted(x: np.ndarray, fs: float) -> np.ndarray:
+    """A baseline without any encoder: per window, the pulse rate and the signal's simple statistics.
+
+    Heart rate (autocorrelation peak in 40-180 bpm) and its peak height (regularity), the power in four
+    bands of the spectrum, the skewness and kurtosis of the signal and of its derivative (pulse shape),
+    and the second-derivative energy. ``x`` is ``(n, L)`` scaled windows; returns ``(n, 12)``.
+    """
+    x = x.astype(np.float64)
+    x = x - x.mean(1, keepdims=True)
+    n, length = x.shape
+    spec = np.abs(np.fft.rfft(x, axis=1)) ** 2
+    freqs = np.fft.rfftfreq(length, 1 / fs)
+    total = spec[:, (freqs > 0.5) & (freqs < 8)].sum(1) + 1e-12
+    bands = [spec[:, (freqs >= lo) & (freqs < hi)].sum(1) / total for lo, hi in ((0.5, 1.0), (1.0, 2.0),
+                                                                                (2.0, 4.0), (4.0, 8.0))]
+    ac = np.fft.irfft(np.abs(np.fft.rfft(x, 2 * length, axis=1)) ** 2, axis=1)[:, :length]
+    ac = ac / np.maximum(ac[:, :1], 1e-12)
+    lo, hi = int(fs * 60 / 180), int(fs * 60 / 40)
+    lag = lo + ac[:, lo:hi + 1].argmax(1)
+    peak = ac[np.arange(n), lag]
+
+    def moments(v):
+        v = v - v.mean(1, keepdims=True)
+        sd = v.std(1) + 1e-12
+        return (v ** 3).mean(1) / sd ** 3, (v ** 4).mean(1) / sd ** 4
+
+    d1 = np.diff(x, axis=1)
+    d2 = np.diff(d1, axis=1)
+    s0, k0 = moments(x)
+    s1, k1 = moments(d1)
+    return np.stack([60 * fs / lag, peak, *bands, s0, k0, s1, k1,
+                     (d2 ** 2).mean(1) / ((d1 ** 2).mean(1) + 1e-12), (d1 ** 2).mean(1) / ((x ** 2).mean(1) + 1e-12)],
+                    axis=1)
+
+
 @dataclass
 class People:
     """One row per person: the mean window embedding, age, source and window count."""
@@ -264,9 +299,10 @@ def json_safe(value):
     return value
 
 
-def run(folders: Sequence[Path], encoder_path: Path | None, out: Path, cap: int = 200, folds: int = 10,
+def run(folders: Sequence[Path], encoder_path: Path | str | None, out: Path, cap: int = 200, folds: int = 10,
         repeats: int = 5, null: int = 20, batch_size: int = 256, device: str = "cuda", seed: int = 0) -> dict:
-    """Embed, cross-validate and write ``people.npz``, ``predictions.parquet``, ``metrics.json``, ``head.pt``."""
+    """Embed (``encoder_path`` a checkpoint, ``"random"`` for an untrained encoder, None for hand-made
+    features), cross-validate and write ``people.npz``, ``predictions.parquet``, ``metrics.json``, ``head.pt``."""
     import polars as pl
 
     from kron_ppg.train import load_encoder
@@ -279,8 +315,18 @@ def run(folders: Sequence[Path], encoder_path: Path | None, out: Path, cap: int 
         pool = Pool.load(folders)
         aged = np.flatnonzero(np.isfinite(pool.age))
         idx = aged[spread_index(pool.subject[aged], cap, seed)]
-        encoder = load_encoder(encoder_path, device)
-        emb = embed(encoder, pool, idx, batch_size, device)
+        if encoder_path is None:  # the hand-made baseline
+            emb = np.concatenate([handcrafted(np.stack([pool.window(int(i)) for i in idx[k:k + 4096]]),
+                                              pool.sample_rate) for k in range(0, len(idx), 4096)])
+        else:
+            if str(encoder_path) == "random":  # an untrained encoder of the default shape
+                from kron_ppg.model import KronPPGConfig
+
+                torch.manual_seed(seed)
+                encoder = KronPPG(KronPPGConfig(sample_rate=pool.sample_rate)).to(device)
+            else:
+                encoder = load_encoder(encoder_path, device)
+            emb = embed(encoder, pool, idx, batch_size, device)
         people = per_person(pool.subject[idx], pool.age[idx], emb)
         people.save(cache)
     result, cv = evaluate(people, folds, repeats, null, seed)

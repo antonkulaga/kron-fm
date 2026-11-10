@@ -69,3 +69,14 @@ def test_spread_index_and_per_person_embedding(device):
     p = per_person(subjects[idx], np.array([30.0] * 4 + [50.0] * 3), emb)
     assert list(p.source) == ["a", "b"] and list(p.windows) == [4, 3] and list(p.age) == [30.0, 50.0]
     torch.testing.assert_close(torch.tensor(p.x[0]), torch.tensor(emb[:4].mean(0), dtype=torch.float64))
+
+
+def test_handcrafted_reads_the_pulse_rate():
+    from kron_ppg.wrist_age import handcrafted
+
+    fs = 25.0
+    t = np.arange(int(30 * fs)) / fs
+    x = np.stack([np.sin(2 * np.pi * bpm / 60 * t) for bpm in (55, 72, 110)])
+    f = handcrafted(x, fs)
+    assert f.shape == (3, 12) and np.isfinite(f).all()
+    np.testing.assert_allclose(f[:, 0], [55, 72, 110], rtol=0.05)
