@@ -111,3 +111,18 @@ def test_memory_check_scores_identical_chunks_cold_and_warm(device, tmp_path):
     rows = memory_check(model, pool, pool.keys("train") + pool.keys("val"), 4, 25 * 20, 3, device)
     assert [r["chunk"] for r in rows] == [0, 1, 2]
     assert abs(rows[0]["warm"] - rows[0]["cold"]) < 1e-5  # no context yet: the two are the same pass
+
+
+def test_periodicity_pooling_gates_softly_and_the_clock_runs_with_it(device, tmp_path):
+    from kron_ppg.stream_train import StreamClockArgs, _pool_weights, fit_stream_clock
+
+    w = np.array([[0.2] * 5 + [0.675] * 5 + [1.0] * 5])
+    ok = np.ones_like(w, bool)
+    ok[0, 12] = False
+    assert np.allclose(_pool_weights(w, ok, 5, "uniform"), [[1, 1, 0]])
+    assert np.allclose(_pool_weights(w, ok, 5, "periodicity"), [[0, 0.5, 0]])
+    folder = tiny_streams(tmp_path)
+    result = fit_stream_clock(StreamClockArgs([folder], tmp_path / "clock", None, KronPPGConfig(**SMALL), lanes=6,
+                                              chunk_s=20.0, steps=2, eval_every=2, eval_hours=0.05, eval_lanes=5,
+                                              pool="periodicity", device=str(device)))
+    assert math.isfinite(result["test"]["mae"])

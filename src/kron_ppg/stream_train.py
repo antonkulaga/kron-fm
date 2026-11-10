@@ -380,12 +380,43 @@ class StreamClockArgs:
     eval_hours: float = 4.0
     eval_lanes: int = 64
     scale_blocks: int = 30
+    #: ``uniform``: every valid patch counts the same in a person's pool; ``periodicity``: weighted by the pulse
+    #: periodicity of its 10 s block (:data:`POOL_GATE`), a soft quality gate inside the stream
+    pool: str = "uniform"
     seed: int = 0
     device: str = "cuda"
 
 
+#: Pulse periodicity below which a stretch adds nothing to a person's pooled state (the window gate's 0.35);
+#: above it the weight rises linearly to 1. A soft quality gate inside the stream: nothing is cut out.
+POOL_GATE = 0.35
+
+
+def _pool_weights(w: np.ndarray, valid: np.ndarray, patch: int, mode: str) -> np.ndarray:
+    """Per-patch pooling weights ``(B, T)``: the validity (``uniform``), or validity times
+    ``clip((periodicity - POOL_GATE) / (1 - POOL_GATE), 0, 1)`` (``periodicity``)."""
+    steps = valid.shape[1] // patch
+    ok = valid[:, :steps * patch].reshape(len(valid), steps, patch).all(-1).astype(np.float32)
+    if mode == "uniform":
+        return ok
+    if mode != "periodicity":
+        raise ValueError(f"pool must be uniform or periodicity, not {mode!r}")
+    per = w[:, :steps * patch].reshape(len(w), steps, patch).mean(-1)
+    return ok * np.clip((per - POOL_GATE) / (1 - POOL_GATE), 0.0, 1.0)
+
+
+def _pool_step(clock: PPGAgeClock, patches, pv, weight, states, psum, pcount):
+    """One chunk of a stream clock: the encoder carries ``states``; the pool adds the chunk's hidden states
+    weighted by ``weight`` ``(B, T)``; returns ``(age, psum, pcount)``."""
+    h = clock.encoder.encode(patches, pv, states)
+    wt = weight.to(h.dtype).unsqueeze(-1)
+    psum = psum + (h * wt).sum(1)
+    pcount = pcount + wt.sum(1)
+    return clock.head(psum / pcount.clamp_min(1e-6)), psum, pcount
+
+
 def stream_ages(clock: PPGAgeClock, pool: StreamPool, keys: list[str], hours: float, chunk: int, lanes: int,
-                dev) -> dict[str, tuple[float, float, int]]:
+                dev, pool_mode: str = "uniform") -> dict[str, tuple[float, float, int]]:
     """Each person's age read at the end of up to ``hours`` of their streams, one after another, the memory and
     the pool carried across them: ``key -> (predicted, age, patches pooled)``."""
     clock.eval()
@@ -414,13 +445,15 @@ def stream_ages(clock: PPGAgeClock, pool: StreamPool, keys: list[str], hours: fl
             for c in range(max(len(s) for _, s in group)):
                 x = np.zeros((len(group), chunk), np.float32)
                 ok = np.zeros((len(group), chunk), bool)
+                w = np.zeros((len(group), chunk), np.float32)
                 for j, (_, segs) in enumerate(group):
                     if c < len(segs):
                         row, start, n = segs[c]
-                        xx, oo, _ = pool.read(int(row), int(start), chunk)
-                        x[j, :n], ok[j, :n] = xx[:n], oo[:n]
-                patches, pv, _ = _tensors(x, ok, np.zeros_like(x), patch, dev)
-                age, psum, pcount = clock.stream(patches, pv, states, psum, pcount)
+                        xx, oo, ww = pool.read(int(row), int(start), chunk)
+                        x[j, :n], ok[j, :n], w[j, :n] = xx[:n], oo[:n], ww[:n]
+                patches, pv, _ = _tensors(x, ok, w, patch, dev)
+                weight = torch.from_numpy(_pool_weights(w, ok, patch, pool_mode)).to(dev)
+                age, psum, pcount = _pool_step(clock, patches, pv, weight, states, psum, pcount)
             for j, (k, _) in enumerate(group):
                 out[k] = (float(age[j]), pool.age[k], int(pcount[j]))
     clock.train()
@@ -465,7 +498,7 @@ def fit_stream_clock(a: StreamClockArgs) -> dict:
     pcount = torch.zeros(a.lanes, 1, device=dev)
 
     def evaluate() -> dict:
-        subj = {k: stream_ages(clock, pool, v, a.eval_hours, chunk, a.eval_lanes, dev) for k, v in split.items()}
+        subj = {k: stream_ages(clock, pool, v, a.eval_hours, chunk, a.eval_lanes, dev, a.pool) for k, v in split.items()}
         arrays = {k: (np.array([p for p, _, _ in d.values()]), np.array([g for _, g, _ in d.values()]))
                   for k, d in subj.items()}
         bias = fit_bias(*arrays["val"])
@@ -480,17 +513,18 @@ def fit_stream_clock(a: StreamClockArgs) -> dict:
     if a.freeze:
         encoder.eval()
     for step in range(1, a.steps + 1):
-        x, ok, _, reset, keys = lanes.batch()
-        patches, pv, _ = _tensors(x, ok, np.zeros_like(x), config.patch, dev)
+        x, ok, w, reset, keys = lanes.batch()
+        patches, pv, _ = _tensors(x, ok, w, config.patch, dev)
+        weight = torch.from_numpy(_pool_weights(w, ok, config.patch, a.pool)).to(dev)
         r = torch.from_numpy(reset).to(dev)
         states = states.reset(r)
         keep = (~r).float().unsqueeze(-1)
         psum, pcount = psum * keep, pcount * keep
         for g in opt.param_groups:
             g["lr"] = _lr_at(step - 1, a.steps, warmup, g["base"])
-        pred, psum, pcount = clock.stream(patches, pv, states, psum, pcount)
+        pred, psum, pcount = _pool_step(clock, patches, pv, weight, states, psum, pcount)
         age = torch.tensor([pool.age[k] for k in keys], device=dev, dtype=torch.float32)
-        seen = pcount.squeeze(-1) > 0
+        seen = pcount.squeeze(-1) > 1e-3
         loss = F.smooth_l1_loss(pred.float()[seen], age[seen], beta=2.0) if bool(seen.any()) else pred.sum() * 0
         opt.zero_grad(set_to_none=True)
         loss.backward()
