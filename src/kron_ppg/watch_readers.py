@@ -21,7 +21,18 @@ from kron_ppg.readers import Recording, SourceData, _table, _values
 MAX_GAP_S = 0.5
 #: Long recordings (a Vilnius segment of up to 35 h, a WildPPG day, a Multisite span) are cut into recordings of
 #: at most this long, so the per-recording window cap of ``prepare`` samples all of them, not only their start.
-CHUNK_S = 6 * 3600
+CHUNK_S: float | None = 6 * 3600
+
+
+def pieces(x: np.ndarray, fs: float) -> Iterator[tuple[int, np.ndarray]]:
+    """``(j, part)`` of a recording cut into pieces of at most :data:`CHUNK_S`, or ``(0, whole)`` when
+    ``CHUNK_S`` is None (streams for a streaming trainer, :mod:`kron_ppg.streams`)."""
+    if CHUNK_S is None:
+        yield 0, x
+        return
+    step = int(CHUNK_S * fs)
+    for j, start in enumerate(range(0, len(x), step)):
+        yield j, x[start:start + step]
 
 
 def uniform(t: np.ndarray, x: np.ndarray, fs: float) -> np.ndarray:
@@ -131,15 +142,13 @@ def read_multisite_ppg(folder: Path) -> SourceData:
                 for r in _table(raw / "participants_demographics.csv")]
     files = {s["subject"]: raw / s["subject"] / f"{s['subject']}_Watch_raw.npz" for s in subjects}
 
-    chunk = int(CHUNK_S * MULTISITE_FS)
-
     def gen() -> Iterator[Recording]:
         for s in subjects:
             path = files[s["subject"]]
             if path.is_file():
                 x = multisite_watch(path)
-                for j, start in enumerate(range(0, len(x), chunk)):
-                    yield Recording(s["subject"], f"{s['subject']}/watch.{j}", MULTISITE_FS, x[start:start + chunk])
+                for j, part in pieces(x, MULTISITE_FS):
+                    yield Recording(s["subject"], f"{s['subject']}/watch.{j}", MULTISITE_FS, part)
 
     return SourceData(subjects, gen())
 
@@ -191,6 +200,17 @@ def unpack_galaxy_active2(folder: Path, block: int = 1 << 26) -> dict:
     return {"rows": rows, "files": files, "out": str(out)}
 
 
+#: ``"day"``: one recording per device and UTC day (spreads the window cap); ``"device"``: one per device over its
+#: four weeks, the hours between days as gaps (a stream, :mod:`kron_ppg.streams`).
+GALAXY_ACTIVE2_UNIT = "day"
+
+
+def galaxy_active2_device(path: Path) -> np.ndarray:
+    """All days of one device folder of the unpacked set on one 10 Hz grid (raw value inverted)."""
+    df = pl.concat([pl.read_parquet(p) for p in sorted(path.glob("*/part-*.parquet"))])
+    return uniform(df["ts"].to_numpy() / 1000.0, -df["ppg"].to_numpy(), GALAXY_ACTIVE2_FS)
+
+
 def galaxy_active2_day(path: Path) -> np.ndarray:
     """One device-day folder of the unpacked set as green PPG on a 10 Hz grid (raw value inverted)."""
     df = pl.concat([pl.read_parquet(p) for p in sorted(path.glob("part-*.parquet"))])
@@ -210,6 +230,10 @@ def read_galaxy_active2(folder: Path) -> SourceData:
     days = sorted((d.parent.name, d.name, d) for d in root.glob("*/*") if d.is_dir())
 
     def gen() -> Iterator[Recording]:
+        if GALAXY_ACTIVE2_UNIT == "device":
+            for device in sorted({d for d, _, _ in days}):
+                yield Recording(device, device, GALAXY_ACTIVE2_FS, path=root / device, parser="galaxy_active2_device")
+            return
         for device, day, path in days:
             yield Recording(device, f"{device}/{day}", GALAXY_ACTIVE2_FS, path=path, parser="galaxy_active2_day")
 
@@ -218,9 +242,6 @@ def read_galaxy_active2(folder: Path) -> SourceData:
 
 # ---- Vilnius long-term wrist PPG with AF (Zenodo) ------------------------------------------------
 VILNIUS_FS = 100.0
-#: A synchronised segment (up to 35 h) is cut into recordings of at most this long, so the per-recording window
-#: cap of ``prepare`` samples every part of a week-long recording rather than its first day.
-CHUNK_S = 6 * 3600
 #: Columns 0-29 of ``subject_info.xlsx`` (the last two, free-text medication lists, are left out); ``?`` = unknown.
 VILNIUS_COLUMNS = (
     "subject", "sex_female", "age", "height", "weight", "alcohol", "smoking", "physical_inactivity",
@@ -248,16 +269,14 @@ def read_vilnius_af(folder: Path) -> SourceData:
         rec["sex"] = {"0": "M", "1": "F"}.get(rec["sex_female"], "")
         subjects.append(rec)
     files = sorted(folder.glob("[0-9][0-9][0-9]_PPG.mat"))
-    chunk = int(CHUNK_S * VILNIUS_FS)
-
     def gen() -> Iterator[Recording]:
         for path in files:
             subject = path.name[:3]
             with h5py.File(path, "r") as f:
                 for k, ref in enumerate(f["PPG_GREEN"][:, 0]):
                     x = -np.asarray(f[ref][()], np.float64).ravel()
-                    for j, start in enumerate(range(0, len(x), chunk)):
-                        yield Recording(subject, f"{subject}/{k}.{j}", VILNIUS_FS, x[start:start + chunk])
+                    for j, part in pieces(x, VILNIUS_FS):
+                        yield Recording(subject, f"{subject}/{k}.{j}", VILNIUS_FS, part)
 
     return SourceData(subjects, gen())
 
@@ -378,8 +397,6 @@ def read_wildppg(folder: Path) -> SourceData:
 
     files = sorted(folder.glob("WildPPG_Part_*.mat"))
     subjects = [{"subject": p.stem.removeprefix("WildPPG_Part_"), "age": ""} for p in files]
-    chunk = int(CHUNK_S * WILDPPG_FS)
-
     def gen() -> Iterator[Recording]:
         for path, s in zip(files, subjects, strict=True):
             wrist = sio.loadmat(path, variable_names=["wrist"], squeeze_me=True, struct_as_record=False)["wrist"]
@@ -387,8 +404,8 @@ def read_wildppg(folder: Path) -> SourceData:
             if fs != WILDPPG_FS:
                 raise ValueError(f"{path.name}: wrist green at {fs} Hz, expected {WILDPPG_FS}")
             x = np.asarray(wrist.ppg_g.v, np.float64).ravel()
-            for j, start in enumerate(range(0, len(x), chunk)):
-                yield Recording(s["subject"], f"{s['subject']}/{j}", WILDPPG_FS, x[start:start + chunk])
+            for j, part in pieces(x, WILDPPG_FS):
+                yield Recording(s["subject"], f"{s['subject']}/{j}", WILDPPG_FS, part)
 
     return SourceData(subjects, gen())
 
@@ -427,6 +444,7 @@ READERS = {"wf_ppg": read_wf_ppg, "multisite_ppg": read_multisite_ppg, "galaxy_a
            "wildppg": read_wildppg, "ppg_sport": read_ppg_sport}
 PARSERS: dict[str, Callable[[Path], np.ndarray]] = {"multisite_watch": multisite_watch,
                                                     "galaxy_active2_day": galaxy_active2_day,
+                                                    "galaxy_active2_device": galaxy_active2_device,
                                                     "ppg_sport_npy": ppg_sport_npy}
 # Registered into kron_ppg.readers whichever of the two modules is imported first.
 _readers.READERS.update(READERS)

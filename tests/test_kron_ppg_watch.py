@@ -291,3 +291,50 @@ def test_ppg_sport_reads_each_wrist_and_activity_inverted(tmp_path):
     recs = list(data.recordings)
     assert [r.recording for r in recs] == ["S01/L/running", "S01/R/running"] and recs[0].fs == 64.0
     assert np.allclose(recs[0].load(), x)
+
+
+def test_streams_keep_every_recording_whole_with_gaps_and_noise_marked_not_dropped(tmp_path, monkeypatch):
+    from kron_ppg import readers, watch_readers
+    from kron_ppg.readers import Recording, SourceData
+    from kron_ppg.streams import Streams, write_streams
+
+    rng = np.random.default_rng(0)
+    clean = synthetic_ppg(120, 100.0)
+    gappy = synthetic_ppg(120, 100.0, seed=1)
+    gappy[3000:5000] = np.nan  # 20 s gap: stays in the stream, marked invalid
+    noise = rng.standard_normal(60 * 100)  # aperiodic: a window gate would drop it, a stream keeps it
+
+    def fake(folder):
+        recs = [Recording("a", "a/0", 100.0, clean), Recording("a", "a/1", 100.0, gappy),
+                Recording("b", "b/0", 100.0, noise)]
+        return SourceData([{"subject": "a", "age": "61"}, {"subject": "b", "age": "35"}], iter(recs))
+
+    monkeypatch.setitem(readers.READERS, "fake", fake)
+    monkeypatch.setattr(watch_readers, "CHUNK_S", watch_readers.CHUNK_S)  # restored after write_streams
+    (tmp_path / "in").mkdir()
+    info = write_streams("fake", folder=tmp_path / "in", out=tmp_path / "out", workers=1)
+    assert info["streams"] == 3 and info["samples"] == 25 * (120 + 120 + 60) and watch_readers.CHUNK_S is None
+    s = Streams(tmp_path / "out")
+    assert len(s) == 3 and list(s.table["recording"]) == ["a/0", "a/1", "b/0"]
+    x, valid, blocks = s[1]
+    assert len(x) == 3000 and not valid[30 * 25 + 10:50 * 25 - 10].any() and valid[:25 * 29].all()
+    assert blocks.shape == (12, 3) and blocks[4, 2] == 0.0 and blocks[0, 2] == 1.0
+    _, _, clean_blocks = s[0]
+    _, noise_valid, noise_blocks = s[2]
+    assert noise_valid.all() and noise_blocks[:, 1].mean() < clean_blocks[:, 1].mean() - 0.3
+    assert (clean_blocks[:, 0] > 0).all() and dict(s.subjects.select("subject", "age").iter_rows())["a"] == 61
+
+
+def test_wrist_readers_give_whole_recordings_for_streams(tmp_path, monkeypatch):
+    from kron_ppg import watch_readers
+
+    monkeypatch.setattr(watch_readers, "CHUNK_S", None)
+    fake_vilnius(tmp_path / "vilnius_af", 20)
+    recs = list(READERS["vilnius_af"](tmp_path / "vilnius_af").recordings)
+    assert [r.recording for r in recs] == ["006/0.0", "006/1.0"] and len(recs[0].load()) == 5000
+    monkeypatch.setattr(watch_readers, "GALAXY_ACTIVE2_UNIT", "device")
+    folder = tmp_path / "galaxy_active2"
+    fake_galaxy_active2(folder)
+    watch_readers.unpack_galaxy_active2(folder, block=5000)
+    recs = list(READERS["galaxy_active2"](folder).recordings)
+    assert [r.recording for r in recs] == ["ab12", "cd34"] and len(recs[0].load()) == 1200
