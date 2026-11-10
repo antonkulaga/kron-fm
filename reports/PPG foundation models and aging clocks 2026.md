@@ -129,7 +129,7 @@ before it means anything on a watch. GalaxyPPG's 20–29-year-olds cannot do tha
     and every layer's memory, and returns the age so far with the updated state.
   - It reads the trained weights through `kron_core.onnx.PlainKronMixer`, as krontime does.
 
-## First results: run 1 (2026-11-09, haumea, one A100)
+## First results: run 1 (2026-11-09, one A100)
 
 **Data.** 2,000 VitalDB cases, one per person, gave 405,242 windows of 30 s from 1,996 people. Four
 cases had no window that passed the gate. GalaxyPPG gave 1,847 windows and BIDMC 820. Subjects were
@@ -191,8 +191,87 @@ Scores are per person, as the mean over up to 20 windows.
   - It matches PyTorch in ONNX Runtime to 1e-5 y.
   - In float32 it matches the A100 kernels to 4e-6 y; under bfloat16 autocast the difference is 0.03 y.
 
-Run folders, on haumea: `data/output/runs/kron-ppg/r1-{pretrain,clock-scratch,clock-finetune,clock-probe}`.
+Run folders: `data/output/runs/kron-ppg/r1-{pretrain,clock-scratch,clock-finetune,clock-probe}`.
 Each holds `metrics.json`, `predictions.csv` and `bidmc.json`.
+
+## Run 2 (2026-11-10, one A100)
+
+**Data.** 5,887 VitalDB cases, one per person (every case with a PLETH track and an age), gave 1,195,506
+VitalDB windows of 30 s at 25 Hz after the quality gate. People with an age were split by the same hash
+as run 1: 4,071 train, 912 validation and 897 test. Run 1's 308 test people are among the 897, because
+the split does not move when people are added. The same windows, and the same windows at 125 Hz, are
+published as the dataset [`GlucoseDao/ppg-windows`](https://huggingface.co/datasets/GlucoseDao/ppg-windows)
+(below).
+
+**Pretraining.**
+- The same encoder as run 1 (5.85M parameters, `next+subject`), on VitalDB + GalaxyPPG, with BIDMC held out.
+- 40,000 steps × 128 windows, twice run 1's length, on three times the people. It took 49 min at
+  about 1,740 windows/s.
+- Validation next-patch L1 fell to 0.156 (run 1: 0.197).
+
+**Clock.** The same three clocks as run 1, 8,000 steps each, scored per person on up to 20 windows.
+
+| | test MAE | test r | val MAE | BIDMC MAE (52 people) | BIDMC r |
+|---|---|---|---|---|---|
+| predicting the median age | 11.74 | – | 11.46 | 14.31 | – |
+| scratch | 7.75 | 0.76 | 8.11 | 12.54 | 0.54 |
+| finetune | **6.77** | **0.82** | 7.12 | 16.62 | 0.70 |
+| probe (frozen encoder) | 6.82 | 0.81 | 7.11 | 14.11 | 0.64 |
+| *run 1, best (probe; 308 test people)* | *7.33* | *0.78* | *7.78* | *15.29* | *0.68* |
+
+- **Pretraining now pays.** With three times the people, both clocks on the pretrained encoder beat the
+  same model from scratch by about 1 y (6.8 against 7.75), and the gap to scratch is larger than in
+  run 1 (0.5 y). Scratch itself barely moved (7.79 → 7.75), so the gain comes from the encoder, not
+  from more labelled people for the head. Fine-tuning overfits less than in run 1 (train MAE 4.6 against
+  2.8) and reaches its best validation score at step 5,500 of 8,000.
+- **In-domain only.** On BIDMC no clock beats predicting the median age by much: the fine-tuned clock is
+  worse than that (16.6 against 14.3) although its r is the highest (0.70), so it ranks BIDMC's people
+  by age but sits at the wrong level for an ICU monitor's signal. Transfer to another hospital and
+  device is not shown.
+- **The age gap still carries no outcome signal.** Bias-corrected on the 912 validation people, read on
+  the 897 test people (273 hypertensive, 101 diabetic, 87 with ASA ≥ 3, 3 in-hospital deaths). The
+  intervals are 2,000 bootstrap resamples of the test people:
+
+  | outcome | AUC of gap: scratch | finetune | probe | AUC of age alone |
+  |---|---|---|---|---|
+  | hypertension | 0.53 (0.49–0.57) | 0.53 (0.49–0.57) | 0.54 (0.49–0.57) | 0.73 |
+  | diabetes | 0.49 (0.44–0.55) | 0.51 (0.45–0.57) | 0.52 (0.45–0.58) | 0.69 |
+  | ASA ≥ 3 | 0.51 (0.45–0.58) | 0.55 (0.48–0.62) | 0.54 (0.47–0.61) | 0.62 |
+
+  Every interval contains 0.5. Three deaths are too few to read. A better age regressor did not give a
+  more informative gap: what the encoder learns about age it uses to predict age, and what is left over
+  is not, so far, about these outcomes. By this project's standard run 2 is still **an age regressor,
+  not an aging clock**.
+
+**Traits from PPG directly (run 2a).** The gap is not the only way to ask whether PPG carries health
+information. Run 2a trained one multi-task head (`kron-ppg traits`) on run 1's encoder for age, BMI,
+hypertension, diabetes, ASA ≥ 3 and sex, on the 3,986 people downloaded by then (2,735 train, 637
+validation, 614 test), and scored each trait on the test people against age alone and against a
+logistic model of age plus the PPG score, fitted on validation people:
+
+| trait (test positives / negatives) | AUC of PPG | AUC of age | AUC of age + PPG |
+|---|---|---|---|
+| hypertension (183 / 431) | 0.71–0.72 | 0.74 | 0.76 |
+| diabetes (63 / 551) | 0.65–0.68 | 0.68 | 0.69–0.70 |
+| ASA ≥ 3 (56 / 545) | 0.73 | 0.65 | 0.71–0.72 |
+| male sex (298 / 316) | 0.75–0.76 | 0.60 | 0.76–0.78 |
+
+Ranges span the frozen and fine-tuned encoder. PPG alone ranks ASA ≥ 3 and sex better than age does,
+and hypertension and diabetes about as well; adding it to age gains 0.01–0.03, within the noise of
+these counts (run 2a had no intervals; the code now bootstraps `delta_auc`). BMI: MAE 2.66 against 2.87
+for the median, r 0.38. Both heads reached their best validation loss at step 500 of 6,000, so the
+encoder's features were read almost as they are. These trait heads are the more promising route to
+outcome evidence than the gap, and run 2's traits (every target, on the run 2 encoder, with the
+window-level vitals below) test it with intervals.
+
+Run folders: `data/output/runs/kron-ppg/r2-{pretrain,clock-scratch,clock-finetune,clock-probe}`
+and `r2a-traits-{probe,finetune}`. Each clock holds `metrics.json`, `predictions.parquet` and `bidmc.json`.
+
+**The dataset.** `GlucoseDao/ppg-windows` holds the prepared windows of VitalDB (25 and 125 Hz), BIDMC
+(25 and 125 Hz) and GalaxyPPG (25 Hz), with the training split as the Hub's train/validation/test and a
+subject table per source; each config was loaded back from the Hub with polars. VitalDB at 125 Hz has
+183,618 test windows. Per-window vitals (blood pressure, SpO2, ECG heart-rate variability, pulse arrival
+time) are added to the VitalDB configs once `kron-ppg vitals` has run.
 
 ## What is not done
 

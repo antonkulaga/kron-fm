@@ -142,12 +142,16 @@ uv run kron-ppg export data/output/runs/kron-ppg/<clock run>   # -> <run>/onnx/s
 A PPG age is a within-person trend, never a biological age. It must be shown with the run's error
 band.
 
-Status: run 1 (2,000 VitalDB people, one A100) reached a held-out MAE of 7.3 y (r 0.78) with the frozen
-pretrained encoder, against 7.8 y from scratch and 11.3 y for predicting the median age. It transfers
-weakly to BIDMC, and its bias-corrected age gap does not yet separate hypertension, diabetes or ASA ≥ 3
-(AUC 0.50–0.56, against 0.68–0.76 for age alone). So it is an age regressor, not yet an aging clock.
-Details are in the report. Next: baselines on the same splits (age and sex, pulse-shape features,
-AI-PPG Age), more VitalDB people, and wrist data.
+Status: run 2 (5,887 VitalDB people, one A100) reached a held-out MAE of 6.8 y (r 0.82, 897 test people)
+with the pretrained encoder, against 7.75 y from scratch and 11.7 y for predicting the median age; run 1
+(2,000 people) reached 7.3 y. It does not transfer to BIDMC (no better than the median age), and its
+bias-corrected age gap still does not separate hypertension, diabetes or ASA ≥ 3 (AUC 0.49–0.55, every
+95% interval containing 0.5, against 0.62–0.73 for age alone). So it is an age regressor, not yet an
+aging clock. Trait heads read from the same encoder rank ASA ≥ 3 (AUC 0.73) and sex (0.75) better than
+age does. The prepared windows are public as
+[`GlucoseDao/ppg-windows`](https://huggingface.co/datasets/GlucoseDao/ppg-windows) (`kron-ppg hub-export`).
+Details are in the report. Next: trait heads with intervals and per-window vitals, foundation-model
+baselines on the same split, and wrist data.
 
 ## Data and the cluster
 
