@@ -420,6 +420,8 @@ def export(run_dir: Path, out: Path | None = None, chunk: int = 25, window_s: fl
     from kron_ppg.train import load_encoder
 
     head = torch.load(run_dir / "head.pt", map_location="cpu", weights_only=True)
+    metrics = json.loads((run_dir / "metrics.json").read_text()) if (run_dir / "metrics.json").is_file() else {}
+    cutoff = metrics.get("lowpass_hz") or 8.0  # the head's band: the app must filter the same way
     encoder = load_encoder(head["encoder"], "cpu")
     clock = PPGAgeClock(encoder, LinearAgeHead(head["weight"], head["bias"])).eval()
     out = out or run_dir / "onnx"
@@ -432,16 +434,28 @@ def export(run_dir: Path, out: Path | None = None, chunk: int = 25, window_s: fl
     session = ort.InferenceSession(str(out / "stream.onnx"), opts, providers=["CPUExecutionProvider"])
 
     samples = synthetic_streams(1, seconds, c.sample_rate, seed=11)
-    state = [s.numpy() for s in empty_state(clock, 1)]
-    took = []
-    for k, (piece, ok) in enumerate(_chunks(samples, chunk * c.patch, c.patch)):
-        if k and k % per_window == 0:  # a new window: cold memory, the pool kept
-            state = state[:2] + [np.zeros_like(s) for s in state[2:]]
-        t0 = time.perf_counter()
-        age, *state = session.run(None, {"samples": piece.numpy(), "valid": ok.numpy(), **dict(zip(names, state))})
-        took.append(time.perf_counter() - t0)
     length = int(window_s * c.sample_rate)
     windows = samples[0, : (samples.shape[1] // length) * length].reshape(-1, length).numpy()
+    if cutoff < 8.0:  # the parity check reads what the app feeds: windows filtered to the head's band
+        windows = lowpass(windows, c.sample_rate, cutoff)
+        samples = torch.from_numpy(windows.reshape(1, -1).copy())
+    def app_run(sess):
+        """The app's loop over the stream: the final age and each chunk's time."""
+        state = [s.numpy() for s in empty_state(clock, 1)]
+        took, age = [], None
+        for k, (piece, ok) in enumerate(_chunks(samples, chunk * c.patch, c.patch)):
+            if k and k % per_window == 0:  # a new window: cold memory, the pool kept
+                state = state[:2] + [np.zeros_like(s) for s in state[2:]]
+            t0 = time.perf_counter()
+            age, *state = sess.run(None, {"samples": piece.numpy(), "valid": ok.numpy(), **dict(zip(names, state))})
+            took.append(time.perf_counter() - t0)
+        return float(np.asarray(age).ravel()[0]), took
+
+    age, took = app_run(session)
+    from onnxruntime.quantization import QuantType, quantize_dynamic
+
+    quantize_dynamic(str(out / "stream.onnx"), str(out / "stream.int8.onnx"), weight_type=QuantType.QInt8)
+    age8, took8 = app_run(ort.InferenceSession(str(out / "stream.int8.onnx"), opts, providers=["CPUExecutionProvider"]))
 
     class _Pool:
         sample_rate = c.sample_rate
@@ -454,12 +468,14 @@ def export(run_dir: Path, out: Path | None = None, chunk: int = 25, window_s: fl
     encoder.cpu()
     reference = float(reference + head["bias"])
     record["app"] = {
-        "recipe": f"band-pass 0.5-8 Hz, resample to {c.sample_rate:g} Hz, cut {window_s:g} s windows, robust-scale "
+        "recipe": f"band-pass 0.5-{cutoff:g} Hz, resample to {c.sample_rate:g} Hz, cut {window_s:g} s windows, robust-scale "
                   "each (median, IQR/1.349), drop windows the quality gate refuses (periodicity < 0.35 or any "
                   f"|x| > 20); feed each window as {per_window} chunks of {chunk * c.patch} samples; zero every "
                   "recurrent_state/conv_state at each window's start, keep pool_sum/pool_count across windows; "
                   "the age after the last chunk is the person's estimate",
-        "parity_vs_window_embedding_years": abs(float(np.asarray(age).ravel()[0]) - reference),
+        "parity_vs_window_embedding_years": abs(age - reference),
+        "int8": {"graph": "stream.int8.onnx", "bytes": (out / "stream.int8.onnx").stat().st_size,
+                 "age_vs_fp32_years": abs(age8 - age), "chunk_ms_median": 1000 * float(np.median(took8[1:]))},
         "parameters": int(sum(p.numel() for p in encoder.parameters())),
         "chunk_ms_median": 1000 * float(np.median(took[1:])), "threads": threads,
         "cpu_seconds_per_hour_of_signal": float(np.median(took[1:])) * 3600 / (chunk * c.patch_seconds),
