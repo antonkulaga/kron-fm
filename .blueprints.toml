@@ -1,0 +1,33 @@
+# kron-fm's seats (the seats kit, agent-seat-blueprints). Committed: it declares the seats and holds no key.
+# The messenger accounts stay on each machine, in its pool. Declared by the desk's secretary on the owner's word
+# (Anton, 2026-11-10: "allocate a seat for kron-fm ... a proper samsung-watch friendly age predictor").
+[repo]
+# Also the name of the repository's channel in the Zulip organisation, and the id the desk registers it under.
+id = "kron-fm"
+
+# The PPG trainer (docs/seats/PPG_TRAINER.md): trains kron-ppg toward a Samsung-watch age predictor.
+[seat.ppg-trainer]
+roles = "trainer"
+role = "trainer"
+# The organisation's rigger says a share or a cluster fact changed; the desk's secretary relays the maintainers'
+# answers (a wake, never an instruction).
+wake_from = "desk-antonkulaga/rigger */secretary"
+# A quiet seat: it works whether the maintainer is there or not, its questions on the desk.
+presence = false
+
+[seat.ppg-trainer.zulip]
+pool = "~/.config/agent-seat-blueprints/zulip/pool"
+
+# The desk's answers to this seat's questions, each said once.
+[seat.ppg-trainer.watch.desk]
+cmd = "sh kit:bin/py.sh kit:classes/desk/watch-answers.py kron-fm ppg-trainer"
+
+# The cluster's queue at every start: this repository's jobs by job_prefix. slurm/submit.sh names every job
+# kron-<name>; the PPG trainer's own are kron-ppg-<name>. The partition and the account are the cluster machine's.
+[slurm]
+job_prefix = "kron-"
+
+# bash, not sh: the script needs bash 4.4 and refuses under a POSIX sh.
+[digest.jobs]
+cmd = "bash kit:drivers/slurm/digest-jobs.sh"
+pinned = true

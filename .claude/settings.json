@@ -1,0 +1,14 @@
+{
+  "enabledPlugins": {
+    "seats@agent-seat-blueprints": true
+  },
+  "extraKnownMarketplaces": {
+    "agent-seat-blueprints": {
+      "source": {
+        "source": "github",
+        "repo": "winternewt/agent-seat-blueprints",
+        "ref": "v0.1.169"
+      }
+    }
+  }
+}
