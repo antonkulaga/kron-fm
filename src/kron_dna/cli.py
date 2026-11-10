@@ -430,6 +430,62 @@ def probe(task: Path = typer.Argument(..., help="a CodonBERT-style CSV (Sequence
     typer.echo(f"wrote {out}")
 
 
+@app.command()
+def clinvar(vcf: Path = typer.Option(None, help="ClinVar GRCh38 VCF (default: data/input/variants/clinvar/clinvar.vcf.gz)"),
+            cds: str = typer.Option("human-grch38", help="a CDS source name or NCBI cds_from_genomic FASTA path"),
+            runs: list[Path] = typer.Option([], "--run", help="kron-dna run directories (or checkpoints) to score"),
+            window: int = typer.Option(256, help="tokens of context around the masked codon"),
+            holdout_genes: float = typer.Option(0.05, help="the gene fraction `prepare --holdout-genes` set aside"),
+            batch_size: int = 32, device: str = "cuda", seed: int = 0,
+            out: Path | None = typer.Option(None, help="results JSON (default: data/output/eval/clinvar/zero_shot.json)"),
+            ) -> None:
+    """Zero-shot ClinVar: reviewed pathogenic vs benign coding SNVs, AUROC by consequence and gene split.
+
+    Needs the ``genomics`` group (polars-bio): ``uv run --group genomics kron-dna clinvar --run RUN``. The
+    mapped table is cached as ``data/interim/cds/clinvar/variants.parquet``.
+    """
+    import polars as pl
+
+    from kron_core.paths import output_dir
+    from kron_dna import probe as P
+    from kron_dna import variants as V
+    from kron_dna.onnx_export import load_run
+
+    vcf = vcf or input_dir("variants", "clinvar") / "clinvar.vcf.gz"
+    fasta = sequence_files(SOURCES[cds].folder(input_dir()))[0] if cds in SOURCES else Path(cds)
+    t0 = time.time()
+    transcripts = V.read_transcripts(fasta)
+    typer.echo(f"{len(transcripts):,} genes with a usable CDS ({time.time() - t0:.0f} s)")
+    cache = interim_dir("cds", "clinvar") / "variants.parquet"
+    if cache.exists():
+        table = pl.read_parquet(cache)
+    else:
+        variants = V.read_clinvar(vcf)
+        typer.echo(f"{variants.height:,} reviewed P/LP or B/LB SNVs ({time.time() - t0:.0f} s)")
+        table, dropped = V.map_variants(variants, transcripts, holdout_genes, seed)
+        typer.echo(f"{table.height:,} placed on a codon; dropped {dict(dropped)}")
+        cache.parent.mkdir(parents=True, exist_ok=True)
+        table.write_parquet(cache)
+    table = table.filter(pl.col("consequence").is_in(["synonymous", "missense"]))
+    seqs = [t["seq"] for t in transcripts.values()]
+    scores = V.baseline_scores(table, V.codon_frequencies(seqs), P.relative_adaptiveness(seqs))
+    dev = torch.device(device)
+    for run in runs:
+        model, record = load_run(run)
+        t1 = time.time()
+        scores[f"model:{(run if run.is_dir() else run.parent).name}@{record.get('step')}"] = V.masked_marginals(
+            model, table, transcripts, dev, window=window, batch_size=batch_size)
+        typer.echo(f"scored {run} ({time.time() - t1:.0f} s)")
+    summary = V.summarize(table, scores)
+    for row in summary:
+        typer.echo(json.dumps(row))
+    out = out or output_dir("eval", "clinvar") / "zero_shot.json"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps({"vcf": str(vcf), "cds": str(fasta), "window": window, "score": "log p(alt) - log p(ref)",
+                               "metric": "AUROC of -score, pathogenic positive", "results": summary}, indent=2) + "\n")
+    typer.echo(f"wrote {out}")
+
+
 @app.command("export-onnx")
 def export_onnx_cmd(run: Path = typer.Argument(..., help="a `kron-dna train` run directory or checkpoint"),
                     out: Path | None = typer.Option(None, help="output directory (default: <run>/onnx)"),
