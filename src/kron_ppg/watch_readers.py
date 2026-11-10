@@ -83,8 +83,37 @@ def read_wf_ppg(folder: Path) -> SourceData:
     return SourceData(subjects, gen())
 
 
-READERS = {"wf_ppg": read_wf_ppg}
-PARSERS: dict[str, Callable[[Path], np.ndarray]] = {}
+# ---- Multisite-PPG -----------------------------------------------------------------------------
+MULTISITE_FS = 100.0
+
+
+def multisite_watch(path: Path) -> np.ndarray:
+    """A ``P*_Watch_raw.npz`` (read without pickles) as inverted green PPG on a 100 Hz grid from its millisecond
+    timestamps; the hours between sessions are NaN. The raw value falls as blood volume rises, at every site."""
+    with np.load(path, allow_pickle=False) as z:
+        return uniform(z["timestamp"] / 1000.0, -z["ppg_green"].astype(np.float64), MULTISITE_FS)
+
+
+def read_multisite_ppg(folder: Path) -> SourceData:
+    """The watch (wrist) green channel of each participant, one recording per participant. The ring, earring and
+    necklace (``P*_<Site>_raw.npz``, same layout) and the Polar H10 ECG are left for the bridge."""
+    raw = folder / "raw_data"
+    subjects = [{"subject": r["Participant Index"], "age": r.get("Age", ""), "sex": r.get("Gender", ""),
+                 "ethnicity": r.get("Race/Ethnicity", ""), "fitzpatrick": r.get("Fitzpatrick Skin Index", "")}
+                for r in _table(raw / "participants_demographics.csv")]
+    files = {s["subject"]: raw / s["subject"] / f"{s['subject']}_Watch_raw.npz" for s in subjects}
+
+    def gen() -> Iterator[Recording]:
+        for s in subjects:
+            path = files[s["subject"]]
+            if path.is_file():
+                yield Recording(s["subject"], f"{s['subject']}/watch", MULTISITE_FS, path=path, parser="multisite_watch")
+
+    return SourceData(subjects, gen())
+
+
+READERS = {"wf_ppg": read_wf_ppg, "multisite_ppg": read_multisite_ppg}
+PARSERS: dict[str, Callable[[Path], np.ndarray]] = {"multisite_watch": multisite_watch}
 # Registered into kron_ppg.readers whichever of the two modules is imported first.
 _readers.READERS.update(READERS)
 _readers.PARSERS.update(PARSERS)

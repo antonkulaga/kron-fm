@@ -76,3 +76,28 @@ def test_wrist_readers_register_whichever_module_is_imported_first(first):
 
     code = f"import {first}; from kron_ppg.readers import READERS; assert 'wf_ppg' in READERS and 'bidmc' in READERS"
     subprocess.run([sys.executable, "-c", code], check=True)
+
+
+def fake_multisite(folder):
+    raw = folder / "raw_data"
+    (raw / "P1").mkdir(parents=True)
+    (raw / "participants_demographics.csv").write_text(
+        "Participant Index,Age,Gender,Race/Ethnicity,Fitzpatrick Skin Index\nP1,51,Female,White / Caucasian,1\n"
+        "P2,25,Male,Asian / Pacific Islander,3\n")
+    t0 = 1.7716e12
+    t = np.concatenate([t0 + np.arange(6000) * 10.0, t0 + 3_600_000 + np.arange(6000) * 10.0])
+    green = 2e4 - 300 * np.concatenate([synthetic_ppg(60, 100.0, seed=1), synthetic_ppg(60, 100.0, seed=2)])
+    np.savez(raw / "P1" / "P1_Watch_raw.npz", timestamp=t, ppg_green=green, ppg_ir=green * 10,
+             datetime_str=np.array(["2026-02-21 15:37:16"] * len(t)))
+
+
+def test_multisite_reads_the_watch_green_inverted_without_pickles_and_keeps_the_gap(tmp_path):
+    fake_multisite(tmp_path / "multisite_ppg")
+    data = READERS["multisite_ppg"](tmp_path / "multisite_ppg")
+    assert [(s["subject"], s["age"]) for s in data.subjects] == [("P1", "51"), ("P2", "25")]
+    recs = list(data.recordings)  # P2 has no watch file
+    assert [r.recording for r in recs] == ["P1/watch"]
+    x = recs[0].load()
+    assert recs[0].fs == 100.0 and len(x) == 366_000
+    assert np.isfinite(x[:6000]).all() and np.isnan(x[6001:360_000]).all()
+    assert np.nanmean(x) == pytest.approx(-2e4, rel=0.01)
