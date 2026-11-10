@@ -117,7 +117,9 @@ VITAL_DOCS: dict[str, tuple[str, str]] = {
     "rr_ms": ("float64", "median R-R interval, ms"),
     "sdnn_ms": ("float64", "SDNN over the window's R-R intervals, ms"),
     "rmssd_ms": ("float64", "RMSSD over the window's R-R intervals, ms"),
-    "pat_ms": ("float64", "pulse arrival time: R peak to the steepest PPG upstroke after it, ms (median)"),
+    "pat_ms": ("float64", "pulse arrival time: R peak to the steepest PLETH upstroke before the next beat, ms "
+                          "(median). VitalDB's PLETH lags its ECG by a device delay, so values run 0.6-0.8 s: "
+                          "compare within a person and monitor, not with published PATs"),
     "beats": ("float64", "clean beats the ECG features rest on"),
 }
 #: the rate whose variant ``kron-ppg vitals`` writes vitals for
