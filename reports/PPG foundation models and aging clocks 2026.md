@@ -243,6 +243,13 @@ published as the dataset [`GlucoseDao/ppg-windows`](https://huggingface.co/datas
   is not, so far, about these outcomes. By this project's standard run 2 is still **an age regressor,
   not an aging clock**.
 
+**Seeds.** Each clock was trained again with other seeds (the head's initialisation and the order of
+the batches; the encoder, the split and the test people stay the same). Test MAE: scratch 7.75 / 7.84 /
+7.69 (mean 7.76, SD 0.08), probe 6.82 / 6.76 / 6.83 (6.80, SD 0.04), finetune 6.77 / 6.78. The
+pretraining gain of about 1 y is some fifteen times the spread between seeds, and the gap's outcome
+AUCs stay between 0.49 and 0.56 in every seed. Seeds show the results are not a training accident; they
+do not shrink the sampling uncertainty of 897 test people, which the bootstrap intervals carry.
+
 **Traits from PPG directly (run 2a).** The gap is not the only way to ask whether PPG carries health
 information. Run 2a trained one multi-task head (`kron-ppg traits`) on run 1's encoder for age, BMI,
 hypertension, diabetes, ASA ≥ 3 and sex, on the 3,986 people downloaded by then (2,735 train, 637
@@ -285,7 +292,10 @@ the test people.
   age gains about 0.11–0.12 AUC with an interval clear of zero. For `healthy` the gain is small (0.03) but
   also clear of zero. For hypertension and diabetes PPG alone is nearly as good as age, but it carries
   nothing age does not: the gain is 0.01 or less, with intervals across zero. That is the first outcome
-  evidence kron-ppg has, and it comes from a trait head, not from the age gap.
+  evidence kron-ppg has, and it comes from a trait head, not from the age gap. Two more seeds of the
+  frozen head give the same: ASA ≥ 3 +0.120 (0.040–0.201) and +0.122 (0.041–0.202), `healthy` +0.029 and
+  +0.031 (lower bounds 0.008), hypertension +0.009 to +0.010, diabetes −0.011 to −0.013; within-person r
+  for pressure 0.61–0.65.
 - **Body and blood.** Height (MAE 6.4 cm against 7.3 for the median, r 0.50), weight (8.0 kg against 9.3,
   r 0.55), BMI (r 0.39), haemoglobin (r 0.41) and albumin (r 0.41) are read weakly; glucose (r 0.28) and
   creatinine (r 0.16–0.19, MAE no better than the median) are not.
@@ -330,8 +340,9 @@ is 7.2 ms and the ECG rate agrees with the monitor's to a median 0.6 bpm. The fi
 are void.
 
 Run folders: `data/output/runs/kron-ppg/r2-{pretrain,clock-scratch,clock-finetune,clock-probe}`,
-`r2a-traits-{probe,finetune}`, `r2b-traits-{probe,finetune}` and
-`r2-clock-healthy-probe`. Each clock holds `metrics.json`, `predictions.parquet` and `bidmc.json`.
+`r2a-traits-{probe,finetune}`, `r2b-traits-{probe,finetune}`,
+`r2-clock-healthy-probe`, and the seed repeats `r2-clock-{scratch,probe}-s{1,2}`, `r2-clock-finetune-s1`,
+`r2b-traits-probe-s{1,2}`. Each clock holds `metrics.json`, `predictions.parquet` and `bidmc.json`.
 
 **The dataset.** `GlucoseDao/ppg-windows` holds the prepared windows of VitalDB (25 and 125 Hz), BIDMC
 (25 and 125 Hz) and GalaxyPPG (25 Hz), with the training split as the Hub's train/validation/test and a
