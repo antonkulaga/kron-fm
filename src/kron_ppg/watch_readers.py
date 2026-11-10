@@ -14,6 +14,7 @@ from pathlib import Path
 import numpy as np
 import polars as pl
 
+from kron_ppg import readers as _readers
 from kron_ppg.readers import Recording, SourceData, _table, _values
 
 #: A gap between two samples longer than this stays a gap (NaN) when a signal is put on a uniform grid.
@@ -84,3 +85,6 @@ def read_wf_ppg(folder: Path) -> SourceData:
 
 READERS = {"wf_ppg": read_wf_ppg}
 PARSERS: dict[str, Callable[[Path], np.ndarray]] = {}
+# Registered into kron_ppg.readers whichever of the two modules is imported first.
+_readers.READERS.update(READERS)
+_readers.PARSERS.update(PARSERS)

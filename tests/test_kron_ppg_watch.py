@@ -67,3 +67,12 @@ def test_wf_ppg_prepares_windows_for_every_subject(tmp_path):
     fake_wf_ppg(tmp_path / "wf_ppg")
     info = prepare_source("wf_ppg", folder=tmp_path / "wf_ppg", out=tmp_path / "out", seconds=10.0, workers=1)
     assert info["subjects_with_windows"] == 2 and info["windows"] >= 8
+
+
+@pytest.mark.parametrize("first", ["kron_ppg.watch_readers", "kron_ppg.readers"])
+def test_wrist_readers_register_whichever_module_is_imported_first(first):
+    import subprocess
+    import sys
+
+    code = f"import {first}; from kron_ppg.readers import READERS; assert 'wf_ppg' in READERS and 'bidmc' in READERS"
+    subprocess.run([sys.executable, "-c", code], check=True)
