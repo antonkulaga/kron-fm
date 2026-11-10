@@ -180,8 +180,9 @@ def export_variant(source: str, rate: float, out: Path, seconds: float = 30.0, s
         part = windows.filter(pl.col("split") == name).drop("split").collect()
         counts[name] = {"windows": len(part), "subjects": part["subject"].n_unique()}
         if vital_columns:
+            measured = [c for c in vital_columns if c not in ("bp_source", "beats")]  # beats is 0, not null
             counts[name]["with_vitals"] = int(part.select(
-                pl.any_horizontal(pl.col(c).is_not_null() for c in vital_columns if c != "bp_source")).sum().item())
+                pl.any_horizontal(pl.col(c).is_not_null() for c in measured)).sum().item())
         n_shards = max(1, math.ceil(len(part) / shard_rows))
         for k in range(n_shards):
             part.slice(k * shard_rows, shard_rows).write_parquet(
