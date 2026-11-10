@@ -23,14 +23,12 @@ MAX_GAP_S = 0.5
 
 def uniform(t: np.ndarray, x: np.ndarray, fs: float) -> np.ndarray:
     """Samples ``x`` taken at times ``t`` (seconds, possibly jittered or unordered), linearly interpolated onto a
-    grid at ``fs`` from the first time; grid points inside a gap longer than :data:`MAX_GAP_S`, or next to a
-    NaN sample, are NaN."""
+    grid at ``fs`` from the first time; samples sharing a time (a batch stamped once) are averaged. Grid points
+    inside a gap longer than :data:`MAX_GAP_S`, or next to a NaN sample, are NaN."""
     keep = np.isfinite(t)
-    t, x = t[keep], x[keep]
-    order = np.argsort(t, kind="stable")
-    t, x = t[order], x[order]
-    t, first = np.unique(t, return_index=True)
-    x = x[first]
+    t, x = t[keep], np.asarray(x, np.float64)[keep]
+    t, inverse, counts = np.unique(t, return_inverse=True, return_counts=True)
+    x = np.bincount(inverse, weights=x, minlength=len(t)) / counts
     if len(t) < 2:
         return np.full(len(t), np.nan)
     grid = t[0] + np.arange(int(np.floor((t[-1] - t[0]) * fs)) + 1) / fs
@@ -112,8 +110,94 @@ def read_multisite_ppg(folder: Path) -> SourceData:
     return SourceData(subjects, gen())
 
 
-READERS = {"wf_ppg": read_wf_ppg, "multisite_ppg": read_multisite_ppg}
-PARSERS: dict[str, Callable[[Path], np.ndarray]] = {"multisite_watch": multisite_watch}
+# ---- Galaxy Watch Active 2 (Baigutanova et al. 2025) ---------------------------------------------
+#: The watch's green PPG comes every 100 ms (often two samples under one batch time stamp).
+GALAXY_ACTIVE2_FS = 10.0
+GALAXY_ACTIVE2_MEMBER = "raw_data/ppg.csv.gz"
+DAY_MS = 86_400_000
+
+
+def unpack_galaxy_active2(folder: Path, block: int = 1 << 26) -> dict:
+    """Split the 4.7 GB ``raw_data/ppg.csv.gz`` inside ``raw_data.zip`` into
+    ``unpacked/ppg/<deviceId>/<UTC day>/part-<n>.parquet`` (``ts`` in ms, ``ppg``), streaming: the zip member is
+    gunzipped block by block and each block parsed as CSV text. Returns rows and files written."""
+    import gzip
+
+    out = folder / "unpacked" / "ppg"
+    out.mkdir(parents=True, exist_ok=True)
+    schema = {"deviceId": pl.String, "ts": pl.Int64, "ppg": pl.Float64}
+    rows = files = 0
+    with zipfile.ZipFile(folder / "raw_data.zip") as z, z.open(GALAXY_ACTIVE2_MEMBER) as member, \
+            gzip.open(member) as text:
+        header = text.readline().strip().decode()
+        if header.split(",") != list(schema):
+            raise ValueError(f"unexpected header {header!r} in {GALAXY_ACTIVE2_MEMBER}")
+        leftover, part = b"", 0
+        while True:
+            chunk = text.read(block)
+            data = leftover + chunk
+            if not chunk:
+                leftover = b""
+            else:
+                cut = data.rfind(b"\n") + 1
+                data, leftover = data[:cut], data[cut:]
+            if data.strip():
+                df = pl.read_csv(data, has_header=False, new_columns=list(schema), schema=schema)
+                df = df.with_columns((pl.col("ts") // DAY_MS).alias("day"))
+                for (device, day), g in df.group_by(["deviceId", "day"]):
+                    stamp = np.datetime64(int(day), "D").astype(str)
+                    dest = out / str(device) / stamp / f"part-{part:05d}.parquet"
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                    g.select("ts", "ppg").write_parquet(dest)
+                    files += 1
+                rows += len(df)
+                part += 1
+            if not chunk:
+                break
+    return {"rows": rows, "files": files, "out": str(out)}
+
+
+def galaxy_active2_day(path: Path) -> np.ndarray:
+    """One device-day folder of the unpacked set as green PPG on a 10 Hz grid (raw value inverted)."""
+    df = pl.concat([pl.read_parquet(p) for p in sorted(path.glob("part-*.parquet"))])
+    return uniform(df["ts"].to_numpy() / 1000.0, -df["ppg"].to_numpy(), GALAXY_ACTIVE2_FS)
+
+
+def read_galaxy_active2(folder: Path) -> SourceData:
+    """One recording per device and UTC day (``<deviceId>/<YYYY-MM-DD>``), so the per-recording window cap
+    spreads over the four weeks. Needs ``unpack_galaxy_active2`` first. Subjects come from ``survey.csv``
+    (age, sex coded 1/2, height, weight and the sleep, mood and chronotype scores)."""
+    root = folder / "unpacked" / "ppg"
+    if not root.is_dir():
+        raise FileNotFoundError(f"{root} is missing: run `python -m kron_ppg.watch_readers unpack {folder}`")
+    keep = ("age", "sex", "height", "weight", "smartwatch", "exercise", "coffee", "smoking", "drinking",
+            "ISI_1", "PHQ9_1", "GAD7_1", "MEQ")
+    subjects = [{"subject": r["deviceId"], **{k: r.get(k, "") for k in keep}} for r in _table(folder / "survey.csv")]
+    days = sorted((d.parent.name, d.name, d) for d in root.glob("*/*") if d.is_dir())
+
+    def gen() -> Iterator[Recording]:
+        for device, day, path in days:
+            yield Recording(device, f"{device}/{day}", GALAXY_ACTIVE2_FS, path=path, parser="galaxy_active2_day")
+
+    return SourceData(subjects, gen())
+
+
+UNPACKERS = {"galaxy_active2": unpack_galaxy_active2}
+READERS = {"wf_ppg": read_wf_ppg, "multisite_ppg": read_multisite_ppg, "galaxy_active2": read_galaxy_active2}
+PARSERS: dict[str, Callable[[Path], np.ndarray]] = {"multisite_watch": multisite_watch,
+                                                    "galaxy_active2_day": galaxy_active2_day}
 # Registered into kron_ppg.readers whichever of the two modules is imported first.
 _readers.READERS.update(READERS)
 _readers.PARSERS.update(PARSERS)
+
+
+if __name__ == "__main__":  # python -m kron_ppg.watch_readers unpack <source> [folder]
+    import json
+    import sys
+
+    from kron_core.paths import input_dir
+
+    if len(sys.argv) < 3 or sys.argv[1] != "unpack" or sys.argv[2] not in UNPACKERS:
+        sys.exit(f"usage: python -m kron_ppg.watch_readers unpack {{{','.join(UNPACKERS)}}} [folder]")
+    target = Path(sys.argv[3]) if len(sys.argv) > 3 else input_dir("ppg", sys.argv[2])
+    print(json.dumps(UNPACKERS[sys.argv[2]](target)))

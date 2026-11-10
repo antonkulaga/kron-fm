@@ -101,3 +101,41 @@ def test_multisite_reads_the_watch_green_inverted_without_pickles_and_keeps_the_
     assert recs[0].fs == 100.0 and len(x) == 366_000
     assert np.isfinite(x[:6000]).all() and np.isnan(x[6001:360_000]).all()
     assert np.nanmean(x) == pytest.approx(-2e4, rel=0.01)
+
+
+def fake_galaxy_active2(folder):
+    """raw_data.zip holding raw_data/ppg.csv.gz (deviceId, ts in ms, ppg) at 10 Hz with a doubled batch stamp,
+    two devices, one crossing a UTC midnight, and survey.csv."""
+    import gzip
+
+    folder.mkdir(parents=True)
+    (folder / "survey.csv").write_text("deviceId,sex,age,height,weight,ISI_1,PHQ9_1,GAD7_1,MEQ\n"
+                                       "ab12,1,36,178.0,76.0,8,1,1,46\ncd34,2,31,159.0,50.0,11,3,1,28\n")
+    lines = ["deviceId,ts,ppg"]
+    for device, start in (("ab12", 86_400_000 * 20_000 - 60_000), ("cd34", 86_400_000 * 20_001 + 3_600_000)):
+        x = 2.6e6 - 2e4 * synthetic_ppg(120, 10.0, seed=len(lines))
+        ts = start + np.arange(len(x)) * 100
+        ts[5] = ts[4]  # two samples under one batch stamp
+        lines += [f"{device},{t},{int(v)}" for t, v in zip(ts, x, strict=True)]
+    with zipfile.ZipFile(folder / "raw_data.zip", "w") as z:
+        z.writestr("raw_data/ppg.csv.gz", gzip.compress(("\n".join(lines) + "\n").encode()))
+        z.writestr("__MACOSX/raw_data/._ppg.csv.gz", "junk")
+
+
+def test_galaxy_active2_unpacks_by_device_and_day_and_reads_inverted_10_hz(tmp_path):
+    from kron_ppg.watch_readers import unpack_galaxy_active2
+
+    folder = tmp_path / "galaxy_active2"
+    fake_galaxy_active2(folder)
+    with pytest.raises(FileNotFoundError):
+        READERS["galaxy_active2"](folder)
+    info = unpack_galaxy_active2(folder, block=5000)  # many blocks: lines cut across block edges
+    assert info["rows"] == 2400
+    data = READERS["galaxy_active2"](folder)
+    assert [(s["subject"], s["age"], s["sex"]) for s in data.subjects] == [("ab12", "36", "1"), ("cd34", "31", "2")]
+    recs = list(data.recordings)
+    assert [r.recording for r in recs] == ["ab12/2024-10-03", "ab12/2024-10-04", "cd34/2024-10-05"]
+    lengths = [len(r.load()) for r in recs]
+    assert lengths == [600, 600, 1200]  # the doubled stamp is averaged; the grid spans the times
+    x = recs[2].load()
+    assert recs[2].fs == 10.0 and np.isfinite(x).all() and x.mean() == pytest.approx(-2.6e6, rel=0.01)
