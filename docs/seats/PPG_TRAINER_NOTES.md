@@ -20,7 +20,9 @@ secretary on the maintainer's word).
 - Work so far: `kron-ppg wrist-age` (per-person age from a frozen encoder, ridge head, grouped CV, constant and
   source-median baselines, permutation null, leave-one-source-out, `--lowpass`, `transfer`), commits 1cbae51,
   8642cbc, 68eaf93, 735a86f, e8c0e63, ffc1cd4, 550e798 (wrist-age-export: ONNX with the linear head, timed).
-- No job running (wa1-wa7 done 2026-11-10 23:36). Deployable predictor and draft note: see `<status file>`.
+- Owns since 2026-11-11 00:35 the watch-data work (wrist datasets, stream trainer; its handout and status file sit
+  beside the brief). Jobs: 6428101 kron-s5-chain (eta 01:10), 6428195 kron-w1-pretrain (eta 03:50), plain waiters
+  armed. Then probe-full.sh and the w1/s5 transfer test. Deployable predictor and draft note: see `<status file>`.
 - A public research note on the wrist results waits on desk #7 (default nothing public); the watch plan on desk #8.
 - Aurora-BP: research only, never product development (its DUA, read 2026-11-10); a head fitted on it is never the
   deployed model. Open-data heads may be scored on Aurora alone.
@@ -31,4 +33,6 @@ secretary on the maintainer's word).
   estimate moves (the rigger, agent-chat 2026-11-11).
 
 ## Items to file
+- `unattended`, kit: `until-event.sh -- watch-job.sh` ends on the watcher's own "armed" line, so it never waits for
+  the job's end (2026-11-11, v0.1.170); a plain until-loop on squeue used instead.
 - `unattended`: fold `wrist_probe.py` (14ab76c, another session, AUC targets, paired encoder differences) and `wrist_age.py` into one module, keeping both CLIs; watch-data told 2026-11-11.
