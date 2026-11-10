@@ -111,7 +111,21 @@ def _results(recordings, workers: int, *args):
 
 def write_streams(source: str, sample_rate: float = 25.0, block_s: float = BLOCK_S, folder: Path | None = None,
                   out: Path | None = None, workers: int | None = None) -> dict:
-    """Write every recording of ``source`` as a stream; returns what ``info.json`` holds."""
+    """Write every recording of ``source`` as a stream; returns what ``info.json`` holds.
+
+    The wrist readers read whole recordings while it runs (:func:`whole_recordings`) and are set back after,
+    so a later ``prepare`` in the same process still cuts its pieces."""
+    from kron_ppg import watch_readers
+
+    saved = watch_readers.CHUNK_S, watch_readers.GALAXY_ACTIVE2_UNIT
+    try:
+        return _write_streams(source, sample_rate, block_s, folder, out, workers)
+    finally:
+        watch_readers.CHUNK_S, watch_readers.GALAXY_ACTIVE2_UNIT = saved
+
+
+def _write_streams(source: str, sample_rate: float, block_s: float, folder: Path | None, out: Path | None,
+                   workers: int | None) -> dict:
     whole_recordings()
     if source not in READERS:
         raise ValueError(f"no reader for {source!r}; one of {sorted(READERS)}")

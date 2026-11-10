@@ -310,10 +310,11 @@ def test_streams_keep_every_recording_whole_with_gaps_and_noise_marked_not_dropp
         return SourceData([{"subject": "a", "age": "61"}, {"subject": "b", "age": "35"}], iter(recs))
 
     monkeypatch.setitem(readers.READERS, "fake", fake)
-    monkeypatch.setattr(watch_readers, "CHUNK_S", watch_readers.CHUNK_S)  # restored after write_streams
+    before = watch_readers.CHUNK_S, watch_readers.GALAXY_ACTIVE2_UNIT
     (tmp_path / "in").mkdir()
     info = write_streams("fake", folder=tmp_path / "in", out=tmp_path / "out", workers=1)
-    assert info["streams"] == 3 and info["samples"] == 25 * (120 + 120 + 60) and watch_readers.CHUNK_S is None
+    assert info["streams"] == 3 and info["samples"] == 25 * (120 + 120 + 60)
+    assert (watch_readers.CHUNK_S, watch_readers.GALAXY_ACTIVE2_UNIT) == before  # set back for a later prepare
     s = Streams(tmp_path / "out")
     assert len(s) == 3 and list(s.table["recording"]) == ["a/0", "a/1", "b/0"]
     x, valid, blocks = s[1]
