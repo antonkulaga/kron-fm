@@ -28,6 +28,10 @@ and only sets that download without an account, a data-use agreement or a click-
 * ``utsa_ppg``: wrist green PPG and fingertip red and IR PPG on the same seconds (rate read from the files), with
   accelerometer and Holter ECG RR intervals, 12 people sitting, sleeping and at office work, 30 min or more each.
   The repository is MIT; it states no separate data licence.
+* ``ppg_sport``: wrist PPG, IMU and ECG at 64 Hz from both wrists of 30 people across six activities (stationary,
+  walking, running, badminton, table tennis, basketball), about 48 h, processed by the authors (IMWUT 2026);
+  ``.npy`` files and ``participants.xlsx`` from the GitHub repository. CC BY-NC-ND 4.0 per the publication's
+  repository record; the GitHub repository states no licence.
 * ``wesad``: Empatica E4 wrist BVP (64 Hz) and RespiBAN chest ECG in a stress study, 15 people, ages in each
   ``S*_readme.txt``; pickles again, never unpickled.
 """
@@ -64,6 +68,7 @@ PTT_PPG = "https://physionet.org/files/pulse-transit-time-ppg/1.1.0"
 WRIST_EXERCISE = "https://physionet.org/files/wrist/1.0.0"
 DALIA_URL = "https://archive.ics.uci.edu/static/public/495/ppg+dalia.zip"
 UTSA_URL = "https://drive.usercontent.google.com/download?id=1NP_mngn7YccQO09FdaqQ001wwTMmE0ks&export=download&confirm=t"
+PPG_SPORT_REPO = "LaserHu/PPG-Sport"
 WESAD_URL = "https://uni-siegen.sciebo.de/s/HGdUkoNlW1Ub0Gx/download"
 
 
@@ -127,6 +132,20 @@ def zenodo_files(record: int) -> list[tuple[str, str, int | None]]:
 
 def fetch_vilnius_af(source: Source, folder: Path, force: bool) -> dict:
     return fetch_tree(source, folder, force, zenodo_files(VILNIUS_AF_RECORD), {"zenodo_record": VILNIUS_AF_RECORD})
+
+
+def github_files(repo: str, prefixes: tuple[str, ...], branch: str = "main") -> list[tuple[str, str, int | None]]:
+    """The files of a GitHub repository under ``prefixes`` (or named exactly so), from its git tree."""
+    tree = json.loads(_get_text(f"https://api.github.com/repos/{repo}/git/trees/{branch}?recursive=1"))
+    if tree.get("truncated"):
+        raise RuntimeError(f"{repo}: the git tree listing is truncated")
+    return [(f"https://raw.githubusercontent.com/{repo}/{branch}/{t['path']}", t["path"], t.get("size"))
+            for t in tree["tree"] if t["type"] == "blob" and t["path"].startswith(prefixes)]
+
+
+def fetch_ppg_sport(source: Source, folder: Path, force: bool) -> dict:
+    return fetch_tree(source, folder, force, github_files(PPG_SPORT_REPO, ("dataset/", "participants.xlsx",
+                                                                           "readme.md", "cleaned_gt/")))
 
 
 def fetch_files(source: Source, folder: Path, force: bool) -> dict:
@@ -228,6 +247,16 @@ SOURCES: dict[str, Source] = {
                "https://github.com/utsanpb2-234/UTSA-PPG",
                {"format": "zip of csv", "sites": ["wrist", "finger"], "approx_mb": 496},
                fetch=fetch_files),
+        Source("ppg_sport", DOMAIN,
+               "PPG-Sport: both-wrist PPG, IMU and ECG at 64 Hz, 30 people, six sports and daily activities, ~48 h",
+               (), "CC BY-NC-ND 4.0 per the publication's repository record (non-commercial, no derivatives; "
+                   "research use); the GitHub repository states no licence",
+               "PPG-Sport: a dataset for reliable heart rate monitoring from wrist PPG under dynamic sports "
+               "conditions (2026). Proc. ACM IMWUT 10(2), doi 10.1145/3810216.",
+               f"https://github.com/{PPG_SPORT_REPO}",
+               {"format": "npy", "fs": 64, "sites": ["left wrist", "right wrist"],
+                "load": "numpy.load(path, allow_pickle=False)", "approx_mb": 400},
+               fetch=fetch_ppg_sport),
         Source("wesad", DOMAIN,
                "WESAD: Empatica E4 wrist BVP (64 Hz) and chest ECG in a stress study, 15 people, age per person; "
                "the archive's pickles are never unpickled",
