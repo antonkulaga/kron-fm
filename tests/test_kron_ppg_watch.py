@@ -274,3 +274,20 @@ def test_wildppg_reads_the_wrist_green_in_chunks(tmp_path, monkeypatch):
     recs = list(data.recordings)
     assert [r.recording for r in recs] == ["an0/0", "an0/1", "an0/2"] and recs[0].fs == 128.0
     assert np.allclose(np.concatenate([r.load() for r in recs]), x)
+
+
+def test_ppg_sport_reads_each_wrist_and_activity_inverted(tmp_path):
+    folder = tmp_path / "ppg_sport"
+    (folder / "dataset").mkdir(parents=True)
+    write_xlsx(folder / "participants.xlsx", [
+        ["Participants", "Gender", "Age", "HeighT (cm)", "Weight (kg)", "Badminton", "Table Tennis", "Basketball"],
+        ["S01", "M", "27", "175", "90", "3", "2", "2"]])
+    x = synthetic_ppg(60, 64.0)
+    for wrist in "LR":
+        np.save(folder / "dataset" / f"S01{wrist}_running_ppg.npy", -x[:, None])
+    np.save(folder / "dataset" / "S01_running_ecg.npy", x[:, None])
+    data = READERS["ppg_sport"](folder)
+    assert data.subjects[0]["age"] == "27" and data.subjects[0]["basketball"] == "2"
+    recs = list(data.recordings)
+    assert [r.recording for r in recs] == ["S01/L/running", "S01/R/running"] and recs[0].fs == 64.0
+    assert np.allclose(recs[0].load(), x)

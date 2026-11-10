@@ -393,13 +393,41 @@ def read_wildppg(folder: Path) -> SourceData:
     return SourceData(subjects, gen())
 
 
+# ---- PPG-Sport ---------------------------------------------------------------------------------------
+PPG_SPORT_FS = 64.0
+
+
+def ppg_sport_npy(path: Path) -> np.ndarray:
+    """One ``S<NN><L|R>_<activity>_ppg.npy`` (read without pickles), inverted: at rest it rises slowly and falls
+    fast, as the raw wrist channels of the other sets do."""
+    return -np.load(path, allow_pickle=False).astype(np.float64).ravel()
+
+
+def read_ppg_sport(folder: Path) -> SourceData:
+    """Each wrist's PPG per activity, ``<subject>/<L|R>/<activity>`` at 64 Hz; age, sex, height, weight and
+    the sports experience levels from ``participants.xlsx``."""
+    rows = xlsx_rows(folder / "participants.xlsx")
+    subjects = [{"subject": r[0], "sex": r[1], "age": r[2], "height": r[3], "weight": r[4],
+                 "badminton": r[5], "table_tennis": r[6], "basketball": r[7]}
+                for r in rows[1:] if len(r) >= 8 and r[0].startswith("S")]
+    pattern = re.compile(r"^(S\d+)([LR])_([a-z]+)_ppg\.npy$")
+    found = sorted((m[1], m[2], m[3], p) for p in (folder / "dataset").glob("*_ppg.npy") if (m := pattern.match(p.name)))
+
+    def gen() -> Iterator[Recording]:
+        for subject, wrist, activity, path in found:
+            yield Recording(subject, f"{subject}/{wrist}/{activity}", PPG_SPORT_FS, path=path, parser="ppg_sport_npy")
+
+    return SourceData(subjects, gen())
+
+
 UNPACKERS = {"galaxy_active2": unpack_galaxy_active2}
 READERS = {"wf_ppg": read_wf_ppg, "multisite_ppg": read_multisite_ppg, "galaxy_active2": read_galaxy_active2,
            "vilnius_af": read_vilnius_af, "utsa_ppg": read_utsa_ppg,
            "ppg_dalia": read_ppg_dalia, "wesad": read_wesad,
-           "wildppg": read_wildppg}
+           "wildppg": read_wildppg, "ppg_sport": read_ppg_sport}
 PARSERS: dict[str, Callable[[Path], np.ndarray]] = {"multisite_watch": multisite_watch,
-                                                    "galaxy_active2_day": galaxy_active2_day}
+                                                    "galaxy_active2_day": galaxy_active2_day,
+                                                    "ppg_sport_npy": ppg_sport_npy}
 # Registered into kron_ppg.readers whichever of the two modules is imported first.
 _readers.READERS.update(READERS)
 _readers.PARSERS.update(PARSERS)
