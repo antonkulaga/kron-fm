@@ -169,7 +169,8 @@ same 68.6M model and batch, up to 300k steps. The step-25k snapshot, by `evaluat
 
 After 25k steps the corpus model already beats the human-only model on yeast and on SynCodonLM. It ties the human-only model on human
 genes, the human-only model's own domain. Human is ~0.1% of SynCodonLM, and its genes there are not split by
-the human hold-out, so the "held-out human genes" row is not held out for this model.
+the human hold-out, so the "held-out human genes" row is not held out for this model. On the mRFP probe the step-25k snapshot
+reaches test rho 0.695 (val 0.661), against 0.716 for the human `mlm` model.
 
 **Not built yet:**
 - clustering of a genome's paralogs (`prepare --holdout-genes`
