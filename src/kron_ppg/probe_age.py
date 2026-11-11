@@ -135,15 +135,18 @@ def read_sdk(run: Path, alias: str) -> ProbeRun | None:
     x = np.interp(grid, t[ok], g[ok])
     if alias == "sdk_ecg":
         # the ECG recording's green may repeat each optical sample over several ECG rows: keep its own rate
-        changes = np.flatnonzero(np.diff(g[ok]) != 0)
-        if len(changes) > 10:
-            step = float(np.median(np.diff(t[ok][changes])))
-            if step > 1.5 * dt:
-                fs = float(round(1.0 / step))
-                grid = np.arange(0.0, t[-1], 1 / fs)
-                x = np.interp(grid, t[ok], g[ok])
-                idx = np.clip(np.searchsorted(t, grid), 1, len(t) - 1)
-                valid = ok[idx]
+        # The green value is held over several ECG rows: its own rate is the count of its changes over the span
+        # (stamps come in bursts, so the median gap between changes is not a rate). Sample it at its changes.
+        tg, gg = t[ok], g[ok]
+        changes = np.flatnonzero(np.diff(gg) != 0) + 1
+        span = tg[-1] - tg[0]
+        if len(changes) > 10 and span > 0:
+            own = len(changes) / span
+            if own < 0.75 * fs:
+                fs = float(round(own))
+                grid = np.arange(tg[changes[0]], tg[-1], 1 / fs)
+                x = np.interp(grid, tg[changes], gg[changes])
+                valid = np.ones(len(grid), bool)
         sign = upright_sign(np.where(valid, x, np.nan), fs)
     else:
         sign = -1.0  # raw green light drops at systole, as the probe's own analysis reads it
