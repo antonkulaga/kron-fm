@@ -12,8 +12,8 @@ cache = Path("data/interim/health/nhanes_pam_2005/steps.parquet"); cache.parent.
 f = pl.read_parquet(cache) if cache.is_file() else nhanes_2005(Path("data/input/health/nhanes_pam_2005"))
 f.write_parquet(cache)
 print("people", f.height, "age", f["age"].min(), "-", f["age"].max(), "median", f["age"].median(), flush=True)
-l5 = (np.degrees(np.arctan2(f["l5_sin"], f["l5_cos"])) % 360) / 15
-print(f"gate: L5 at night (22-07) {(((l5 >= 22) | (l5 < 7)).mean()*100):.1f} %; daily steps median {np.expm1(f['log_daily_steps']).median():.0f}")
+shares = f.select([c for c in FEATURES if c.startswith("share_h")]).to_numpy()
+print(f"gate: share of window steps 12-17 h {shares[:, 4:10].sum(1).mean()*100:.1f} %; daily window steps median {np.expm1(f['log_daily_steps']).median():.0f}; empty bins median {f['empty_daytime'].median():.2f}")
 y = f["age"].to_numpy(); rng = np.random.default_rng(0); fold = rng.permutation(len(y)) % 10
 def model(): return HistGradientBoostingRegressor(max_iter=400, learning_rate=0.05, max_leaf_nodes=31, min_samples_leaf=40,
                                                   l2_regularization=1.0, random_state=0)

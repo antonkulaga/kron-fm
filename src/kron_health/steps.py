@@ -2,17 +2,20 @@
 
 Trained on NHANES 2005-2006 (ActiGraph 7164 on the hip, per-minute steps, ~7,000 people). NHANES minutes are summed
 into 10-minute bins first, so every feature is computed from the same thing a Samsung Health export holds
-(``step_bins``: steps per 10 minutes): the activity head's rhythm features on the hourly sums
-(:func:`kron_health.activity.rhythm`), and step features that share their unit across devices:
+(``step_bins``: steps per 10 minutes). The hip monitor was worn while awake and taken off for the evening and the
+night, a watch is worn day and night, so every feature reads only the hours both cover, :data:`HOURS` (08:00-19:59),
+and only worn time in them:
 
-* ``log_daily_steps``: mean steps per worn day (log);
-* ``empty_daytime``: share of 10-minute bins between 08:00 and 22:00 with no step;
-* ``brisk``, ``moderate``: share of daytime bins with >= 1,000 and >= 500 steps (about 100 and 50 steps a minute);
+* ``share_h08`` ... ``share_h19``: each hour's share of the window's steps (the day's shape);
+* ``daily_cv``: day-to-day variation of the window's steps;
+* ``log_daily_steps``: mean steps per kept day in the window (log);
+* ``empty_daytime``: share of worn 10-minute bins with no step;
+* ``brisk``, ``moderate``: share of worn bins with >= 1,000 and >= 500 steps (about 100 and 50 steps a minute);
 * ``best30``: median over days of the best 30 minutes (three consecutive bins), steps per minute.
 
-A kept day has at least 10 worn hours (NHANES: an hour with fewer than 60 minutes of zero intensity counts as worn;
-the watch: an hour with any bin); the rhythm features then read every hour of a kept day, unworn hours as zero steps. Two or more features outside the training range refuse the input, as for the
-activity head.
+A kept day has at least :data:`MIN_HOURS` worn hours in the window (NHANES: an hour with fewer than 60 minutes of
+zero intensity counts as worn; the watch: an hour with any bin). Two or more features outside the training range
+refuse the input, as for the activity head.
 """
 from __future__ import annotations
 
@@ -21,44 +24,38 @@ from pathlib import Path
 import numpy as np
 import polars as pl
 
-from kron_health.activity import UNIT_FREE, rhythm
-
+HOURS = range(8, 20)
+MIN_HOURS = 8
 STEP_FEATURES = ["log_daily_steps", "empty_daytime", "brisk", "moderate", "best30"]
-FEATURES = [f for f in UNIT_FREE if f != "sleep_min"] + STEP_FEATURES
+FEATURES = [f"share_h{h:02d}" for h in HOURS] + ["daily_cv"] + STEP_FEATURES
 
 
 def bin_features(day: np.ndarray, hour: np.ndarray, steps10: np.ndarray, worn_hour: np.ndarray,
                  min_days: int = 4) -> dict[str, float] | None:
     """Features of one person's 10-minute step bins: ``day`` index, clock ``hour``, steps per bin, and whether the
-    bin's hour was worn (one entry per bin). None with fewer than ``min_days`` worn days."""
+    bin's hour was worn (one entry per bin). None with fewer than ``min_days`` kept days."""
     day, hour, s, worn = (np.asarray(a) for a in (day, hour, steps10, worn_hour))
     s = s.astype(float)
-    days = [d for d in np.unique(day) if len(np.unique(hour[(day == d) & worn])) >= 10]
+    win = np.isin(hour, list(HOURS)) & worn.astype(bool)
+    days = [d for d in np.unique(day[win]) if len(np.unique(hour[win & (day == d)])) >= MIN_HOURS]
     if len(days) < min_days:
         return None
-    keep = np.isin(day, days)
-    # hourly sums for the rhythm features
-    hk = pl.DataFrame({"d": day[keep], "h": hour[keep], "s": s[keep], "w": worn[keep]}).group_by("d", "h").agg(
-        pl.col("s").sum(), pl.col("w").any()).sort("d", "h")
-    # every hour of a kept day counts for the rhythm features: NHANES 2005-06 took the hip monitor off for the
-    # night (no day reaches rhythm's 20 worn hours), and a watch's export has bins through the night; a night
-    # off the hip reads zero steps as a night asleep on the wrist does
-    r = rhythm(hk["s"].to_numpy(), hk["h"].to_numpy(), hk["d"].to_numpy(), np.ones(hk.height, bool), min_days=min_days)
-    if r is None:
+    keep = win & np.isin(day, days)
+    dk, hk, sk = day[keep], hour[keep], s[keep]
+    total = sk.sum()
+    if total <= 0:
         return None
-    out = {k: r[k] for k in UNIT_FREE if k != "sleep_min"}
-    dk, hk2, sk, wk = day[keep], hour[keep], s[keep], worn[keep]
-    daily = np.array([sk[(dk == d) & wk].sum() for d in days])
-    daytime = wk & (hk2 >= 8) & (hk2 < 22)
+    # each hour's mean steps per worn bin, then shares, so a day missing an hour does not bend the shape
+    profile = np.array([sk[hk == h].mean() if (hk == h).any() else np.nan for h in HOURS])
+    profile = np.where(np.isfinite(profile), profile, np.nanmean(profile))
+    out = {f"share_h{h:02d}": float(profile[i] / profile.sum()) for i, h in enumerate(HOURS)}
+    daily = np.array([sk[dk == d].sum() for d in days])
+    out["daily_cv"] = float(daily.std() / max(daily.mean(), 1e-12))
     out["log_daily_steps"] = float(np.log1p(daily.mean()))
-    out["empty_daytime"] = float(np.mean(sk[daytime] == 0)) if daytime.any() else float("nan")
-    out["brisk"] = float(np.mean(sk[daytime] >= 1000)) if daytime.any() else float("nan")
-    out["moderate"] = float(np.mean(sk[daytime] >= 500)) if daytime.any() else float("nan")
-    best = []
-    for d in days:
-        x = sk[dk == d]
-        if len(x) >= 3:
-            best.append(np.max(np.convolve(x, np.ones(3), mode="valid")) / 30.0)
+    out["empty_daytime"] = float(np.mean(sk == 0))
+    out["brisk"] = float(np.mean(sk >= 1000))
+    out["moderate"] = float(np.mean(sk >= 500))
+    best = [np.max(np.convolve(sk[dk == d], np.ones(3), mode="valid")) / 30.0 for d in days if (dk == d).sum() >= 3]
     out["best30"] = float(np.median(best)) if best else float("nan")
     return out
 

@@ -122,7 +122,8 @@ def test_step_features_from_ten_minute_bins_match_across_sources():
                      np.ones(len(starts), bool))
     assert a is not None and set(FEATURES) <= set(a)
     assert all(abs(a[k] - b[k]) < 1e-9 for k in FEATURES)
-    assert 0.05 < a["brisk"] < 0.1 and a["empty_daytime"] > 0.1 and 60 < a["best30"] < 120
+    # window 08-20: 72 bins a day, 18 of them 600-1200 steps (9-12 h), the 6 of 08 h empty
+    assert 0.05 < a["brisk"] < 0.15 and abs(a["empty_daytime"] - 6 / 72) < 1e-9 and 60 < a["best30"] < 120
 
 
 def test_workout_features_read_hr_at_speed_and_its_slope():
