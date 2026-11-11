@@ -152,7 +152,9 @@ language models are reported near 0.9 on ClinVar missense, and a codon model is 
 below 0.5 on synonymous variants, their intervals included: pathogenic synonymous SNVs look *more* likely to them
 than benign ones. Pathogenic synonymous variants act mostly through splicing, which a CDS-only model cannot see,
 and the GC change of the substitution alone does better (0.60). The CPU and GPU paths gave the same AUROCs to within
-0.001.
+0.001. Context helps a little. With a 1,000-codon window instead of 256, the 50k model goes from 0.705 to 0.711 on
+missense, a gain of +0.005 with a paired bootstrap interval of 0.003-0.008 over the same variants. Synonymous does
+not move (+0.003, interval -0.000 to 0.006).
 
 ```bash
 uv sync --inexact --all-groups                          # polars-bio is in the `genomics` group
