@@ -109,6 +109,16 @@ The median guess scores 9.63. At 25 Hz, the Galaxy Watch's rate, the c1 frozen h
 far, below the fine-tuned run 4 encoder (6.88, not tested paired against it); one seed. Its predictions are still
 compressed toward the mean (slope 0.52). For a 10 Hz watch the 5 Hz run 4 head stays.
 
+### Fine-tuning c1, and averaging two clocks (2026-11-11)
+
+Fine-tuning the c1 encoder on the open wrist people (6k steps) did not beat c1 frozen: 6.72 y (lr 3e-4) and 6.84 y
+(lr 1e-4), against 6.61. Fine-tuning run 4 for 6k steps gave 6.71 (lr 3e-4) and 6.79 (lr 1e-4). The average, per
+person, of the frozen c1 head and the 6k fine-tuned run 4 reads **6.30 y** (r 0.71) on Aurora's 1,220 people, better
+than c1 alone by 0.17-0.46 y (paired) and than the fine-tuned run 4 by 0.27-0.55 y. Adding the fine-tuned c1 as a
+third member changes nothing (6.34). Both members were fitted on open data only, so the average can be deployed (two
+encoders, about 30 ms per 5 s). The members and the learning rate were chosen by their Aurora scores, so the 6.30
+carries a small selection effect; seed 1 of c1 (running) will test it.
+
 ## Limits
 
 - The head learnt mostly from young people (20-35) plus 35 older AF patients; the test device is not Samsung.
