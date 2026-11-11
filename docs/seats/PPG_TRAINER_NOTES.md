@@ -33,6 +33,8 @@ secretary on the maintainer's word).
   its source sits beside the brief's private files (kron-samsung). Kept state report in #kron-fm > state (keep name
   ppg-state), milestones in #kron-fm > milestones, questions in #kron-fm > decisions. House style: the desk's
   docs/REPORTING.md (finding first, one headline number with ± and n, marks, tables). No person's values.
+- Every step asked of Anton carries its URL (dataset page, agreement to sign, desk issue, form); Anton, 2026-11-11:
+  "always give urls".
 
 ## Cluster rules taken up
 - Every sbatch carries `--comment 'seat=kron-fm/ppg-trainer; what=<one line, no person or private data>;
