@@ -16,7 +16,10 @@ secretary, on the maintainer's word)._
   as the brief and status file hold them: **one A100 card at a time** (gpu12 card 1, training), never the PPG
   trainer's last free card; short inference (evaluate, probe, ClinVar scoring) may share a card only after checking
   its free memory.
-- `JOB_PREFIX=kron-dna-` set in the clone's untracked `slurm/env.local.sh`.
+- The seat's job prefix `kron-dna-` is in the seat table (`[seat.dna-trainer.slurm]`, kit v0.1.181); the older
+  `JOB_PREFIX=kron-dna-` in the clone's untracked `slurm/env.local.sh` stays as a fallback.
+- `[seat.dna-trainer.watch.jobs]` (kit v0.1.182) watches every `kron-dna-*` job: start, requeue, end with state
+  and log. No per-job wait is armed any more.
 
 ## Submitting
 
