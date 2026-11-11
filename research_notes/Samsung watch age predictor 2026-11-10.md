@@ -125,6 +125,21 @@ varies with its seed far more than the frozen head): averaged with c1, each give
 member taken as the mean of its three seeds, so that no seed is chosen, the average reads **6.34 y (6.03-6.64)**, r 0.71,
 better than c1 alone by 0.13-0.42 y (paired). Seed 1 of c1 itself is running.
 
+## Each watch reads at its own offset (2026-11-11)
+
+The open wrist sets are young (median age 23-28 each), except Vilnius (AF patients, median 62). Holding one set out
+and fitting the head on the rest, each held-out cohort is read at an offset: for the c1 head, GalaxyPPG (Galaxy
+Watch5, median 23) reads 14.6, MultiSite +16 y, PPG Sport +25 y, Vilnius -22 y; for the 5 Hz run 4 head, Galaxy
+Active2 reads +14 y. With each source's mean embedding removed before fitting, almost no age signal is left (slope
+of prediction on age 0.07-0.10 on Aurora). So the open heads learn age mostly *between* sources, old Vilnius
+against young students, and a new device carries its own offset of up to 10-25 y. Aurora is one device on which the
+offset happened to be small; it does not show the clock is calibrated on a Galaxy Watch. On one 40-year-old's
+Galaxy Watch probe recordings the heads read 32-48 y.
+
+The fix is people of known, varied age recorded on the target watch, to fit the watch's offset (or the head)
+there: no open Galaxy Watch set has people over about 35. Until then a single person's age from the watch is not a
+number to report. Script: `scripts/kron_ppg_device_offsets.py`.
+
 ## Limits
 
 - The head learnt mostly from young people (20-35) plus 35 older AF patients; the test device is not Samsung.
