@@ -77,8 +77,11 @@ Watch 3, stroke survivors); s5, scale-free stream pretraining on the open wrist 
 | w1 (wrist windows) | 6.14 (5.88-6.40) | 7.97 (7.60-8.33) | 0.58 |
 | s5 (wrist streams, scale-free) | 6.91 (6.61-7.19) | 15.6 (reads 11.9 y old) | 0.40 |
 
-w1 matches run 4 when the head sees the target cohort and transfers a little worse; s5 is worse on both. The
-deployable predictor stays on run 4, which also carries no data of unknown terms (PulseWatch's are not yet known).
+In the 5 Hz band, w1 matches run 4 when the head sees the target cohort and transfers a little worse; s5 is worse on
+both. In the full band (the watch-data probe, ridge with K-fold over people) w1 is slightly better than run 4 on
+Aurora: paired difference -0.23 y (-0.38 to -0.08) on 15 s windows, -0.37 y (-0.57 to -0.17) on 30 s; on Galaxy
+Active 2 and Vilnius the difference is within noise. The same probe reads PulseWatch's AF labels (105 people) at
+AUC 0.77 (0.64-0.89) with run 4, 0.76 with w1, against 0.72 for an untrained twin. The deployable predictor stays on run 4, which also carries no data of unknown terms (PulseWatch's are not yet known).
 More wrist pretraining is not where the next gain is: the head's training people (214, mostly 20-35) are.
 
 ## Limits
