@@ -28,6 +28,14 @@ Every job carries the rigger's comment (rule of 2026-11-11, for the GPU dashboar
 slurm/submit.sh ...` (sbatch reads `SBATCH_COMMENT`; no script change), and `scontrol update JobId=<id>
 Comment='...'` when the estimate moves. `what` names no person and no private data.
 
+## Reporting
+
+Anton (2026-11-11, via the secretary): a `state` topic in the repository's channel with one current report, edited
+in place, and a `milestones` topic with one line per landed result, figures where they say it best. This seat keeps
+its report as `watchdog.py keep dna-trainer kron-dna-state '#kron-fm>state' FILE` (its source in the seat's scratch
+folder, outside the repository) and posts each landed result to `#kron-fm>milestones`. Both are updated at every
+snapshot and every new comparison. No person's health values and no cluster host names in either.
+
 ## Running
 
 - `kron-dna-syncodon-mlm` (6427115): SynCodonLM pretraining, `mlm`, 300k steps, gpu12 card 1, resumable,
