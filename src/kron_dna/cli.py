@@ -517,6 +517,39 @@ def clinvar(vcf: Path = typer.Option(None, help="ClinVar GRCh38 VCF (default: da
     typer.echo(f"wrote {out} and {per_variant}")
 
 
+@app.command()
+def ensemble(scores: list[Path] = typer.Argument(..., help="per-variant parquet files from `kron-dna clinvar`"),
+             columns: list[str] = typer.Option(..., "--column", help="LONG=SHORT: a score column and its short name"),
+             leave_out: list[str] = typer.Option([], "--leave-out", help="a short name: also fit without it, "
+                                                 "and report its paired gain"),
+             out: Path | None = typer.Option(None, help="results JSON (default: data/output/eval/clinvar/ensemble.json)"),
+             ) -> None:
+    """Gradient-boosted trees over per-variant scores, 5 folds split by gene; AUROC by consequence with intervals."""
+    from kron_core.paths import output_dir
+    from kron_dna import ensemble as E
+
+    pairs = dict(c.split("=", 1) for c in columns)
+    table = E.join_scores(scores, pairs)
+    every = [*pairs.values(), "is_missense"]
+    sets = {"all": every} | {f"all but {x}": [f for f in every if f != x] for x in leave_out}
+    rows, preds = E.evaluate(table, sets)
+    y, cons = table["label"].to_numpy(), table["consequence"].to_numpy()
+    gains = {}
+    for x in leave_out:
+        for consequence in ("missense", "synonymous"):
+            m = cons == consequence
+            gains[f"{x}:{consequence}"] = E.paired_gain(preds[f"all but {x}"][m], preds["all"][m], y[m])
+    for r in rows:
+        typer.echo(f"{r['consequence']:10s} {r['inputs']:30s} {r['auroc']:.3f} ({r['ci'][0]:.3f}-{r['ci'][1]:.3f})")
+    for k, g in gains.items():
+        typer.echo(f"gain of {k}: {g['gain']:+.4f} ({g['ci'][0]:+.4f} to {g['ci'][1]:+.4f})")
+    out = out or output_dir("eval", "clinvar") / "ensemble.json"
+    out.write_text(json.dumps({"inputs": [str(p) for p in scores], "columns": pairs, "folds": "5, by gene",
+                               "model": "HistGradientBoostingClassifier(max_iter=300, learning_rate=0.05)",
+                               "results": rows, "gains": gains}, indent=2) + "\n")
+    typer.echo(f"wrote {out}")
+
+
 @app.command("export-onnx")
 def export_onnx_cmd(run: Path = typer.Argument(..., help="a `kron-dna train` run directory or checkpoint"),
                     out: Path | None = typer.Option(None, help="output directory (default: <run>/onnx)"),

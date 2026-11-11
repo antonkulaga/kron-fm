@@ -209,6 +209,21 @@ in 5 folds by gene (3,948 genes, so no gene is in both training and test), gives
 ESM-2 alone. The gain is +0.005, with a paired bootstrap interval of 0.003-0.006: small but real. The two scores
 correlate only 0.45 (Spearman). Adding the GC and codon-usage deltas does not move it (0.911).
 
+**A first supervised ensemble** (gradient-boosted trees, 5 folds split by gene so no gene is in both training and
+test, on the same 15,756 variants). The inputs are scores already computed: kron-dna 75k, ESM-2, AlphaGenome's four
+scorers, the GC and codon-usage deltas, and the consequence. AUROC (95% interval):
+
+| inputs | missense | synonymous |
+|---|---|---|
+| kron-dna alone | 0.711 (0.700-0.720) | 0.449 (0.430-0.471) |
+| ESM-2 alone | 0.902 (0.896-0.908) | 0.475 (0.456-0.498) |
+| everything but kron-dna | 0.915 (0.910-0.921) | 0.933 (0.921-0.946) |
+| everything | **0.925** (0.920-0.931) | **0.938** (0.926-0.951) |
+
+kron-dna adds +0.010 on missense (paired interval 0.008-0.013) and +0.005 on synonymous (0.001-0.009) to the rest.
+AlphaMissense alone is at 0.966 on missense, with population frequency behind it. Not in yet: conservation, the
+models' embeddings, and a check on a set other than ClinVar.
+
 ```bash
 uv sync --inexact --all-groups                          # polars-bio in `genomics`; fair-esm, alphagenome in `baselines`
 uv run kron-dna clinvar --run data/output/runs/kron-dna/<run>   # -> data/output/eval/clinvar/zero_shot.{json,parquet}
