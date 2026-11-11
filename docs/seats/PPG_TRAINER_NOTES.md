@@ -34,6 +34,5 @@ secretary on the maintainer's word).
   estimate moves (the rigger, agent-chat 2026-11-11).
 
 ## Items to file
-- `unattended`, kit: `until-event.sh -- watch-job.sh` ends on the watcher's own "armed" line, so it never waits for
-  the job's end (2026-11-11, v0.1.170); a plain until-loop on squeue used instead.
+- filed: kit #422 (until-event ends on watch-job's armed banner); a plain until-loop on squeue meanwhile.
 - `unattended`: fold `wrist_probe.py` (14ab76c, another session, AUC targets, paired encoder differences) and `wrist_age.py` into one module, keeping both CLIs; watch-data told 2026-11-11.
