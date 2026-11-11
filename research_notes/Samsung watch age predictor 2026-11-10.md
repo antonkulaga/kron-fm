@@ -65,6 +65,22 @@ spread over a day or two; more helps.
   PPG needs Samsung's Health Sensor SDK (Galaxy Watch4 and later, partner approval), which is said to give green PPG at
   25 Hz (not yet checked here); the Active 2 runs Tizen and is not reached this way.
 
+## Wrist pretraining does not beat finger pretraining here (2026-11-11)
+
+Two encoders pretrained on wrist PPG were put through the same two tests, 5 Hz band, against run 4 (finger PPG):
+w1, the run 4 recipe (160k steps) on the open wrist window sets plus PulseWatch2025 (Samsung Gear S3 / Galaxy
+Watch 3, stroke survivors); s5, scale-free stream pretraining on the open wrist streams plus PulseWatch.
+
+| Encoder | Aurora, head fitted on Aurora (CV) | Open-wrist head on all of Aurora | r |
+|---|---|---|---|
+| run 4 (finger, VitalDB + GalaxyPPG) | 6.12 (5.86-6.38) | **7.50 (7.16-7.85)** | 0.60 |
+| w1 (wrist windows) | 6.14 (5.88-6.40) | 7.97 (7.60-8.33) | 0.58 |
+| s5 (wrist streams, scale-free) | 6.91 (6.61-7.19) | 15.6 (reads 11.9 y old) | 0.40 |
+
+w1 matches run 4 when the head sees the target cohort and transfers a little worse; s5 is worse on both. The
+deployable predictor stays on run 4, which also carries no data of unknown terms (PulseWatch's are not yet known).
+More wrist pretraining is not where the next gain is: the head's training people (214, mostly 20-35) are.
+
 ## Limits
 
 - The head learnt mostly from young people (20-35) plus 35 older AF patients; the test device is not Samsung.
