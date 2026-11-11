@@ -110,7 +110,9 @@ the head was scored on Aurora-BP's 1,220 people, who were never used for fitting
 
 The median guess scores 9.63. At 25 Hz, the Galaxy Watch's rate, the c1 frozen head is the best deployable model so
 far, below the fine-tuned run 4 encoder (6.88, not tested paired against it); one seed. Its predictions are still
-compressed toward the mean (slope 0.52). For a 10 Hz watch the 5 Hz run 4 head stays.
+compressed toward the mean (slope 0.52). For a 10 Hz watch the 5 Hz run 4 head stays. A second pretraining seed
+(c2) reads 6.78 y (6.45-7.08) full band, again better than run 4 (-0.68 to -1.31 y, paired), and 7.99 at 5 Hz:
+over the two seeds the c1 recipe gives 6.70 +- 0.12 y on Aurora.
 
 ### Fine-tuning c1, and averaging two clocks (2026-11-11)
 
