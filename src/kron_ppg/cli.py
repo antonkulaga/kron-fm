@@ -212,6 +212,23 @@ def wrist_age_export(run: Path = typer.Argument(..., help="a wrist-age run folde
     typer.echo(json.dumps(json_safe({k: record[k] for k in ("bytes", "checks", "app")}), indent=2))
 
 
+@app.command("probe-age")
+def probe_age(runs: list[Path] = typer.Argument(..., help="pulse-exploration probe run folders (each with hr_raw.csv)"),
+              model: Path = typer.Option(..., help="a wrist-age run folder with head.pt (the deployable clock)"),
+              out: Path | None = typer.Option(None, help="write the estimate as JSON here too"),
+              device: str = "cuda") -> None:
+    """One person's age from the watch probe's raw PPG: decode, quality gate, the wrist clock."""
+    from kron_ppg.probe_age import estimate
+    from kron_ppg.wrist_age import json_safe
+
+    result = json_safe(estimate(runs, model, device))
+    text = json.dumps(result, indent=2)
+    if out:
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(text + "\n")
+    typer.echo(text)
+
+
 @app.command()
 def vitals(source: str = typer.Argument("vitaldb"), sample_rate: float = 25.0, seconds: float = 30.0,
            workers: int | None = typer.Option(None, help="parallel processes (default: CPUs, at most 16)")) -> None:
