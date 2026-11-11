@@ -35,6 +35,9 @@ in place, and a `milestones` topic with one line per landed result, figures wher
 its report as `watchdog.py keep dna-trainer kron-dna-state '#kron-fm>state' FILE` (its source in the seat's scratch
 folder, outside the repository) and posts each landed result to `#kron-fm>milestones`. Both are updated at every
 snapshot and every new comparison. No person's health values and no cluster host names in either.
+The tabbed results page (a Claude artifact, private to the owner until he shares it) is linked at the top of the
+report and republished to the same address at each significant milestone, from the source file in the seat's
+scratch folder.
 
 ## Running
 
