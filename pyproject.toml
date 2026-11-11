@@ -23,6 +23,7 @@ dependencies = [
 kron-data = "kron_core.data_cli:app"
 kron-dna = "kron_dna.cli:app"
 kron-ppg = "kron_ppg.cli:app"
+kron-health = "kron_health.cli:app"
 
 [build-system]
 requires = ["hatchling>=1.26.0"]
