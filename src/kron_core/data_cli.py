@@ -22,11 +22,12 @@ app = typer.Typer(add_completion=False, no_args_is_help=True)
 def all_sources() -> dict[str, Source]:
     """The datasets of every kron-fm model, by name."""
     from kron_dna.sources import SOURCES as CDS
+    from kron_health.sources import SOURCES as HEALTH
     from kron_ppg.sources import SOURCES as PPG
     from krontime.sources import SOURCES as TIMESERIES
 
     merged: dict[str, Source] = {}
-    for registry in (CDS, TIMESERIES, PPG):
+    for registry in (CDS, TIMESERIES, PPG, HEALTH):
         clash = set(merged) & set(registry)
         if clash:
             raise RuntimeError(f"two sources share a name: {sorted(clash)}")

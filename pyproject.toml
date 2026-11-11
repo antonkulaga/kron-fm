@@ -26,7 +26,7 @@ requires = ["hatchling>=1.26.0"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/kron_core", "src/krontime", "src/kron_dna", "src/kron_ppg"]
+packages = ["src/kron_core", "src/krontime", "src/kron_dna", "src/kron_ppg", "src/kron_health"]
 
 [tool.uv]
 system-certs = true
