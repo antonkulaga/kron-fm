@@ -441,6 +441,11 @@ def clinvar(vcf: Path = typer.Option(None, help="ClinVar GRCh38 VCF (default: da
             holdout_genes: float = typer.Option(0.05, help="the gene fraction `prepare --holdout-genes` set aside"),
             max_per_class: int = typer.Option(5000, help="variants kept per (consequence, label), by seed; 0 = all"),
             batch_size: int = 32, device: str = "cuda", seed: int = 0,
+            alphamissense: Path | None = typer.Option(None, help="AlphaMissense_hg38.tsv.gz: score its pathogenicity too"),
+            alphagenome_key: Path | None = typer.Option(None, help="a file holding an AlphaGenome API key: score "
+                                                        "its splicing and RNA-seq effects too (`baselines` group)"),
+            esm_models: list[str] = typer.Option([], "--esm", help="ESM-2 models to score missense with "
+                                                 "(e.g. esm2_t33_650M_UR50D; needs the `baselines` group)"),
             out: Path | None = typer.Option(None, help="results JSON (default: data/output/eval/clinvar/zero_shot.json)"),
             ) -> None:
     """Zero-shot ClinVar: reviewed pathogenic vs benign coding SNVs, AUROC by consequence and gene split.
@@ -475,7 +480,19 @@ def clinvar(vcf: Path = typer.Option(None, help="ClinVar GRCh38 VCF (default: da
     typer.echo(f"{table.height:,} variants scored (at most {max_per_class or 'all'} per consequence and label)")
     seqs = [t["seq"] for t in transcripts.values()]
     scores = V.baseline_scores(table, V.codon_frequencies(seqs), P.relative_adaptiveness(seqs))
+    positions = (V.read_clinvar(vcf).filter(pl.col("id").is_in(table["id"].implode()))
+                 if alphamissense or alphagenome_key else None)
+    if alphagenome_key:
+        scores |= V.alphagenome_scores(table, positions, alphagenome_key.read_text().strip(),
+                                       interim_dir("cds", "clinvar") / "alphagenome.parquet")
+    if alphamissense:
+        scores["alphamissense"] = V.alphamissense_scores(table, positions, alphamissense)
+        typer.echo(f"AlphaMissense: {int(np.isfinite(scores['alphamissense']).sum()):,} of {table.height:,} variants scored")
     dev = torch.device(device)
+    for name in esm_models:
+        t1 = time.time()
+        scores[f"esm:{name}"] = V.esm_marginals(table, transcripts, dev, name)
+        typer.echo(f"scored {name} ({time.time() - t1:.0f} s)")
     for run in runs:
         model, record = load_run(run)
         if dev.type == "cpu":                       # the Triton kernels need CUDA; the export's plain graph does not

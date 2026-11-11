@@ -97,3 +97,65 @@ def test_bootstrap_ci_brackets_the_estimate():
     lo, hi = V.bootstrap_ci(V.auroc, score, label, n=200)
     assert lo < est < hi and 0.5 < lo and hi - lo < 0.2
     assert V.bootstrap_ci(V.auroc, np.zeros(3), np.ones(3, int), n=10) is None   # one class in every resample
+
+
+def test_alphamissense_scores_join_by_site(tmp_path):
+    import gzip
+    path = tmp_path / "am.tsv.gz"
+    with gzip.open(path, "wt") as fh:
+        fh.write("# Copyright\n#CHROM\tPOS\tREF\tALT\tgenome\tuniprot_id\ttranscript_id\tprotein_variant\t"
+                 "am_pathogenicity\tam_class\n")
+        fh.write("chr1\t100\tA\tG\thg38\tP1\tT1\tK1E\t0.9\tlikely_pathogenic\n")
+        fh.write("chr1\t100\tA\tG\thg38\tP1\tT2\tK1E\t0.7\tambiguous\n")      # second transcript: max kept
+        fh.write("chr2\t5\tC\tT\thg38\tP2\tT3\tA2V\t0.1\tlikely_benign\n")
+    table = pl.DataFrame({"id": ["a", "b", "c"]})
+    positions = pl.DataFrame({"id": ["c", "a", "b"], "chrom": ["1", "1", "2"], "pos": [7, 100, 5],
+                              "ref": ["G", "A", "C"], "alt": ["T", "G", "T"]})
+    s = V.alphamissense_scores(table, positions, path)
+    assert s[0] == -0.9 and s[1] == -0.1 and np.isnan(s[2])
+
+
+def test_summarize_skips_missing_scores():
+    table = pl.DataFrame({"label": [1, 1, 0, 0], "consequence": ["missense"] * 4, "in_training": [True] * 4})
+    rows = V.summarize(table, {"x": np.array([-1.0, np.nan, 1.0, 2.0])}, n_boot=0)
+    row = next(r for r in rows if r["consequence"] == "missense" and r["genes"] == "all")
+    assert row["x"] == 1.0 and row["x_n"] == 3
+
+
+def test_esm_marginals_tiny_model():
+    import esm
+    import torch
+    torch.manual_seed(0)
+    alphabet = esm.data.Alphabet.from_architecture("ESM-1b")
+    net = esm.model.esm2.ESM2(num_layers=1, embed_dim=16, attention_heads=2, alphabet=alphabet)
+    seq = "ATG" + "GCT" * 30 + "TAA"
+    tx = {"G": {"name": "tx", "gene": "G", "chrom": "1", "strand": "+", "exons": [(1, len(seq))], "seq": seq}}
+    table = pl.DataFrame({"transcript": ["tx"] * 3, "codon_index": [5, 5, 20], "consequence": ["missense", "missense", "synonymous"],
+                          "ref_codon": ["GCT", "GCT", "GCT"], "alt_codon": ["ACT", "GCT", "GCC"]})
+    s = V.esm_marginals(table, tx, torch.device("cpu"), window=16, batch_size=2, model=(net, alphabet))
+    assert np.isfinite(s[:2]).all() and s[1] == 0.0 and np.isnan(s[2])
+
+
+def test_alphagenome_scores_cache_and_resume(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    calls = []
+
+    class Fake:
+        def score_variant(self, interval, variant, variant_scorers):
+            calls.append(variant.position)
+            if variant.position == 3:
+                raise RuntimeError("no service")
+            return [SimpleNamespace(X=np.array([[0.1, -0.5 * variant.position]])) for _ in variant_scorers]
+
+    table = pl.DataFrame({"id": ["a", "b", "c"]})
+    positions = pl.DataFrame({"id": ["a", "b", "c"], "chrom": ["1", "1", "2"], "pos": [1, 2, 3],
+                              "ref": ["A", "C", "G"], "alt": ["G", "T", "A"]})
+    cache = tmp_path / "ag.parquet"
+    monkeypatch.setattr(V.time, "sleep", lambda s: None)           # no back-off waits in the test
+    out = V.alphagenome_scores(table, positions, "", cache, scorers=("SPLICE_SITES",), workers=1, client=Fake())
+    s = out["alphagenome:splice_sites"]
+    assert s[0] == -0.5 and s[1] == -1.0 and np.isnan(s[2]) and calls.count(3) == 5
+    calls.clear()
+    V.alphagenome_scores(table, positions, "", cache, scorers=("SPLICE_SITES",), workers=1, client=Fake())
+    assert calls == [3] * 5                                        # the two scored are cached; the failure is retried

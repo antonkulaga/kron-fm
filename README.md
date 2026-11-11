@@ -147,8 +147,8 @@ corpus (it saw no ClinVar labels):
 In brackets: 95% bootstrap intervals over the variants (1,000 resamples). Missense: 5,000 P / 5,000 B overall, of
 which 263 P / 213 B are in held-out genes. Synonymous: 756 P / 5,000 B. Over all missense variants the
 SynCodonLM model at 50k steps is above every other score, its interval clear of theirs. It also improved from 25k to 50k.
-On the 476 held-out-gene variants every model's interval overlaps every other's. The models separate missense variants only weakly. Protein
-language models are reported near 0.9 on ClinVar missense, and a codon model is far from that. All five models sit
+On the 476 held-out-gene variants every model's interval overlaps every other's. The models separate missense variants only weakly: ESM-2 reaches
+0.906 on the same variants (the next table). All five models sit
 below 0.5 on synonymous variants, their intervals included: pathogenic synonymous SNVs look *more* likely to them
 than benign ones. Pathogenic synonymous variants act mostly through splicing, which a CDS-only model cannot see,
 and the GC change of the substitution alone does better (0.60). The CPU and GPU paths gave the same AUROCs to within
@@ -156,9 +156,31 @@ and the GC change of the substitution alone does better (0.60). The CPU and GPU 
 missense, a gain of +0.005 with a paired bootstrap interval of 0.003-0.008 over the same variants. Synonymous does
 not move (+0.003, interval -0.000 to 0.006).
 
+**Against the state of the art, on the same variants.** Each row is AUROC (95% bootstrap interval). "Held-out" is
+the human runs' 5% gene hold-out (263 P / 213 B missense). A score covers only what it can score: AlphaMissense has
+9,705 of the 10,000 missense variants, and AlphaGenome 5,733 of the 5,756 synonymous ones.
+
+| scorer | what it sees | missense, all genes | missense, held-out genes | synonymous, all genes |
+|---|---|---|---|---|
+| kron-dna SynCodonLM 50k, 1,000-codon window | the CDS's codons | 0.711 (0.701-0.721) | 0.661 (0.614-0.709) | 0.426 (0.404-0.448) |
+| ESM-2 650M, masked marginal | the protein | 0.906 (0.900-0.912) | 0.834 (0.800-0.870) | - |
+| AlphaMissense | protein, structure, population frequency | **0.966** (0.963-0.969) | **0.950** (0.933-0.967) | - |
+| AlphaGenome, splice junctions | 100 kb of genome | 0.594 (0.582-0.605) | 0.540 (0.494-0.594) | **0.939** (0.926-0.951) |
+| AlphaGenome, RNA-seq | 100 kb of genome | 0.530 (0.519-0.541) | 0.489 (0.434-0.541) | 0.810 (0.793-0.830) |
+| GC delta | the substitution | 0.467 (0.457-0.476) | 0.418 (0.373-0.465) | 0.602 (0.586-0.618) |
+
+The codon model is far behind on both classes. On missense, a protein language model of a similar size (ESM-2,
+650M) is near 0.91 zero-shot. AlphaMissense is higher still, but it is tuned with population frequency, and much of
+ClinVar's benign class is common variants, so its number is not a clean zero-shot comparison. On synonymous variants
+the splicing scores of AlphaGenome reach 0.94, which confirms that pathogenic synonymous variants are splicing
+variants: a model that reads only the CDS cannot score them. ESM-2 runs in fp32: in bf16 the same model drops to
+0.70, measured on 1,000 of these variants. AlphaGenome was called through its API with the scorers its client
+recommends, taking the largest absolute effect over the tracks. Evo 2 is not compared yet.
+
 ```bash
-uv sync --inexact --all-groups                          # polars-bio is in the `genomics` group
+uv sync --inexact --all-groups                          # polars-bio in `genomics`; fair-esm, alphagenome in `baselines`
 uv run kron-dna clinvar --run data/output/runs/kron-dna/<run>   # -> data/output/eval/clinvar/zero_shot.{json,parquet}
+uv run kron-dna clinvar --esm esm2_t33_650M_UR50D --alphamissense AlphaMissense_hg38.tsv.gz --alphagenome-key KEYFILE
 ```
 
 **SynCodonLM pretraining (running).** `mlm` on the whole corpus (`packed_1024_sp01`: 1% of species held out),

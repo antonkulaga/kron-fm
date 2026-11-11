@@ -23,6 +23,7 @@ import re
 from collections import Counter
 from collections.abc import Sequence
 from pathlib import Path
+import time
 
 import numpy as np
 import polars as pl
@@ -222,6 +223,50 @@ def masked_marginals(model: torch.nn.Module, table: pl.DataFrame, transcripts: d
                          table["ref_codon"].to_list(), table["alt_codon"].to_list())])
 
 
+@torch.no_grad()
+def esm_marginals(table: pl.DataFrame, transcripts: dict[str, dict], device: torch.device,
+                  model_name: str = "esm2_t33_650M_UR50D", window: int = 1022, batch_size: int = 8,
+                  model=None) -> np.ndarray:
+    """ESM-2's masked marginal on the protein, ``log p(alt aa) - log p(ref aa)`` at the masked residue, for the
+    missense rows of ``table``; NaN for the rest (a synonymous change leaves the protein as it is).
+
+    The protein is the transcript's translation without its stop; a residue past ``window`` gets a window
+    centred on it, as ``masked_marginals`` does for codons. ``model`` is ``(model, alphabet)`` for tests."""
+    import esm
+
+    net, alphabet = model if model is not None else getattr(esm.pretrained, model_name)()
+    net = net.to(device).eval()                            # fp32: bf16 drops ESM-2 650M from 0.90 to 0.70 AUROC
+    by_name = {t["name"]: t for t in transcripts.values()}
+    proteins = {name: "".join(GENETIC_CODE[t["seq"][i:i + 3]] for i in range(0, len(t["seq"]) - 3, 3))
+                for name, t in by_name.items()}
+    missense = table["consequence"].to_numpy() == "missense"
+    keys = sorted(set((n, k) for n, k, m in zip(table["transcript"].to_list(), table["codon_index"].to_list(),
+                                                 missense) if m), key=lambda nk: (len(proteins[nk[0]]), nk))
+    logp: dict[tuple[str, int], np.ndarray] = {}
+    for start in range(0, len(keys), batch_size):
+        chunk = keys[start:start + batch_size]
+        pieces, at = [], []
+        for name, k in chunk:
+            prot = proteins[name]
+            lo = max(0, min(k - window // 2, len(prot) - window))
+            pieces.append((name, prot[lo:lo + window]))
+            at.append(k - lo + 1)                            # +1: the <cls> token ESM puts first
+        _, _, tokens = alphabet.get_batch_converter()(pieces)
+        tokens[torch.arange(len(chunk)), torch.tensor(at)] = alphabet.mask_idx
+        logits = net(tokens.to(device))["logits"]
+        lp = torch.log_softmax(logits[torch.arange(len(chunk), device=device), torch.tensor(at, device=device)]
+                               .float(), dim=-1).cpu().numpy()
+        for key, row in zip(chunk, lp):
+            logp[key] = row
+    out = np.full(table.height, np.nan)
+    for i, (n, k, a, b, m) in enumerate(zip(table["transcript"].to_list(), table["codon_index"].to_list(),
+                                            table["ref_codon"].to_list(), table["alt_codon"].to_list(), missense)):
+        if m:
+            row = logp[(n, k)]
+            out[i] = row[alphabet.get_idx(GENETIC_CODE[b])] - row[alphabet.get_idx(GENETIC_CODE[a])]
+    return out
+
+
 def auroc(score: np.ndarray, label: np.ndarray) -> float | None:
     """AUROC of ``-score`` for ``label == 1`` (pathogenic), by ranks (ties averaged); ``None`` with one class."""
     from scipy.stats import rankdata
@@ -232,6 +277,73 @@ def auroc(score: np.ndarray, label: np.ndarray) -> float | None:
         return None
     ranks = rankdata(-score)
     return float((ranks[pos].sum() - n1 * (n1 + 1) / 2) / (n1 * n0))
+
+
+def alphamissense_scores(table: pl.DataFrame, positions: pl.DataFrame, path: str | Path) -> np.ndarray:
+    """AlphaMissense pathogenicity for each row of ``table``, as a score where lower means pathogenic
+    (``-am_pathogenicity``), NaN where AlphaMissense has none (synonymous variants, other transcripts).
+
+    ``positions`` holds ``id, chrom, pos, ref, alt`` (``read_clinvar``) for the table's ids; ``path`` is the
+    public ``AlphaMissense_hg38.tsv.gz`` (chromosomes as ``chr1``; several transcripts at one site: the highest)."""
+    am = pl.read_csv(path, separator="\t", comment_prefix="#", has_header=False, columns=[0, 1, 2, 3, 8],
+                     infer_schema=False)                       # all text; typed below
+    am = am.rename(dict(zip(am.columns, ["chrom", "pos", "ref", "alt", "am"])))
+    am = (am.with_columns(pl.col("chrom").str.strip_prefix("chr"), pl.col("pos").cast(pl.Int64),
+                          pl.col("am").cast(pl.Float64))
+          .group_by("chrom", "pos", "ref", "alt").agg(pl.col("am").max()))
+    keyed = positions.select("id", pl.col("chrom").cast(pl.Utf8), pl.col("pos").cast(pl.Int64), "ref", "alt")
+    joined = table.select("id").join(keyed.join(am, on=["chrom", "pos", "ref", "alt"], how="left"),
+                                     on="id", how="left", maintain_order="left")
+    return -joined["am"].fill_null(float("nan")).to_numpy().astype(float)
+
+
+ALPHAGENOME_SCORERS = ("SPLICE_SITES", "SPLICE_SITE_USAGE", "SPLICE_JUNCTIONS", "RNA_SEQ")
+
+
+def alphagenome_scores(table: pl.DataFrame, positions: pl.DataFrame, api_key: str, cache: Path,
+                       scorers: tuple[str, ...] = ALPHAGENOME_SCORERS, workers: int = 4,
+                       client=None) -> dict[str, np.ndarray]:
+    """AlphaGenome's recommended variant scorers over a 100 kb window, one score per scorer: ``-max |effect|``
+    over its tracks (and genes, for RNA_SEQ), so lower means a larger predicted effect, as for the other scores.
+
+    Results are appended to ``cache`` (a parquet keyed by ``id``) as they arrive, so a rerun skips what is done;
+    a failed call is retried 5 times, then left NaN and not cached, so a rerun tries it again. ``client`` stands
+    in for the API in tests."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    if client is None:
+        from alphagenome.models import dna_client
+        client = dna_client.create(api_key)
+    from alphagenome.data import genome
+    from alphagenome.models import dna_client, variant_scorers as VS
+
+    chosen = [VS.RECOMMENDED_VARIANT_SCORERS[k] for k in scorers]
+    done = pl.read_parquet(cache) if cache.exists() else pl.DataFrame(schema={"id": pl.Utf8, **{k: pl.Float64 for k in scorers}})
+    keyed = positions.select("id", "chrom", "pos", "ref", "alt").unique("id")
+    todo = table.select("id").unique().join(keyed, on="id").join(done.select("id"), on="id", how="anti")
+
+    def one(row: dict) -> dict:
+        v = genome.Variant(chromosome=f"chr{row['chrom']}", position=int(row["pos"]),
+                           reference_bases=row["ref"], alternate_bases=row["alt"])
+        for attempt in range(5):
+            try:
+                res = client.score_variant(interval=v.reference_interval.resize(dna_client.SEQUENCE_LENGTH_100KB),
+                                           variant=v, variant_scorers=chosen)
+                return {"id": row["id"], **{k: float(np.nanmax(np.abs(r.X))) if r.X.size else float("nan")
+                                            for k, r in zip(scorers, res)}}
+            except Exception:                                 # transient gRPC / proxy failures
+                time.sleep(2 ** attempt)
+        return None
+
+    rows = todo.to_dicts()
+    with ThreadPoolExecutor(workers) as pool:
+        for start in range(0, len(rows), 200):
+            got = pl.DataFrame([r for r in pool.map(one, rows[start:start + 200]) if r], schema=done.schema)
+            done = pl.concat([done, got])
+            done.write_parquet(cache)
+            print(f"AlphaGenome: {done.height:,} variants scored", flush=True)
+    joined = table.select("id").join(done, on="id", how="left", maintain_order="left")
+    return {f"alphagenome:{k.lower()}": -joined[k].fill_null(float("nan")).to_numpy().astype(float) for k in scorers}
 
 
 def bootstrap_ci(metric, *arrays: np.ndarray, n: int = 1000, seed: int = 0, level: float = 0.95) -> list[float] | None:
@@ -268,8 +380,11 @@ def summarize(table: pl.DataFrame, scores: dict[str, np.ndarray], n_boot: int = 
             row = {"consequence": consequence, "genes": split, "pathogenic": int((label[m] == 1).sum()),
                    "benign": int((label[m] == 0).sum())}
             for name, sc in scores.items():
-                row[name] = auroc(sc[m], label[m])
+                ms = m & np.isfinite(sc)                     # a score may cover only part of the variants
+                row[name] = auroc(sc[ms], label[ms])
+                if ms.sum() < m.sum():
+                    row[f"{name}_n"] = int(ms.sum())
                 if n_boot:
-                    row[f"{name}_ci"] = bootstrap_ci(auroc, sc[m], label[m], n=n_boot)
+                    row[f"{name}_ci"] = bootstrap_ci(auroc, sc[ms], label[ms], n=n_boot)
             out.append(row)
     return out
