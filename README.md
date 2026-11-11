@@ -141,7 +141,9 @@ corpus (it saw no ClinVar labels):
 | synonymous (human, 15k steps) | 0.537 (0.525-0.548) | 0.618 (0.568-0.666) | 0.433 (0.411-0.455) |
 | mlm (SynCodonLM, 25k steps) | 0.649 (0.638-0.659) | 0.623 (0.571-0.672) | 0.427 (0.406-0.449) |
 | mlm (SynCodonLM, 50k steps) | 0.705 (0.695-0.716) | 0.658 (0.610-0.706) | 0.423 (0.402-0.445) |
-| mlm (SynCodonLM, 75k steps, 1,000-codon window) | **0.737** (0.727-0.747) | **0.670** (0.623-0.715) | 0.429 (0.407-0.451) |
+| mlm (SynCodonLM, 75k steps, 1,000-codon window) | 0.737 (0.727-0.747) | 0.670 (0.623-0.715) | 0.429 (0.407-0.451) |
+| mlm (SynCodonLM, 100k steps, 1,000-codon window) | 0.762 (0.752-0.771) | 0.685 (0.640-0.730) | 0.443 (0.422-0.465) |
+| mlm (SynCodonLM, 125k steps, 1,000-codon window) | **0.776** (0.766-0.784) | **0.707** (0.663-0.751) | 0.437 (0.416-0.459) |
 | codon-usage delta | 0.539 (0.528-0.550) | 0.593 (0.545-0.642) | 0.533 (0.510-0.556) |
 | GC delta | 0.467 (0.457-0.476) | 0.418 (0.373-0.465) | **0.602** (0.586-0.618) |
 
@@ -151,8 +153,8 @@ SynCodonLM model at 50k steps is above every other score, its interval clear of 
 On the 476 held-out-gene variants every model's interval overlaps every other's. The models separate missense variants only weakly: ESM-2 reaches
 0.906 on the same variants (the next table). All five models sit
 below 0.5 on synonymous variants, their intervals included: pathogenic synonymous SNVs look *more* likely to them
-than benign ones. Pathogenic synonymous variants act mostly through splicing, which a CDS-only model cannot see,
-and the GC change of the substitution alone does better (0.60). The CPU and GPU paths gave the same AUROCs to within
+than benign ones. Pathogenic synonymous variants act mostly through splicing, which a CDS-only model sees at best weakly
+(Encodon 1B reaches 0.62, below), and the GC change of the substitution alone does better (0.60). The CPU and GPU paths gave the same AUROCs to within
 0.001. Context helps a little. With a 1,000-codon window instead of 256, the 50k model goes from 0.705 to 0.711 on
 missense, a gain of +0.005 with a paired bootstrap interval of 0.003-0.008 over the same variants. Synonymous does
 not move (+0.003, interval -0.000 to 0.006).
@@ -174,8 +176,8 @@ the human runs' 5% gene hold-out (263 P / 213 B missense). A score covers only w
 The codon model is far behind on both classes. On missense, a protein language model of a similar size (ESM-2,
 650M) is near 0.91 zero-shot. AlphaMissense is higher still, but it is tuned with population frequency, and much of
 ClinVar's benign class is common variants, so its number is not a clean zero-shot comparison. On synonymous variants
-the splicing scores of AlphaGenome reach 0.94, which confirms that pathogenic synonymous variants are splicing
-variants: a model that reads only the CDS cannot score them. ESM-2 runs in fp32: in bf16 the same model drops to
+the splicing scores of AlphaGenome reach 0.94, which confirms that pathogenic synonymous variants are mostly splicing
+variants: a model that reads only the CDS scores them poorly (kron-dna below chance; Encodon 1B 0.62, below). ESM-2 runs in fp32: in bf16 the same model drops to
 0.70, measured on 1,000 of these variants. AlphaGenome was called through its API with the scorers its client
 recommends, taking the largest absolute effect over the tracks.
 
@@ -195,14 +197,23 @@ Evo 2 reads the genome around the variant, introns and splice sites included, so
 the codon model by 0.136 on missense (paired interval 0.119-0.153) and by 0.436 on synonymous. On each class it is
 below the specialist: ESM-2 or AlphaMissense on missense, AlphaGenome's splicing score on synonymous.
 
-**NVIDIA's CodonFM (EnCodon), quoted, not run here.** It is the closest published peer: masked codon models of
-80M, 600M and 1B parameters, trained on about 130M RefSeq coding sequences from over 22,000 species. Its preprint
-(NVIDIA, 2025) reports ClinVar missense as AUROC in a figure only, with no number in the text: EnCodon is "marginally
-outperformed by the ESM family" and ahead of the RNA and mRNA models it compares. ClinVar synonymous is reported as
-Mann-Whitney p-values over subsamples matched for codon, gene position, pLI and mutation rate, not as AUROC. So
-neither is comparable number for number. What it says for kron-dna: a codon model at that scale comes close to ESM-2
-(0.906 here), while kron-dna at 68.6M parameters and 75k steps is at 0.737. Running it here waits on the owner's go
-for its code (its weights load only through NVIDIA's repository).
+**NVIDIA's CodonFM (Encodon), run here.** It is the closest published peer: masked codon models of 80M and 1B
+parameters, trained on about 130M RefSeq coding sequences from over 22,000 species. It was run with NVIDIA's own
+mutation recipe (the CDS's first 2,046 codons, the variant's codon masked), from its v1.1 release in a scratch
+environment. That environment's xformers has no CUDA build, so its attention call was routed through PyTorch's own
+kernel, checked equal to the explicit formula at start-up. Its context covers 9,339 of the 10,000 missense and
+5,183 of the 5,756 synonymous variants; all three models are compared on those (AUROC, 95% interval):
+
+| model | missense (4,790 P / 4,549 B) | synonymous (704 P / 4,479 B) |
+|---|---|---|
+| kron-dna, 68.6M, 100k steps | 0.766 (0.756-0.774) | 0.443 (0.418-0.465) |
+| Encodon 80M | 0.870 (0.862-0.876) | 0.475 (0.451-0.498) |
+| Encodon 1B | **0.907** (0.900-0.912) | **0.624** (0.603-0.643) |
+
+Encodon 80M, near kron-dna's size, is ahead by 0.104 on missense (paired interval 0.095-0.113), so most of the gap
+is training data and length, not the codon view itself. Encodon 1B matches ESM-2 on missense (0.906 here), and is
+the only coding-sequence model above chance on synonymous variants (0.62), still far below AlphaGenome's splicing
+score (0.94).
 
 Does the codon model add anything to the protein model? A logistic regression on the two scores, cross-validated
 in 5 folds by gene (3,948 genes, so no gene is in both training and test), gives 0.911 on missense against 0.906 for
@@ -234,19 +245,19 @@ uv run kron-dna clinvar --esm esm2_t33_650M_UR50D --alphamissense AlphaMissense_
 same 68.6M model and batch, up to 300k steps. Its snapshots, by `evaluate` on 4,096 rows of each set
 (total / aa / syn bits per masked codon):
 
-| set | step 25k | step 50k | step 75k | human `mlm`, 15k steps |
-|---|---|---|---|---|
-| held-out species | 4.879 / 3.606 / 1.273 | 4.735 / 3.474 / 1.261 | 4.642 / 3.387 / 1.256 | |
-| SynCodonLM test (species seen in training) | 4.892 / 3.622 / 1.270 | 4.757 / 3.498 / 1.259 | 4.668 / 3.414 / 1.254 | |
-| SynCodonLM test, the step-1 sample | 4.882 / 3.610 / 1.272 | 4.747 / 3.486 / 1.261 | 4.657 / 3.402 / 1.256 | 5.153 / - / 1.394 |
-| yeast | 5.099 / 3.727 / 1.372 | 5.018 / 3.650 / 1.368 | 4.977 / 3.610 / 1.367 | 5.342 / - / 1.492 |
-| held-out human genes | 4.788 / 3.528 / 1.260 | 4.645 / 3.401 / 1.245 | 4.542 / 3.306 / 1.236 | 4.784 / 3.526 / 1.258 |
+| set | step 25k | step 50k | step 75k | step 100k | step 125k | human `mlm`, 15k steps |
+|---|---|---|---|---|---|---|
+| held-out species | 4.879 / 3.606 / 1.273 | 4.735 / 3.474 / 1.261 | 4.642 / 3.387 / 1.256 | 4.568 / 3.316 / 1.252 | 4.504 / 3.255 / 1.249 | |
+| SynCodonLM test (species seen in training) | 4.892 / 3.622 / 1.270 | 4.757 / 3.498 / 1.259 | 4.668 / 3.414 / 1.254 | 4.596 / 3.346 / 1.250 | 4.533 / 3.286 / 1.246 | |
+| SynCodonLM test, the step-1 sample | 4.882 / 3.610 / 1.272 | 4.747 / 3.486 / 1.261 | 4.657 / 3.402 / 1.256 | 4.585 / 3.333 / 1.252 | 4.522 / 3.274 / 1.249 | 5.153 / - / 1.394 |
+| yeast | 5.099 / 3.727 / 1.372 | 5.018 / 3.650 / 1.368 | 4.977 / 3.610 / 1.367 | 4.939 / 3.577 / 1.363 | 4.905 / 3.545 / 1.360 | 5.342 / - / 1.492 |
+| held-out human genes | 4.788 / 3.528 / 1.260 | 4.645 / 3.401 / 1.245 | 4.542 / 3.306 / 1.236 | 4.458 / 3.228 / 1.230 | 4.381 / 3.155 / 1.226 | 4.784 / 3.526 / 1.258 |
 
 After 25k steps the corpus model already beats the human-only model on yeast and on SynCodonLM; after 50k it
 also beats it on human genes (4.645 against 4.784), the human-only model's own domain. Human is ~0.1% of
 SynCodonLM, and its genes there are not split by the human hold-out, so the "held-out human genes" row is not
 held out for this model. On the mRFP probe the snapshots reach test rho 0.695 (0.612-0.757) at 25k, 0.642 (0.545-0.715) at 50k and 0.648
-(0.549-0.725) at 75k, against 0.716
+(0.549-0.725) at 75k 0.644 (0.555-0.720) at 100k and 0.674 (0.580-0.752) at 125k, against 0.716
 (0.632-0.780) for the human `mlm` model. These are 95% bootstrap intervals over the 219 test variants, and they all
 overlap: one gene's split cannot rank these models.
 
