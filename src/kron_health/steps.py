@@ -10,8 +10,8 @@ into 10-minute bins first, so every feature is computed from the same thing a Sa
 * ``brisk``, ``moderate``: share of daytime bins with >= 1,000 and >= 500 steps (about 100 and 50 steps a minute);
 * ``best30``: median over days of the best 30 minutes (three consecutive bins), steps per minute.
 
-A worn day has at least 10 worn hours (NHANES: an hour with fewer than 60 minutes of zero intensity counts as worn;
-the watch: an hour with any bin). Two or more features outside the training range refuse the input, as for the
+A kept day has at least 10 worn hours (NHANES: an hour with fewer than 60 minutes of zero intensity counts as worn;
+the watch: an hour with any bin); the rhythm features then read every hour of a kept day, unworn hours as zero steps. Two or more features outside the training range refuse the input, as for the
 activity head.
 """
 from __future__ import annotations
@@ -40,7 +40,10 @@ def bin_features(day: np.ndarray, hour: np.ndarray, steps10: np.ndarray, worn_ho
     # hourly sums for the rhythm features
     hk = pl.DataFrame({"d": day[keep], "h": hour[keep], "s": s[keep], "w": worn[keep]}).group_by("d", "h").agg(
         pl.col("s").sum(), pl.col("w").any()).sort("d", "h")
-    r = rhythm(hk["s"].to_numpy(), hk["h"].to_numpy(), hk["d"].to_numpy(), hk["w"].to_numpy(), min_days=min_days)
+    # every hour of a kept day counts for the rhythm features: NHANES 2005-06 took the hip monitor off for the
+    # night (no day reaches rhythm's 20 worn hours), and a watch's export has bins through the night; a night
+    # off the hip reads zero steps as a night asleep on the wrist does
+    r = rhythm(hk["s"].to_numpy(), hk["h"].to_numpy(), hk["d"].to_numpy(), np.ones(hk.height, bool), min_days=min_days)
     if r is None:
         return None
     out = {k: r[k] for k in UNIT_FREE if k != "sleep_min"}

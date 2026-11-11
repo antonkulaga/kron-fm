@@ -92,6 +92,23 @@ rate 1e-4; nothing of Aurora-BP in training), then scored on all 1,220 Aurora-BP
 ridge head in the same band (7.78): **-0.57 to -1.22 y**, paired over people (three-seed ensemble 6.98, -0.44 to
 -1.15). It reads 25 Hz input; a 5 Hz-band version for 10 Hz watches is training.
 
+## Pretraining on finger and open wrist together (2026-11-11)
+
+Run c1 pretrained the encoder (run 4's recipe, 160k steps) on VitalDB finger PPG and every open wrist set at once,
+self-supervised, so no ages were used. With the encoder frozen and a ridge head fitted on the open wrist people only,
+the head was scored on Aurora-BP's 1,220 people, who were never used for fitting:
+
+| Encoder | Band | MAE (y) | 95 % CI | r | Paired against run 4 |
+|---|---|---|---|---|---|
+| run 4 (finger) | full | 7.78 | 7.41-8.14 | | |
+| c1 (finger + open wrist) | full | **6.61** | 6.30-6.92 | 0.67 | -1.16 (-1.46 to -0.86) |
+| run 4 (finger) | 5 Hz | 7.50 | 7.16-7.85 | 0.60 | |
+| c1 (finger + open wrist) | 5 Hz | 7.92 | 7.54-8.30 | 0.60 | +0.42 (+0.16 to +0.70) |
+
+The median guess scores 9.63. At 25 Hz, the Galaxy Watch's rate, the c1 frozen head is the best deployable model so
+far, below the fine-tuned run 4 encoder (6.88, not tested paired against it); one seed. Its predictions are still
+compressed toward the mean (slope 0.52). For a 10 Hz watch the 5 Hz run 4 head stays.
+
 ## Limits
 
 - The head learnt mostly from young people (20-35) plus 35 older AF patients; the test device is not Samsung.
