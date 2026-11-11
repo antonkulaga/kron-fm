@@ -28,6 +28,8 @@ MODEL = "kron-health"
 REFERENCE = {
     "activity_age": "NHANES 2011-2014 wrist monitor, 8,924 adults 18-80, 10-fold CV: MAE 11.9 y (11.7-12.1), r 0.61 "
                     "(median age 15.8); never checked on a watch's step counts",
+    "step_age": "NHANES 2005-2006, 4,467 adults 18-85, step counts in 10-minute bins (hip pedometer), 10-fold CV: "
+                "MAE 12.5 y (12.2-12.8), r 0.62 (median age 17.0)",
     "resting_hrv_age": "Autonomic Aging, 1,093 people 18-92 at supine rest: MAE 8.7 y (8.2-9.2), r 0.54 (median age 9.7): "
                        "barely past the median; read from sleep RR here, a different state (sleep raises HRV, so it reads young): "
                        "not to be read as a person's age",
@@ -127,6 +129,35 @@ def _activity(person_out: Path, export, days: int) -> dict:
     return {"estimate": float(m["model"].predict(x)[0]), "days": days, "inputs": days_in}
 
 
+def _steps(person_out: Path, days: int) -> dict:
+    import joblib
+    import polars as pl
+
+    from kron_health.steps import samsung
+
+    path = runs_dir(MODEL) / "steps-gbm" / "model.joblib"
+    if not path.is_file():
+        return {"note": "not fitted: scripts/kron_health/steps_eval.py"}
+    bins = person_out / "streams" / "step_bins.parquet"
+    if not bins.is_file():
+        return {"note": "no step bins (run the extractor's streams first)"}
+    steps = pl.read_parquet(bins)
+    start = steps["start"].max() - timedelta(days=days)
+    steps = steps.filter(pl.col("start") >= start)
+    feat = samsung(steps)
+    if feat is None:
+        return {"note": "fewer than 4 days with 10 worn hours"}
+    m = joblib.load(path)
+    x = np.array([[feat[k] for k in m["features"]]], float)
+    outside = [k for k, v, lo, hi in zip(m["features"], x[0], m["lo"], m["hi"]) if np.isfinite(v) and not lo <= v <= hi]
+    days_in = int(steps["start"].dt.date().n_unique())
+    if len(outside) >= 2:
+        return {"estimate": None, "days": days, "inputs": days_in, "outside_training_range": outside,
+                "note": "not read: the input lies outside the range the head was trained on"}
+    return {"estimate": float(m["model"].predict(x)[0]), "days": days, "inputs": days_in,
+            "outside_training_range": outside}
+
+
 def _hrv(export) -> dict:
     import joblib
 
@@ -200,7 +231,8 @@ def estimate(export_folder: Path = typer.Argument(..., help="the unpacked samsun
 
     export = Export(export_folder)
     person_out = export_folder.parent / "out"
-    result = {"activity_age": _activity(person_out, export, activity_days), "resting_hrv_age": _hrv(export),
+    result = {"activity_age": _activity(person_out, export, activity_days),
+              "step_age": _steps(person_out, activity_days), "resting_hrv_age": _hrv(export),
               "ecg_age": _ecg(export, probe)}
     if probe:
         from kron_ppg.probe_age import estimate as ppg

@@ -108,6 +108,10 @@ def nhanes_2005(folder: Path, min_age: float = 18.0, chunk: int = 2_000_000) -> 
 
     for part in pd.read_sas(xpt, format="xport", encoding="latin-1", chunksize=chunk):
         part = part.assign(SEQN=part.SEQN.astype(int))
+        # SAS transport stores zero as an IBM float that pandas decodes as ~5.4e-79, not 0: every "== 0" test
+        # (a minute without steps, a minute of zero intensity) would fail on it
+        num = part.select_dtypes("number").columns
+        part[num] = part[num].mask(part[num].abs() < 1e-30, 0.0)
         if pending is not None:
             part = pd.concat([pending, part])
         last = part.SEQN.iloc[-1]

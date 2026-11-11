@@ -123,3 +123,27 @@ def test_step_features_from_ten_minute_bins_match_across_sources():
     assert a is not None and set(FEATURES) <= set(a)
     assert all(abs(a[k] - b[k]) < 1e-9 for k in FEATURES)
     assert 0.05 < a["brisk"] < 0.1 and a["empty_daytime"] > 0.1 and 60 < a["best30"] < 120
+
+
+def test_workout_features_read_hr_at_speed_and_its_slope():
+    from kron_health.workout import FEATURES, person, session_features
+
+    t = np.arange(0, 1200, 1.0)
+    speed = np.clip(5 + t // 120, 5, 14).astype(float)  # a ramp: 2 min per km/h from 5 to 14
+    hr = 60 + 8 * np.interp(t - 30, t, speed)  # 8 bpm per km/h, 30 s behind
+    f = session_features(t, speed, hr)
+    assert f is not None and set(FEATURES) <= set(f)
+    assert abs(f["hr_speed_slope"] - 8) < 0.5 and abs(f["hr_at_10_fit"] - 140) < 3
+    assert abs(f["hr_at_8"] - 124) < 2 and abs(f["hr_at_12"] - 156) < 2
+    p = person([f, None, dict(f, hr_at_6=float("nan"))])
+    assert p["hr_at_8"] == f["hr_at_8"]
+
+
+def test_sas_transport_zero_is_read_as_zero():
+    # pandas decodes an XPORT zero as ~5.4e-79; the step reader must treat it as 0
+    import pandas as pd
+
+    part = pd.DataFrame({"SEQN": [1.0, 1.0], "PAXSTEP": [5.397605346934028e-79, 12.0]})
+    num = part.select_dtypes("number").columns
+    part[num] = part[num].mask(part[num].abs() < 1e-30, 0.0)
+    assert (part.PAXSTEP == 0).sum() == 1
