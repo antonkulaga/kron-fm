@@ -33,6 +33,14 @@ pool = "~/.config/agent-seat-blueprints/zulip/pool"
 [seat.dna-trainer.watch.desk]
 cmd = "sh kit:bin/py.sh kit:classes/desk/watch-answers.py kron-fm dna-trainer"
 
+# The DNA trainer's own jobs (v0.1.181), in place of JOB_PREFIX in the clone's untracked environment.
+[seat.dna-trainer.slurm]
+job_prefix = "kron-dna-"
+
+# One watcher for all of them: start, requeue, end with state and log (v0.1.182), in place of a watch per sbatch.
+[seat.dna-trainer.watch.jobs]
+cmd = "bash kit:drivers/slurm/watch-jobs.sh"
+
 # The cluster's queue at every start: this repository's jobs by job_prefix (the kit's DESIGN §20). slurm/submit.sh
 # names every job kron-<name>, so kron- is the whole repository: both trainers and the data loop. Each trainer's
 # clone narrows it to its own in its untracked environment, JOB_PREFIX=kron-ppg- or JOB_PREFIX=kron-dna- (the
