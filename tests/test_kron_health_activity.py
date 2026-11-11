@@ -91,3 +91,16 @@ def test_band_removes_wander_and_offset():
     # the wander dominates the raw strip's low frequencies and is gone from the filtered one
     lowf = lambda s: np.abs(np.fft.rfft(s, axis=-1))[:, 1:4].sum() / np.abs(np.fft.rfft(s, axis=-1)).sum()
     assert lowf(clean) < 0.2 * lowf(raw)
+
+
+def test_sdk_ecg_carries_the_lead_state_forward(tmp_path):
+    from kron_health.ecg import sdk_ecg
+
+    n = 500 * 24
+    lead = np.full(n, -1)
+    lead[::10] = 0
+    lead[:500 * 4:10] = 5  # the first 4 s off
+    pl.DataFrame({"timestamp_ms": np.arange(n) // 10 * 20, "ecg_mv": np.sin(np.arange(n) / 50) + 130,
+                  "lead_off": lead, "sequence": np.arange(n), "ppg_green": np.zeros(n)}).write_csv(tmp_path / "sdk_ecg.csv")
+    x = sdk_ecg(tmp_path)
+    assert x is not None and len(x) == 500 * 20

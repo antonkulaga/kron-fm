@@ -158,3 +158,25 @@ def load_code15(folder: Path, out: Path, min_age: float = 18.0) -> dict[str, np.
     out.parent.mkdir(parents=True, exist_ok=True)
     np.savez(out, **d)
     return d
+
+
+def sdk_ecg(run: Path, fs: float = 500.0) -> np.ndarray | None:
+    """The lead-on samples of a pulse-exploration probe run's ``sdk_ecg.csv`` (Samsung SDK, raw ``ecg_mv``, 500 Hz).
+
+    The SDK reports ``lead_off`` on the first row of each burst and -1 on the rest, so the state is carried forward
+    from the last reported value; only rows with the lead on (0) are kept. The signal is raw (an offset of about
+    130 mV, no filter): read it with a filtered head, ``strips(x, fs, filtered=True)``. None without enough samples.
+    """
+    import polars as pl
+
+    path = Path(run) / "sdk_ecg.csv"
+    if not path.is_file() or path.stat().st_size == 0:
+        return None
+    d = pl.read_csv(path, infer_schema_length=None)
+    if "ecg_mv" not in d.columns:
+        return None
+    if "lead_off" in d.columns:
+        d = d.with_columns(pl.when(pl.col("lead_off") >= 0).then(pl.col("lead_off")).forward_fill().alias("_lo"))
+        d = d.filter(pl.col("_lo") == 0)
+    x = d["ecg_mv"].cast(pl.Float64, strict=False).drop_nulls().to_numpy()
+    return x if len(x) >= int(fs * SECONDS) else None
