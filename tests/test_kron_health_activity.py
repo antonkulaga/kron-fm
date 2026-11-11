@@ -118,12 +118,13 @@ def test_step_features_from_ten_minute_bins_match_across_sources():
     steps = np.array([float(rng.integers(600, 1200)) if 9 <= t.hour < 12 else (50.0 if 12 <= t.hour < 20 else 0.0)
                       for t in starts])
     a = samsung(pl.DataFrame({"start": starts, "steps": steps}))
-    b = bin_features(np.array([(t - t0).days for t in starts]), np.array([t.hour for t in starts]), steps,
-                     np.ones(len(starts), bool))
+    day, hour = np.array([(t - t0).days for t in starts]), np.array([t.hour for t in starts])
+    moved = {(d, h) for d, h, x in zip(day, hour, steps) if x > 0}  # a worn hour has a bin with steps, as on NHANES
+    b = bin_features(day, hour, steps, np.array([(d, h) in moved for d, h in zip(day, hour)]))
     assert a is not None and set(FEATURES) <= set(a)
     assert all(abs(a[k] - b[k]) < 1e-9 for k in FEATURES)
-    # window 08-20: 72 bins a day, 18 of them 600-1200 steps (9-12 h), the 6 of 08 h empty
-    assert 0.05 < a["brisk"] < 0.15 and abs(a["empty_daytime"] - 6 / 72) < 1e-9 and 60 < a["best30"] < 120
+    # window 08-20: the 08 h bins hold no step, so that hour is not worn; 18 of the 66 worn bins are 600-1200 steps
+    assert 0.05 < a["brisk"] < 0.15 and a["empty_daytime"] == 0 and 60 < a["best30"] < 120
 
 
 def test_workout_features_read_hr_at_speed_and_its_slope():

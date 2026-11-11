@@ -28,8 +28,8 @@ MODEL = "kron-health"
 REFERENCE = {
     "activity_age": "NHANES 2011-2014 wrist monitor, 8,924 adults 18-80, 10-fold CV: MAE 11.9 y (11.7-12.1), r 0.61 "
                     "(median age 15.8); never checked on a watch's step counts",
-    "step_age": "NHANES 2005-2006, 4,467 adults 18-85, step counts in 10-minute bins (hip pedometer), 10-fold CV: "
-                "MAE 12.5 y (12.2-12.8), r 0.62 (median age 17.0)",
+    "step_age": "NHANES 2005-2006, 3,622 adults 18-85, step counts in 10-minute bins 08-20 h, worn time only (hip "
+                "pedometer), 10-fold CV: MAE 14.0 y (13.7-14.3), r 0.50 (median age 16.8)",
     "resting_hrv_age": "Autonomic Aging, 1,093 people 18-92 at supine rest: MAE 8.7 y (8.2-9.2), r 0.54 (median age 9.7): "
                        "barely past the median; read from sleep RR here, a different state (sleep raises HRV, so it reads young): "
                        "not to be read as a person's age",

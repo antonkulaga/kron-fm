@@ -14,7 +14,7 @@ and only worn time in them:
 * ``best30``: median over days of the best 30 minutes (three consecutive bins), steps per minute.
 
 A kept day has at least :data:`MIN_HOURS` worn hours in the window (NHANES: an hour with fewer than 60 minutes of
-zero intensity counts as worn; the watch: an hour with any bin). Two or more features outside the training range
+zero intensity counts as worn; the watch: an hour with a bin of one step or more). Two or more features outside the training range
 refuse the input, as for the activity head.
 """
 from __future__ import annotations
@@ -131,7 +131,9 @@ def samsung(step_bins: pl.DataFrame) -> dict[str, float] | None:
         return None
     full = pl.DataFrame({"b": pl.datetime_range(s["b"].min(), s["b"].max(), "10m", eager=True)})
     s = full.join(s, on="b", how="left")
-    worn_bin = s["steps"].is_not_null()
+    # NHANES counts an hour as worn when it has movement (under 60 minutes of zero intensity); a watch writes bins
+    # of zero steps while it lies on a desk, so a watch hour counts as worn only with a bin of one step or more
+    worn_bin = s["steps"].fill_null(0.0) > 0
     s = s.with_columns(worn_bin.alias("w"), pl.col("b").dt.truncate("1h").alias("h"))
     worn_hour = s.group_by("h").agg(pl.col("w").any().alias("wh"))
     s = s.join(worn_hour, on="h", how="left")
