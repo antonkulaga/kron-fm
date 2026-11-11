@@ -9,7 +9,9 @@ from kron_ppg.wrist_age import bootstrap, _r, json_safe
 
 out = Path(sys.argv[1]); out.mkdir(parents=True, exist_ok=True)
 steps = int(sys.argv[2]) if len(sys.argv) > 2 else 40000
-filtered = len(sys.argv) > 3 and sys.argv[3] == "filtered"  # 0.5-40 Hz on every strip, as kron_health.ecg.strips(filtered=True)
+flags = set(sys.argv[3:])
+filtered = "filtered" in flags  # 0.5-40 Hz on every strip, as kron_health.ecg.strips(filtered=True)
+combined = "combined" in flags  # also train on PTB-XL folds 1-8 (its fold 10 stays the test), for a head across cohorts
 d = load_code15(Path("data/input/health/code15"), Path("data/interim/health/code15/lead1.npz"))
 x, age, pat = d["x"], d["age"], d["patient"]
 def filt(a):
@@ -23,6 +25,14 @@ ptb = dict(np.load("data/interim/health/ptb_xl/lead1.npz", allow_pickle=True))
 if filtered:
     ptb["x"] = filt(ptb["x"])
 pte = ptb["fold"] == 10
+if combined:  # PTB-XL's training folds join the training strips; CODE-15% patients and PTB-XL folds 9-10 stay out
+    ptr = ptb["fold"] <= 8
+    x = np.concatenate([x, ptb["x"][ptr].astype(x.dtype)])
+    age = np.concatenate([age, ptb["age"][ptr].astype(age.dtype)])
+    pat = np.concatenate([pat, -1 - ptb["patient"][ptr].astype(pat.dtype)])  # negative ids: never a CODE-15% patient
+    tr = np.concatenate([tr, np.ones(ptr.sum(), bool)])
+    va = np.concatenate([va, np.zeros(ptr.sum(), bool)])
+    te = np.concatenate([te, np.zeros(ptr.sum(), bool)])
 dev = torch.device("cuda"); torch.manual_seed(0)
 m = ECGAge(width=64, mean=float(age[tr].mean()), scale=float(age[tr].std())).to(dev)
 opt = torch.optim.AdamW(m.parameters(), lr=1e-3, weight_decay=1e-2)
@@ -48,7 +58,7 @@ for step in range(1, steps + 1):
         print(f"step {step} loss {loss.item():.2f} val MAE {v:.2f} ({time.time() - t0:.0f}s)", flush=True)
         if v < best: best, state = v, {k: t.clone() for k, t in m.state_dict().items()}
 m.load_state_dict(state)
-res = {"val_best_mae": best, "steps": steps, "filtered": filtered}
+res = {"val_best_mae": best, "steps": steps, "filtered": filtered, "combined": combined}
 def per_patient(pred, y, p, base):
     u = np.unique(p); pp = np.array([pred[p == k].mean() for k in u]); yy = np.array([y[p == k].mean() for k in u])
     err = {"model": np.abs(pp - yy), "constant": np.abs(base - yy)}
