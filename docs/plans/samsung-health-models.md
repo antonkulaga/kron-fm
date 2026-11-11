@@ -43,3 +43,21 @@ LifeSnaps (71 people, Fitbit, age only under/over 30) serves to test the readers
 
 Dataset survey and access steps: kept beside the trainer's brief (they name contacts); summarised in the trainer's
 status file.
+
+## First results (2026-11-11; scripts in `scripts/kron_health/`)
+
+Per person, held-out people (10-fold CV, or PTB-XL's patient-wise test fold), 95 % intervals from bootstrap over
+people, against the training folds' median age; shuffled ages as the null.
+
+| Head | Cohort | People, ages | MAE (y) | Median age | r |
+|---|---|---|---|---|---|
+| Activity (hourly rhythm, unit-free), boosting | NHANES 2011-2014 wrist monitor | 8,924, 18-80 | 11.88 (11.71-12.05) | 15.82 | 0.61 |
+| Activity, with the daily total (device units) | same | | 11.41 | 15.82 | 0.65 |
+| ECG, lead I 10 s, 1D ResNet | PTB-XL test fold | 1,861 patients, 18-89 | 9.37 (9.03-9.71) | 13.93 | 0.72 |
+| Resting HRV (5-min features), boosting with sex | Autonomic Aging | 1,093, 18-92 (age groups) | 8.70 (8.20-9.20) | 9.66 | 0.54 |
+
+Checks: activity's clock alignment (the least active 5 h falls at night for 96 %); HRV's beat detection (two ECG
+leads agree: HR to 0.00 bpm median, RMSSD to 0.9 ms median, over 617 records). The HRV head barely beats the median
+(ridge: -1.09 to -0.05 y), in a cohort that is 64 % under 30 and at supine rest, not asleep: the night head waits on
+NSRR. All three are far from the published bars (3.7, 6.9, 5.6 y); the next data are minute-level activity
+(UK Biobank), CODE-15% for the ECG, and the NSRR nights.
