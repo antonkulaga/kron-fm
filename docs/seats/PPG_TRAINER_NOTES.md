@@ -41,4 +41,4 @@ secretary on the maintainer's word).
 
 ## Items to file
 - filed: kit #422 (until-event ends on watch-job's armed banner); a plain until-loop on squeue meanwhile.
-- `unattended`: fold `wrist_probe.py` (14ab76c, another session, AUC targets, paired encoder differences) and `wrist_age.py` into one module, keeping both CLIs; watch-data told 2026-11-11.
+- `canceled: both work and are tested; they share only a ridge fit, and a merge risks two CLIs for no gain` (2026-11-11): fold `wrist_probe.py` (14ab76c, another session) and `wrist_age.py` into one module.
