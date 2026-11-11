@@ -49,3 +49,29 @@ def test_windows_pass_the_gate_at_the_pulse_rate(tmp_path):
     w, starts, tally = probe_windows(read_hr_raw(_run(tmp_path)))
     assert tally["accepted"] >= 5 and w.shape[1] == 750
     assert abs(tally["median_hr_bpm"] - 66) < 4 and tally["median_periodicity"] > 0.6
+
+
+def test_a_short_run_still_gives_its_window(tmp_path):
+    # 44 s with the first second off the wrist: one 30 s window starts at the first on-wrist sample
+    w, _, tally = probe_windows(read_hr_raw(_run(tmp_path, seconds=44.0)))
+    assert tally["candidates"] == 1 and tally["accepted"] == 1
+
+
+def test_sdk_green_reads_upright_and_its_duplicate_stamps_spread(tmp_path):
+    from kron_ppg.probe_age import read_sdk
+
+    rng = np.random.default_rng(3)
+    t = np.arange(0, 120, 0.04)
+    green = 50000 - 800 * _pulse(t) + 20 * rng.standard_normal(len(t))  # light drops at systole
+    ms = (np.floor(t * 1000 / 8) * 8).astype(np.int64)  # several samples share a millisecond stamp now and then
+    run = tmp_path / "sdk"
+    run.mkdir()
+    pl.DataFrame({"timestamp_ms": ms, "wall_ms": ms, "green": green, "green_status": np.zeros(len(t), int),
+                  "ir": green, "ir_status": np.zeros(len(t), int), "red": green,
+                  "red_status": np.zeros(len(t), int)}).write_csv(run / "sdk_ppg.csv")
+    rec = read_sdk(run, "sdk_ppg")
+    assert rec is not None and rec.fs == 25.0 and rec.sign == -1.0
+    d = np.diff(rec.x[rec.valid])
+    assert np.percentile(d, 99) > -np.percentile(d, 1)  # systole up
+    w, _, tally = probe_windows(rec)
+    assert tally["accepted"] >= 3

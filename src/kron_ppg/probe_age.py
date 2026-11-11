@@ -75,16 +75,124 @@ def read_hr_raw(run: Path, fs: float = FS) -> ProbeRun:
     return ProbeRun(run.name, x, valid, fs, float(valid.sum() / fs), sign)
 
 
+#: The probe's optical sources, best first: the SDK's on-demand 100 Hz green, its continuous 25 Hz green, the
+#: Android hr_raw AC channel, and the green channel the SDK records beside its ECG.
+SOURCES = ("sdk_ppg100", "sdk_ppg", "hr_raw", "sdk_ecg")
+
+
+def _spread_duplicates(ts: np.ndarray) -> np.ndarray:
+    """Per-sample times where the SDK stamps several samples with the same millisecond (as the probe does)."""
+    if len(ts) < 3 or np.all(np.diff(ts) > 0):
+        return ts
+    idx = np.arange(len(ts))
+    first = np.r_[True, np.diff(ts) != 0]
+    ai, at = idx[first], ts[first]
+    if len(ai) < 2:
+        return ts
+    step = float(np.median(np.diff(at) / np.diff(ai)))
+    out = np.interp(idx, ai, at)
+    tail = idx > ai[-1]
+    out[tail] = at[-1] + (idx[tail] - ai[-1]) * step
+    return out
+
+
+def upright_sign(x: np.ndarray, fs: float) -> float:
+    """+1 when systole points up already: the derivative's upper 2 % tail longer than its lower (fast rise)."""
+    ok = np.isfinite(x)
+    if ok.sum() < 4 * fs:
+        return 1.0
+    y = bandpass(np.where(ok, x - np.nanmedian(x), 0.0), fs)
+    d = np.diff(y[ok])
+    return 1.0 if np.percentile(d, 98) >= -np.percentile(d, 2) else -1.0
+
+
+def read_sdk(run: Path, alias: str) -> ProbeRun | None:
+    """An SDK green channel (``sdk_ppg``, ``sdk_ppg100``: ``green`` with ``green_status``; ``sdk_ecg``: ``ppg_green``)
+    on a uniform grid at its own rate, systole up. None when the file is missing or holds no usable samples."""
+    path = Path(run) / f"{alias}.csv"
+    if not path.is_file() or path.stat().st_size == 0:
+        return None
+    df = pl.read_csv(path, infer_schema_length=None)
+    col = "ppg_green" if alias == "sdk_ecg" else "green"
+    if df.is_empty() or col not in df.columns or "timestamp_ms" not in df.columns:
+        return None
+    t = _spread_duplicates(df["timestamp_ms"].cast(pl.Float64).to_numpy())
+    t = (t - t[0]) / 1000.0
+    g = df[col].cast(pl.Float64, strict=False).to_numpy()
+    ok = np.isfinite(g)
+    if "green_status" in df.columns:
+        ok &= df["green_status"].cast(pl.Float64, strict=False).fill_null(0).to_numpy() == 0
+    if ok.sum() < 10:
+        return None
+    dt = float(np.median(np.diff(t[ok])))
+    if not np.isfinite(dt) or dt <= 0:
+        return None
+    fs = float(round(1.0 / dt))
+    grid = np.arange(0.0, t[-1], 1 / fs)
+    idx = np.clip(np.searchsorted(t, grid), 1, len(t) - 1)
+    near = np.where(np.abs(t[idx] - grid) < np.abs(t[idx - 1] - grid), idx, idx - 1)
+    valid = ok[near] & (np.abs(t[near] - grid) <= 1.5 / fs)
+    x = np.interp(grid, t[ok], g[ok])
+    if alias == "sdk_ecg":
+        # the ECG recording's green may repeat each optical sample over several ECG rows: keep its own rate
+        changes = np.flatnonzero(np.diff(g[ok]) != 0)
+        if len(changes) > 10:
+            step = float(np.median(np.diff(t[ok][changes])))
+            if step > 1.5 * dt:
+                fs = float(round(1.0 / step))
+                grid = np.arange(0.0, t[-1], 1 / fs)
+                x = np.interp(grid, t[ok], g[ok])
+                idx = np.clip(np.searchsorted(t, grid), 1, len(t) - 1)
+                valid = ok[idx]
+        sign = upright_sign(np.where(valid, x, np.nan), fs)
+    else:
+        sign = -1.0  # raw green light drops at systole, as the probe's own analysis reads it
+    x = sign * x
+    x[~valid] = np.nan
+    return ProbeRun(f"{Path(run).name}:{alias}", x, valid, fs, float(valid.sum() / fs), sign)
+
+
+def _valid_windows(valid: np.ndarray, size: int) -> list[int]:
+    """Starts of non-overlapping ``size``-sample windows inside each run of valid samples, from the run's start."""
+    starts, i, n = [], 0, len(valid)
+    while i < n:
+        if not valid[i]:
+            i += 1
+            continue
+        j = i
+        while j < n and valid[j]:
+            j += 1
+        starts += list(range(i, j - size + 1, size))
+        i = j
+    return starts
+
+
 def probe_windows(run: ProbeRun, seconds: float = 30.0, target_fs: float = FS
                   ) -> tuple[np.ndarray, np.ndarray, dict]:
     """The run's quality-gated, robust-scaled windows ``(N, L)``, their starts (s), and the gate's tally."""
     if len(run.x) == 0:
         return np.zeros((0, int(seconds * target_fs)), np.float32), np.zeros(0), {"candidates": 0, "accepted": 0}
-    y, ok = prepare_signal(run.x, run.fs, target_fs)
+    from kron_ppg.signal import MAX_SCALED_ABS, quality, robust_scale
+
+    y, ok = prepare_signal(np.nan_to_num(run.x), run.fs, target_fs)
+    if len(y) == 0:
+        return np.zeros((0, int(seconds * target_fs)), np.float32), np.zeros(0), {"candidates": 0, "accepted": 0}
+    # the run's own invalid samples (off the wrist, status != 0) on the target grid
+    src = np.minimum(np.round(np.arange(len(y)) * run.fs / target_fs).astype(int), len(run.valid) - 1)
+    ok = ok & run.valid[src]
     size = int(round(seconds * target_fs))
-    candidates = sum(1 for s in range(0, len(y) - size + 1, size) if ok[s:s + size].all())
-    w, starts, quals = cut_windows(y, ok, target_fs, seconds, seconds)
-    tally = {"candidates": candidates, "accepted": int(len(w)),
+    cand = _valid_windows(ok, size)
+    w, starts, quals = [], [], []
+    for st in cand:
+        seg = robust_scale(y[st:st + size])
+        q = quality(seg, target_fs, max_abs=MAX_SCALED_ABS)
+        if q.ok:
+            w.append(seg.astype(np.float32))
+            starts.append(st / target_fs)
+            quals.append(q)
+    w = np.stack(w) if w else np.zeros((0, size), np.float32)
+    starts = np.asarray(starts)
+    tally = {"candidates": len(cand), "accepted": int(len(w)),
              "median_hr_bpm": float(np.median([q.hr_bpm for q in quals])) if quals else None,
              "median_periodicity": float(np.median([q.periodicity for q in quals])) if quals else None}
     return w, starts, tally
@@ -101,11 +209,23 @@ def estimate(runs: list[Path], model_run: Path, device: str = "cuda", seconds: f
     encoder = load_encoder(head["encoder"], device)
     per_run, all_windows = [], []
     for r in runs:
-        rec = read_hr_raw(Path(r))
-        w, starts, tally = probe_windows(rec, seconds)
-        per_run.append({"run": rec.name, "seconds_on_wrist": rec.seconds_on_wrist, "ac_sign": rec.sign, **tally})
-        if len(w):
-            all_windows.append(lowpass(w, FS, cutoff) if cutoff else w)
+        best = None
+        for alias in SOURCES:
+            if alias == "hr_raw":
+                rec = read_hr_raw(Path(r)) if (Path(r) / "hr_raw.csv").is_file() else None
+            else:
+                rec = read_sdk(Path(r), alias)
+            if rec is None:
+                continue
+            w, starts, tally = probe_windows(rec, seconds)
+            entry = {"run": Path(r).name, "source": alias, "fs": rec.fs, "seconds_valid": rec.seconds_on_wrist,
+                     "sign": rec.sign, **tally, "used": False}
+            per_run.append(entry)
+            if best is None and len(w):
+                best = (entry, w)
+        if best is not None:  # one source per run, the best that passed: the same seconds are never counted twice
+            best[0]["used"] = True
+            all_windows.append(lowpass(best[1], FS, cutoff) if cutoff else best[1])
     out = {"model": str(model_run), "band_hz": [0.5, cutoff or 8.0], "runs": per_run,
            "windows": int(sum(len(w) for w in all_windows))}
     if not all_windows:
