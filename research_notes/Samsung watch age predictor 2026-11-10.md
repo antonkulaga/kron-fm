@@ -84,6 +84,14 @@ Active 2 and Vilnius the difference is within noise. The same probe reads PulseW
 AUC 0.77 (0.64-0.89) with run 4, 0.76 with w1, against 0.72 for an untrained twin. The deployable predictor stays on run 4, which also carries no data of unknown terms (PulseWatch's are not yet known).
 More wrist pretraining is not where the next gain is: the head's training people (214, mostly 20-35) are.
 
+## Fine-tuning on the open watch data (2026-11-11)
+
+The encoder and an age head fine-tuned end to end on the same open wrist sets (214 people, 3,000 steps, learning
+rate 1e-4; nothing of Aurora-BP in training), then scored on all 1,220 Aurora-BP people, full band:
+**MAE 6.88 y (6.56-7.19), r 0.68**; three seeds 6.88 / 7.09 / 7.27 (7.08 +- 0.19). Against the frozen encoder with a
+ridge head in the same band (7.78): **-0.57 to -1.22 y**, paired over people (three-seed ensemble 6.98, -0.44 to
+-1.15). It reads 25 Hz input; a 5 Hz-band version for 10 Hz watches is training.
+
 ## Limits
 
 - The head learnt mostly from young people (20-35) plus 35 older AF patients; the test device is not Samsung.
