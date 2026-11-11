@@ -90,3 +90,57 @@ class ECGAge(nn.Module):
         h = self.body(self.stem(x.unsqueeze(1)))
         pooled = torch.cat([h.mean(-1), h.amax(-1)], dim=-1)
         return self.mean + self.scale * self.head(pooled).squeeze(-1)
+
+
+def load_code15(folder: Path, out: Path, min_age: float = 18.0) -> dict[str, np.ndarray]:
+    """Lead I of every CODE-15% exam as one 10 s strip at 250 Hz, cached in ``out`` (an ``.npz``).
+
+    Each ``exams_partN.zip`` holds one HDF5 file with ``tracings`` ``(n, 4096, 12)`` at 400 Hz (10 s, zero-padded to
+    4096; lead order DI, DII, ...) and ``exam_id``; ``exams.csv`` gives age, sex and the patient. Parts are unpacked
+    one at a time into a scratch folder beside ``out`` and removed after reading.
+    """
+    import tempfile
+    import zipfile
+
+    import h5py
+    import polars as pl
+    from scipy.signal import resample_poly
+
+    folder, out = Path(folder), Path(out)
+    if out.is_file():
+        return dict(np.load(out, allow_pickle=False))
+    out.parent.mkdir(parents=True, exist_ok=True)
+    meta = pl.read_csv(folder / "exams.csv", infer_schema_length=None)
+    info = {int(r["exam_id"]): r for r in meta.iter_rows(named=True)}
+    xs, ages, males, patients, exams = [], [], [], [], []
+    for part in sorted(folder.glob("exams_part*.zip")):
+        with tempfile.TemporaryDirectory(dir=out.parent) as tmp, zipfile.ZipFile(part) as z:
+            name = next(n for n in z.namelist() if n.endswith(".hdf5"))
+            z.extract(name, tmp)
+            with h5py.File(Path(tmp) / name, "r") as h:
+                ids = h["exam_id"][:]
+                tr = h["tracings"]
+                for start in range(0, len(ids), 4096):
+                    block = tr[start:start + 4096, :, 0].astype(np.float64)  # lead I
+                    for j, eid in enumerate(ids[start:start + 4096]):
+                        r = info.get(int(eid))
+                        if r is None or r["age"] is None or r["age"] < min_age:
+                            continue
+                        x = block[j]
+                        nz = np.flatnonzero(x != 0)
+                        if len(nz) < 3800:  # padding or a flat lead
+                            continue
+                        x = x[nz[0]:nz[0] + 4000]
+                        if len(x) < 4000:
+                            continue
+                        xs.append(robust(resample_poly(x, 5, 8)[None, :LENGTH])[0].astype(np.float16))
+                        ages.append(float(r["age"]))
+                        males.append(bool(r["is_male"]))
+                        patients.append(int(r["patient_id"]))
+                        exams.append(int(eid))
+        print(f"{part.name}: {len(xs)} strips so far", flush=True)
+    d = {"x": np.stack(xs), "age": np.asarray(ages, np.float32), "male": np.asarray(males),
+         "patient": np.asarray(patients), "exam": np.asarray(exams)}
+    out.parent.mkdir(parents=True, exist_ok=True)
+    np.savez(out, **d)
+    return d
