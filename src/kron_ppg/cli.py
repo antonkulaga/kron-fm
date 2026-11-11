@@ -129,6 +129,8 @@ def clock(sources: list[str] = typer.Argument(..., help="prepared sources with a
           encoder: Path | None = typer.Option(None, help="a pretraining checkpoint; none trains from scratch"),
           freeze: bool = typer.Option(False, help="train the head only (a probe of the pretrained encoder)"),
           healthy_only: bool = typer.Option(False, help="learn age from healthy people only; test on everyone"),
+          lowpass: float | None = typer.Option(None, help="remove frequencies above this many Hz from every window "
+                                               "(5: what a 10 Hz watch keeps)"),
           out: Path | None = typer.Option(None, help="run folder (default data/output/runs/kron-ppg/...)"),
           sample_rate: float = 25.0, seconds: float = 30.0, patch: int = 5, d_model: int = 256, n_heads: int = 4,
           n_layers: int = 6, ff_units: int = 768, dropout: float = 0.1,
@@ -142,7 +144,8 @@ def clock(sources: list[str] = typer.Argument(..., help="prepared sources with a
     out = out or runs_dir(MODEL) / run_name("clock", tag, *sources)
     config = _config(sample_rate, patch, d_model, n_heads, n_layers, ff_units, dropout, 5)
     result = fit_clock(ClockArgs(folders, out, encoder, config, freeze, batch_size, steps, lr, head_lr,
-                                 eval_every=eval_every, seed=seed, device=device, healthy_only=healthy_only))
+                                 eval_every=eval_every, seed=seed, device=device, healthy_only=healthy_only,
+                                 lowpass_hz=lowpass))
     from kron_ppg.clock import json_safe
 
     typer.echo(json.dumps(json_safe({k: result[k] for k in ("best_step", "val", "test", "outcomes")}), indent=2))
@@ -252,6 +255,12 @@ def evaluate(run: Path = typer.Argument(..., help="a clock run folder (or its ch
     model = load_clock(ckpt, dev)
     bias = torch.load(ckpt, map_location="cpu", weights_only=True)["bias"]
     pool = Pool.load(_variants(sources, model.encoder.config.sample_rate, seconds))
+    config = (ckpt.parent / "config.json")
+    cutoff = json.loads(config.read_text()).get("lowpass_hz") if config.is_file() else None
+    if cutoff:  # the band the clock was trained in
+        from kron_ppg.train import lowpass_pool
+
+        lowpass_pool(pool, cutoff)
     idx = np.flatnonzero(np.isfinite(pool.age))
     subj = predict(model, pool, idx, batch_size, dev)
     pred = np.array([p for p, _, _ in subj.values()])

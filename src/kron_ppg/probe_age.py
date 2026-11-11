@@ -232,6 +232,8 @@ def estimate(runs: list[Path], model_run: Path, device: str = "cuda", seconds: f
         from kron_ppg.train import load_clock
 
         head, clock = None, load_clock(model_run / "checkpoint.pt", device)
+        if (model_run / "config.json").is_file():  # a clock trained in a narrower band reads in that band
+            cutoff = json.loads((model_run / "config.json").read_text()).get("lowpass_hz") or cutoff
     per_run, all_windows = [], []
     for r in runs:
         best = None

@@ -12,6 +12,11 @@ run, source, seconds, out = Path(sys.argv[1]), sys.argv[2], float(sys.argv[3]), 
 dev = torch.device("cuda")
 m = load_clock(run / "checkpoint.pt", dev)
 pool = Pool.load([variant_dir(source, m.encoder.config.sample_rate, seconds)])
+cfg = run / "config.json"
+cutoff = json.loads(cfg.read_text()).get("lowpass_hz") if cfg.is_file() else None
+if cutoff:  # the band the clock was trained in
+    from kron_ppg.train import lowpass_pool
+    lowpass_pool(pool, cutoff)
 idx = np.flatnonzero(np.isfinite(pool.age))
 subj = predict(m, pool, idx, 256, dev)
 f = pl.DataFrame({"subject": list(subj), "predicted": [v[0] for v in subj.values()], "age": [v[1] for v in subj.values()]})

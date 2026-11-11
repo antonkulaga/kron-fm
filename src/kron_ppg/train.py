@@ -45,6 +45,14 @@ def _check_rate(pool: Pool, config: KronPPGConfig) -> None:
                          "prepare them at the model's rate")
 
 
+def lowpass_pool(pool: Pool, cutoff: float) -> None:
+    """Make ``pool.window`` return each window with every frequency above ``cutoff`` Hz removed."""
+    from kron_ppg.wrist_age import lowpass
+
+    raw = pool.window
+    pool.window = lambda i: lowpass(raw(i)[None], pool.sample_rate, cutoff)[0]
+
+
 def load_encoder(path: str | Path, device: torch.device | str = "cpu") -> KronPPG:
     """An encoder from a pretraining or clock checkpoint."""
     ckpt = torch.load(path, map_location="cpu", weights_only=True)
@@ -190,6 +198,9 @@ class ClockArgs:
     #: usual aging-clock design: train and validation (which fits the bias) are healthy, test is everyone,
     #: so the test gap says whether the unhealthy read older than healthy aging predicts
     healthy_only: bool = False
+    #: remove every frequency above this many Hz from each window first (5: what a 10 Hz watch keeps); the run's
+    #: config.json records it, and evaluate and probe-age apply it again
+    lowpass_hz: float | None = None
 
 
 def _eval_index(pool: Pool, idx: np.ndarray, per_subject_cap: int, seed: int) -> np.ndarray:
@@ -223,6 +234,8 @@ def fit_clock(a: ClockArgs) -> dict:
     torch.manual_seed(a.seed)
     dev = torch.device(a.device)
     pool = Pool.load(a.folders)
+    if a.lowpass_hz:
+        lowpass_pool(pool, a.lowpass_hz)
     encoder = load_encoder(a.encoder, dev) if a.encoder else KronPPG(a.config).to(dev)
     config = encoder.config
     _check_rate(pool, config)
@@ -248,7 +261,7 @@ def fit_clock(a: ClockArgs) -> dict:
     a.out.mkdir(parents=True, exist_ok=True)
     eval_idx = {k: _eval_index(pool, v, a.eval_windows_per_subject, a.seed) for k, v in split.items()}
     record = {"task": "clock", "model": config.to_dict(), "encoder": str(a.encoder) if a.encoder else None,
-              "freeze": a.freeze, "healthy_only": a.healthy_only, "data": [str(f) for f in a.folders], "lr": a.lr, "head_lr": a.head_lr,
+              "freeze": a.freeze, "healthy_only": a.healthy_only, "lowpass_hz": a.lowpass_hz, "data": [str(f) for f in a.folders], "lr": a.lr, "head_lr": a.head_lr,
               "batch_size": a.batch_size, "steps": a.steps, "seed": a.seed,
               "windows": {k: int(len(v)) for k, v in split.items()},
               "subjects": {k: int(len(set(pool.subject[v]))) for k, v in split.items()},
