@@ -25,8 +25,19 @@ def robust(x: np.ndarray) -> np.ndarray:
     return ((x - med) / np.maximum((q75 - q25) / 1.349, 1e-6)).astype(np.float32)
 
 
-def strips(ecg: np.ndarray, fs: float) -> np.ndarray:
-    """A recording at ``fs`` as robust-scaled 10 s strips at 250 Hz, ``(n, 2500)``; the tail shorter than 10 s is dropped."""
+def band(x: np.ndarray, lo: float = 0.5, hi: float = 40.0) -> np.ndarray:
+    """Each 250 Hz strip band-passed (zero-phase Butterworth, order 2) and robust-scaled again: baseline wander and the
+    offset of an unfiltered recorder (a watch SDK's raw ECG) go, so a head reads the waveform, not the drift."""
+    from scipy.signal import butter, sosfiltfilt
+
+    sos = butter(2, [lo, hi], btype="band", fs=FS, output="sos")
+    y = sosfiltfilt(sos, np.asarray(x, np.float64), axis=-1, padtype="odd", padlen=min(3 * FS, x.shape[-1] - 1))
+    return robust(y)
+
+
+def strips(ecg: np.ndarray, fs: float, filtered: bool = False) -> np.ndarray:
+    """A recording at ``fs`` as robust-scaled 10 s strips at 250 Hz, ``(n, 2500)``; the tail shorter than 10 s is
+    dropped. With ``filtered``, each strip is also band-passed 0.5-40 Hz (:func:`band`), as the filtered heads read."""
     from scipy.signal import resample_poly
 
     x = np.nan_to_num(np.asarray(ecg, float))
@@ -36,7 +47,10 @@ def strips(ecg: np.ndarray, fs: float) -> np.ndarray:
         g = gcd(int(fs), FS)
         x = resample_poly(x, FS // g, int(fs) // g)
     n = len(x) // LENGTH
-    return robust(x[: n * LENGTH].reshape(n, LENGTH)) if n else np.zeros((0, LENGTH), np.float32)
+    if not n:
+        return np.zeros((0, LENGTH), np.float32)
+    out = robust(x[: n * LENGTH].reshape(n, LENGTH))
+    return band(out) if filtered else out
 
 
 def load_ptbxl(folder: Path, min_age: float = 18.0) -> dict[str, np.ndarray]:

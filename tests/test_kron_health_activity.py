@@ -76,3 +76,18 @@ def test_ecg_strips_and_model_shapes():
     assert s.shape == (3, LENGTH) and abs(float(np.median(s))) < 0.1
     m = ECGAge(width=8)
     assert m(torch.from_numpy(s)).shape == (3,)
+
+
+def test_band_removes_wander_and_offset():
+    from kron_health.ecg import strips
+
+    t = np.arange(7500) / 250
+    beat = np.zeros_like(t)
+    beat[(np.arange(0, 7500, 200))] = 1.0
+    ecg = np.convolve(beat, np.hanning(15), mode="same") + 130.0 + 3.0 * np.sin(2 * np.pi * 0.1 * t)  # offset + wander
+    raw = strips(ecg, 250.0)
+    clean = strips(ecg, 250.0, filtered=True)
+    assert raw.shape == clean.shape == (3, 2500)
+    # the wander dominates the raw strip's low frequencies and is gone from the filtered one
+    lowf = lambda s: np.abs(np.fft.rfft(s, axis=-1))[:, 1:4].sum() / np.abs(np.fft.rfft(s, axis=-1)).sum()
+    assert lowf(clean) < 0.2 * lowf(raw)
