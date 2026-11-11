@@ -69,6 +69,18 @@ SOURCES: dict[str, Source] = {
                "CDC/NCHS National Health and Nutrition Examination Survey 2005-2006, Physical Activity Monitor (PAXRAW_D).",
                "https://wwwn.cdc.gov/nchs/nhanes/",
                {"format": "zip of SAS transport (xpt)", "approx_mb": 475}),
+        Source("treadmill_malaga", DOMAIN,
+               "Treadmill maximal exercise tests (University of Malaga): 992 graded tests of 857 people aged 10-63 with "
+               "time-stamped heart rate, speed and gas exchange (VO2, VCO2), age, sex, height, weight: the workout head "
+               "(heart rate against running speed, as a watch records a run)",
+               (RemoteFile(f"{PHYSIONET}/treadmill-exercise-cardioresp/treadmill-maximal-exercise-tests-from-the-"
+                           "exercise-physiology-and-human-performance-lab-of-the-university-of-malaga-1.0.1.zip",
+                           "treadmill-1.0.1.zip", 6_572_835),),
+               "PhysioNet Contributor Review Health Data License 1.5.0",
+               "Mongin D, Garcia Romero J, Alvero Cruz JR (2021) Treadmill maximal exercise tests from the Exercise "
+               "Physiology and Human Performance Lab of the University of Malaga. PhysioNet, doi 10.13026/7ezk-j442.",
+               "https://physionet.org/content/treadmill-exercise-cardioresp/1.0.1/",
+               {"format": "zip of csv", "approx_mb": 7}),
         Source("nhanes_pam", DOMAIN,
                "NHANES 2011-2014 wrist activity monitor (ActiGraph GT3X+, 7 days): hourly and daily MIMS summaries with "
                "wear and sleep-wake flags, and demographics (age top-coded at 80) for ~14,000 people aged 6-80: the "
