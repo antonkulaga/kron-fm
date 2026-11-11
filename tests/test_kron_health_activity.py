@@ -50,3 +50,29 @@ def test_samsung_step_bins_sum_to_hours():
     f = samsung(bins, sleeps)
     assert f is not None and f["sleep_min"] == 420.0
     assert abs(f["share_h12"] - 1 / 9) < 1e-9 and f["share_h03"] == 0.0
+
+
+def test_hrv_features_on_a_known_series():
+    from kron_health.hrv import age_mid, features
+
+    rng = np.random.default_rng(1)
+    t = np.arange(0, 1200, 0.25)
+    rr = 1000 + 30 * np.sin(2 * np.pi * 0.25 * np.cumsum(np.full(1200, 1.0))) + rng.normal(0, 5, 1200)  # HF-ish beat-to-beat swing
+    rr[[50, 400]] = [2600.0, 280.0]
+    f = features(rr)
+    assert f is not None and f["segments"] >= 3 and f["kept_fraction"] < 1.0
+    assert abs(f["hr"] - 60) < 1 and f["rmssd"] > 20 and 0.0 < f["dfa_a1"] < 1.5
+    assert f["sd1"] > 0 and f["sd2"] > 0
+    assert age_mid(1) == 18.5 and age_mid(15) == 88.5
+
+
+def test_ecg_strips_and_model_shapes():
+    import torch
+
+    from kron_health.ecg import LENGTH, ECGAge, strips
+
+    x = np.sin(np.arange(15000) / 500 * 2 * np.pi * 1.2) * 0.8 + 3.0
+    s = strips(x, 500.0)
+    assert s.shape == (3, LENGTH) and abs(float(np.median(s))) < 0.1
+    m = ECGAge(width=8)
+    assert m(torch.from_numpy(s)).shape == (3,)
