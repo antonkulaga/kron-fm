@@ -34,6 +34,9 @@ roles = "trainer"
 role = "trainer"
 presence = false
 wake_from = "desk-antonkulaga/rigger */secretary"
+# A person's post anywhere in the repository's channel wakes this seat (Anton, 2026-11-11); it answers what is
+# about kron-dna, and leaves a post about neither trainer to the ppg-trainer.
+wake_people = "kron-fm"
 
 [seat.dna-trainer.zulip]
 pool = "~/.config/agent-seat-blueprints/zulip/pool"
