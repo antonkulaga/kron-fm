@@ -61,6 +61,9 @@ spread over a day or two; more helps.
   watch.
 - **Size:** int8 dynamic quantisation gives 7.6 MB but moves the age by 0.3-1.3 y on a test stream: not to ship
   until checked on real readings; fp16 (~12 MB) is the next thing to try.
+- **The c1 clock (2026-11-11)** exports the same way: 24 MB fp32, 15 ms per 5 s chunk, 11 CPU-s per hour, within
+  0.035 y of the window path (full-band recipe, band-pass 0.5-8 Hz). Its int8 graph moves the age by 5.3 y: int8 is
+  out for it. The two-encoder average runs two such graphs (48 MB, about 30 ms per chunk).
 - **Ways onto the watch:** ONNX Runtime Mobile in a Wear OS app (Kotlin/Java API), or convert to TFLite. Raw green
   PPG needs Samsung's Health Sensor SDK (Galaxy Watch4 and later, partner approval), which is said to give green PPG at
   25 Hz (not yet checked here); the Active 2 runs Tizen and is not reached this way.
