@@ -140,7 +140,8 @@ corpus (it saw no ClinVar labels):
 | hierarchical (human, 15k steps) | 0.620 (0.609-0.632) | 0.631 (0.584-0.679) | 0.431 (0.410-0.453) |
 | synonymous (human, 15k steps) | 0.537 (0.525-0.548) | 0.618 (0.568-0.666) | 0.433 (0.411-0.455) |
 | mlm (SynCodonLM, 25k steps) | 0.649 (0.638-0.659) | 0.623 (0.571-0.672) | 0.427 (0.406-0.449) |
-| mlm (SynCodonLM, 50k steps) | **0.705** (0.695-0.716) | **0.658** (0.610-0.706) | 0.423 (0.402-0.445) |
+| mlm (SynCodonLM, 50k steps) | 0.705 (0.695-0.716) | 0.658 (0.610-0.706) | 0.423 (0.402-0.445) |
+| mlm (SynCodonLM, 75k steps, 1,000-codon window) | **0.737** (0.727-0.747) | **0.670** (0.623-0.715) | 0.429 (0.407-0.451) |
 | codon-usage delta | 0.539 (0.528-0.550) | 0.593 (0.545-0.642) | 0.533 (0.510-0.556) |
 | GC delta | 0.467 (0.457-0.476) | 0.418 (0.373-0.465) | **0.602** (0.586-0.618) |
 
@@ -163,6 +164,7 @@ the human runs' 5% gene hold-out (263 P / 213 B missense). A score covers only w
 | scorer | what it sees | missense, all genes | missense, held-out genes | synonymous, all genes |
 |---|---|---|---|---|
 | kron-dna SynCodonLM 50k, 1,000-codon window | the CDS's codons | 0.711 (0.701-0.721) | 0.661 (0.614-0.709) | 0.426 (0.404-0.448) |
+| kron-dna SynCodonLM 75k, 1,000-codon window | the CDS's codons | 0.737 (0.727-0.747) | 0.670 (0.623-0.715) | 0.429 (0.407-0.451) |
 | ESM-2 650M, masked marginal | the protein | 0.906 (0.900-0.912) | 0.834 (0.800-0.870) | - |
 | AlphaMissense | protein, structure, population frequency | **0.966** (0.963-0.969) | **0.950** (0.933-0.967) | - |
 | AlphaGenome, splice junctions | 100 kb of genome | 0.594 (0.582-0.605) | 0.540 (0.494-0.594) | **0.939** (0.926-0.951) |
@@ -175,7 +177,28 @@ ClinVar's benign class is common variants, so its number is not a clean zero-sho
 the splicing scores of AlphaGenome reach 0.94, which confirms that pathogenic synonymous variants are splicing
 variants: a model that reads only the CDS cannot score them. ESM-2 runs in fp32: in bf16 the same model drops to
 0.70, measured on 1,000 of these variants. AlphaGenome was called through its API with the scorers its client
-recommends, taking the largest absolute effect over the tracks. Evo 2 is not compared yet.
+recommends, taking the largest absolute effect over the tracks.
+
+**Evo 2 7B**, on a fixed subsample of the same variants (2,000 per class; all 756 pathogenic synonymous): the change
+in mean log-likelihood of a 4,096-base genomic window, alternate minus reference (`scripts/kron_dna/evo2/`, in its
+own environment). On the subsample, each scorer's AUROC (95% interval):
+
+| scorer | missense (2,000 P / 2,000 B) | synonymous (756 P / 2,000 B) |
+|---|---|---|
+| kron-dna SynCodonLM 75k | 0.732 (0.717-0.747) | 0.423 (0.401-0.446) |
+| Evo 2 7B | 0.868 (0.856-0.879) | 0.859 (0.841-0.877) |
+| ESM-2 650M | 0.910 (0.899-0.919) | - |
+| AlphaMissense | **0.971** (0.966-0.975) | - |
+| AlphaGenome, splice junctions | 0.590 (0.571-0.607) | **0.939** (0.925-0.951) |
+
+Evo 2 reads the genome around the variant, introns and splice sites included, so it scores both classes. It is above
+the codon model by 0.136 on missense (paired interval 0.119-0.153) and by 0.436 on synonymous. On each class it is
+below the specialist: ESM-2 or AlphaMissense on missense, AlphaGenome's splicing score on synonymous.
+
+Does the codon model add anything to the protein model? A logistic regression on the two scores, cross-validated
+in 5 folds by gene (3,948 genes, so no gene is in both training and test), gives 0.911 on missense against 0.906 for
+ESM-2 alone. The gain is +0.005, with a paired bootstrap interval of 0.003-0.006: small but real. The two scores
+correlate only 0.45 (Spearman). Adding the GC and codon-usage deltas does not move it (0.911).
 
 ```bash
 uv sync --inexact --all-groups                          # polars-bio in `genomics`; fair-esm, alphagenome in `baselines`
@@ -187,18 +210,19 @@ uv run kron-dna clinvar --esm esm2_t33_650M_UR50D --alphamissense AlphaMissense_
 same 68.6M model and batch, up to 300k steps. Its snapshots, by `evaluate` on 4,096 rows of each set
 (total / aa / syn bits per masked codon):
 
-| set | step 25k | step 50k | human `mlm`, 15k steps |
-|---|---|---|---|
-| held-out species | 4.879 / 3.606 / 1.273 | 4.735 / 3.474 / 1.261 | |
-| SynCodonLM test (species seen in training) | 4.892 / 3.622 / 1.270 | 4.757 / 3.498 / 1.259 | |
-| SynCodonLM test, the step-1 sample | 4.882 / 3.610 / 1.272 | 4.747 / 3.486 / 1.261 | 5.153 / - / 1.394 |
-| yeast | 5.099 / 3.727 / 1.372 | 5.018 / 3.650 / 1.368 | 5.342 / - / 1.492 |
-| held-out human genes | 4.788 / 3.528 / 1.260 | 4.645 / 3.401 / 1.245 | 4.784 / 3.526 / 1.258 |
+| set | step 25k | step 50k | step 75k | human `mlm`, 15k steps |
+|---|---|---|---|---|
+| held-out species | 4.879 / 3.606 / 1.273 | 4.735 / 3.474 / 1.261 | 4.642 / 3.387 / 1.256 | |
+| SynCodonLM test (species seen in training) | 4.892 / 3.622 / 1.270 | 4.757 / 3.498 / 1.259 | 4.668 / 3.414 / 1.254 | |
+| SynCodonLM test, the step-1 sample | 4.882 / 3.610 / 1.272 | 4.747 / 3.486 / 1.261 | 4.657 / 3.402 / 1.256 | 5.153 / - / 1.394 |
+| yeast | 5.099 / 3.727 / 1.372 | 5.018 / 3.650 / 1.368 | 4.977 / 3.610 / 1.367 | 5.342 / - / 1.492 |
+| held-out human genes | 4.788 / 3.528 / 1.260 | 4.645 / 3.401 / 1.245 | 4.542 / 3.306 / 1.236 | 4.784 / 3.526 / 1.258 |
 
 After 25k steps the corpus model already beats the human-only model on yeast and on SynCodonLM; after 50k it
 also beats it on human genes (4.645 against 4.784), the human-only model's own domain. Human is ~0.1% of
 SynCodonLM, and its genes there are not split by the human hold-out, so the "held-out human genes" row is not
-held out for this model. On the mRFP probe the snapshots reach test rho 0.695 (0.612-0.757) at 25k and 0.642 (0.545-0.715) at 50k, against 0.716
+held out for this model. On the mRFP probe the snapshots reach test rho 0.695 (0.612-0.757) at 25k, 0.642 (0.545-0.715) at 50k and 0.648
+(0.549-0.725) at 75k, against 0.716
 (0.632-0.780) for the human `mlm` model. These are 95% bootstrap intervals over the 219 test variants, and they all
 overlap: one gene's split cannot rank these models.
 
