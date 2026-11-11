@@ -13,6 +13,7 @@ presence = false
 # The rigger keeps the cluster account and the shares; the desk's secretary relays the maintainers' answers.
 wake_from = "desk-antonkulaga/rigger */secretary"
 
+wake_people = "kron-fm"
 [seat.ppg-trainer.zulip]
 pool = "~/.config/agent-seat-blueprints/zulip/pool"
 
