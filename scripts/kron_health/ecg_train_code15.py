@@ -12,6 +12,8 @@ steps = int(sys.argv[2]) if len(sys.argv) > 2 else 40000
 flags = set(sys.argv[3:])
 filtered = "filtered" in flags  # 0.5-40 Hz on every strip, as kron_health.ecg.strips(filtered=True)
 combined = "combined" in flags  # also train on PTB-XL folds 1-8 (its fold 10 stays the test), for a head across cohorts
+balanced = "balanced" in flags  # draw training strips evenly over 5-year age bands, against the pull to the mean
+width = int(next((f.split("=")[1] for f in flags if f.startswith("width=")), 64))
 d = load_code15(Path("data/input/health/code15"), Path("data/interim/health/code15/lead1.npz"))
 x, age, pat = d["x"], d["age"], d["patient"]
 def filt(a):
@@ -34,11 +36,17 @@ if combined:  # PTB-XL's training folds join the training strips; CODE-15% patie
     va = np.concatenate([va, np.zeros(ptr.sum(), bool)])
     te = np.concatenate([te, np.zeros(ptr.sum(), bool)])
 dev = torch.device("cuda"); torch.manual_seed(0)
-m = ECGAge(width=64, mean=float(age[tr].mean()), scale=float(age[tr].std())).to(dev)
+m = ECGAge(width=width, mean=float(age[tr].mean()), scale=float(age[tr].std())).to(dev)
 opt = torch.optim.AdamW(m.parameters(), lr=1e-3, weight_decay=1e-2)
 sched = torch.optim.lr_scheduler.OneCycleLR(opt, 1e-3, total_steps=steps)
 X = torch.from_numpy(x).to(dev); Y = torch.from_numpy(age).to(dev)
 idx_tr = np.flatnonzero(tr); rng = np.random.default_rng(0); bs = 256
+if balanced:
+    bands = (age[idx_tr] // 5).astype(int)
+    _, inv, cnt = np.unique(bands, return_inverse=True, return_counts=True)
+    p_tr = 1.0 / cnt[inv]; p_tr /= p_tr.sum()
+else:
+    p_tr = None
 def predict(XX, idx):
     m.eval(); o = []
     with torch.no_grad():
@@ -48,7 +56,7 @@ def predict(XX, idx):
 val_idx = np.flatnonzero(va); val_idx = val_idx[: 20000]
 best, state, t0 = 1e9, None, time.time()
 for step in range(1, steps + 1):
-    b = rng.choice(idx_tr, bs)
+    b = rng.choice(idx_tr, bs, p=p_tr)
     xb = X[b].float() * torch.where(torch.rand(bs, 1, device=dev) < 0.5, -1.0, 1.0)
     xb = torch.roll(xb, int(rng.integers(0, 250)), dims=1)
     loss = F.smooth_l1_loss(m(xb), Y[b], beta=2.0)
@@ -58,12 +66,14 @@ for step in range(1, steps + 1):
         print(f"step {step} loss {loss.item():.2f} val MAE {v:.2f} ({time.time() - t0:.0f}s)", flush=True)
         if v < best: best, state = v, {k: t.clone() for k, t in m.state_dict().items()}
 m.load_state_dict(state)
-res = {"val_best_mae": best, "steps": steps, "filtered": filtered, "combined": combined}
+res = {"val_best_mae": best, "steps": steps, "filtered": filtered, "combined": combined, "balanced": balanced,
+       "width": width}
 def per_patient(pred, y, p, base):
     u = np.unique(p); pp = np.array([pred[p == k].mean() for k in u]); yy = np.array([y[p == k].mean() for k in u])
     err = {"model": np.abs(pp - yy), "constant": np.abs(base - yy)}
+    slope = float(np.polyfit(yy, pp, 1)[0])  # 1 = no pull to the mean; < 1 = young read old, old read young
     return {"patients": len(u), "mae": err["model"].mean(), "mae_constant": err["constant"].mean(), "r": _r(pp, yy),
-            "interval95": bootstrap(err)}
+            "slope_pred_on_age": slope, "interval95": bootstrap(err)}
 base = float(np.median(age[tr]))
 res["code15_test"] = per_patient(predict(X, np.flatnonzero(te)), age[te], pat[te], base)
 PX = torch.from_numpy(ptb["x"]).to(dev)
@@ -71,5 +81,5 @@ pi = np.flatnonzero(pte)
 res["ptbxl_fold10"] = per_patient(predict(PX, pi), ptb["age"][pte], ptb["patient"][pte], float(np.median(ptb["age"][ptb["fold"] <= 8])))
 print(json.dumps(json_safe(res), indent=1))
 torch.save({"state": m.state_dict(), "mean": float(m.mean), "scale": float(m.scale), "fs": 250, "seconds": 10,
-            "filtered": filtered}, out / "checkpoint.pt")
+            "filtered": filtered, "width": width}, out / "checkpoint.pt")
 (out / "metrics.json").write_text(json.dumps(json_safe(res), indent=1))
