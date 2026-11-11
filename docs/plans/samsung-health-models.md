@@ -67,3 +67,11 @@ head (9.03 on PTB-XL). Band-passing is also what a watch needs: on one person, a
 filtered combined head the gap is 6.6 y, of which 2.6 y is the time between the two sets of recordings (4 SDK
 strips, a sanity check on one person, not a validation). All heads are far from the published bars (3.7, 6.9, 5.6 y); the next data are minute-level activity
 (UK Biobank), CODE-15% for the ECG, and the NSRR nights.
+
+**On a watch's data (2026-11-11, two exports, private):** the NHANES activity head does not transfer to step counts.
+Step counts are zero in most hours where the monitor's activity never is, so quiet hours and day-to-day variation
+fall at the 99th-100th percentile of the monitor's and the head gives adult "ages" of 11 and 20; `kron-health
+estimate` now refuses an input outside a head's training range. The activity head needs a cohort with step data
+and ages (Homekit2020, All of Us). The resting-HRV head reads sleep RR young (sleep raises HRV over supine rest)
+and is not read as a person's age. The ECG head is the one summary head to read on a watch, filtered.
+
