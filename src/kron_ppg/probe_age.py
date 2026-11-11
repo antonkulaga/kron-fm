@@ -201,15 +201,37 @@ def probe_windows(run: ProbeRun, seconds: float = 30.0, target_fs: float = FS
     return w, starts, tally
 
 
+def reference(model_run: Path, metrics: dict) -> str:
+    """The model's own error, as its run records it: ``reference.txt`` when the run has one (written for a model
+    judged on another cohort than it was fitted on), else the run's cross-validation or test score."""
+    if (model_run / "reference.txt").is_file():
+        return (model_run / "reference.txt").read_text().strip()
+    if "pooled" in metrics:  # a wrist-age run: CV over its own people
+        p = metrics["pooled"]
+        ci = p.get("interval95", {}).get("model", [float("nan")] * 2)
+        return (f"{p['people']} people of {', '.join(sorted(metrics.get('per_source', {})))}, grouped CV: MAE "
+                f"{p['mae']:.2f} y ({ci[0]:.2f}-{ci[1]:.2f}), r {p['r']:.2f}, median age {p['mae_constant']:.2f}")
+    if "test" in metrics:  # a clock run: its hashed test split
+        t = metrics["test"]
+        return f"its test people ({t.get('subjects')}): MAE {t.get('mae', float('nan')):.2f} y, r {t.get('r', float('nan')):.2f}"
+    return "no recorded reference error"
+
+
 def estimate(runs: list[Path], model_run: Path, device: str = "cuda", seconds: float = 30.0) -> dict:
     """The person's age from every accepted window of ``runs``, with the clock of ``model_run``."""
     from kron_ppg.train import load_encoder
     from kron_ppg.wrist_age import embed, lowpass
 
-    head = torch.load(Path(model_run) / "head.pt", map_location="cpu", weights_only=True)
-    metrics = json.loads((Path(model_run) / "metrics.json").read_text())
+    model_run = Path(model_run)
+    metrics = json.loads((model_run / "metrics.json").read_text()) if (model_run / "metrics.json").is_file() else {}
     cutoff = metrics.get("lowpass_hz")
-    encoder = load_encoder(head["encoder"], device)
+    if (model_run / "head.pt").is_file():  # a wrist-age run: the frozen encoder and a ridge over its mean embedding
+        head = torch.load(model_run / "head.pt", map_location="cpu", weights_only=True)
+        encoder, clock = load_encoder(head["encoder"], device), None
+    else:  # a clock run (kron-ppg clock, e.g. a fine-tune): encoder and age head in one checkpoint, full band
+        from kron_ppg.train import load_clock
+
+        head, clock = None, load_clock(model_run / "checkpoint.pt", device)
     per_run, all_windows = [], []
     for r in runs:
         best = None
@@ -243,14 +265,20 @@ def estimate(runs: list[Path], model_run: Path, device: str = "cuda", seconds: f
         def window(self, i):
             return w[i]
 
-    emb = embed(encoder, _Pool(), np.arange(len(w)), device=device)
-    weight, bias = head["weight"].numpy().astype(np.float64), float(head["bias"])
-    per_window = emb.astype(np.float64) @ weight + bias
-    out["age"] = float(emb.mean(0).astype(np.float64) @ weight + bias)
+    if clock is None:
+        emb = embed(encoder, _Pool(), np.arange(len(w)), device=device)
+        weight, bias = head["weight"].numpy().astype(np.float64), float(head["bias"])
+        per_window = emb.astype(np.float64) @ weight + bias
+        out["age"] = float(emb.mean(0).astype(np.float64) @ weight + bias)
+    else:  # the clock's own person estimate: the mean of its window predictions, as kron-ppg clock scores people
+        clock.eval()
+        with torch.no_grad():
+            per_window = np.concatenate([clock(torch.from_numpy(w[i:i + 256]).to(device)).float().cpu().numpy()
+                                         for i in range(0, len(w), 256)]).astype(np.float64)
+        out["age"] = float(per_window.mean())
     out["per_window_age"] = {"median": float(np.median(per_window)), "p10": float(np.percentile(per_window, 10)),
                              "p90": float(np.percentile(per_window, 90))}
     readings_15s = len(w) * seconds / 15
-    out["reference"] = ("held-out wrist cohort, 1,220 people: MAE 7.50 y (7.16-7.85) from all readings; "
-                        "16 readings of 15 s 7.35 y, 8 readings 7.7 y, 1 reading 10.3 y")
+    out["reference"] = reference(model_run, metrics)
     out["readings_15s_equivalent"] = readings_15s
     return out
