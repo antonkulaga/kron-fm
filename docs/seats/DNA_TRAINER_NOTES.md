@@ -35,6 +35,8 @@ in place, and a `milestones` topic with one line per landed result, figures wher
 its report as `watchdog.py keep dna-trainer kron-dna-state '#kron-fm>state' FILE` (its source in the seat's scratch
 folder, outside the repository) and posts each landed result to `#kron-fm>milestones`. Both are updated at every
 snapshot and every new comparison. No person's health values and no cluster host names in either.
+Anything that asks the owner to act carries the direct links he needs (a dataset, a note, a script, the results
+page): his rule of 2026-11-11, "always give urls".
 The house style is the desk's docs/REPORTING.md (finding first, one number with its interval and n, marks, tables
 for comparisons, plan / queue in the state report). Milestones and decisions are posted with `keep` too (names
 `kron-dna-milestone-<date>`, `kron-dna-decision-<topic>`), so they can be edited; sources in the scratch folder.
