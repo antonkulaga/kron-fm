@@ -104,3 +104,22 @@ def test_sdk_ecg_carries_the_lead_state_forward(tmp_path):
                   "lead_off": lead, "sequence": np.arange(n), "ppg_green": np.zeros(n)}).write_csv(tmp_path / "sdk_ecg.csv")
     x = sdk_ecg(tmp_path)
     assert x is not None and len(x) == 500 * 20
+
+
+def test_step_features_from_ten_minute_bins_match_across_sources():
+    from datetime import datetime, timedelta
+
+    from kron_health.steps import FEATURES, bin_features, samsung
+
+    days = 7
+    rng = np.random.default_rng(0)
+    t0 = datetime(2026, 7, 1)
+    starts = [t0 + timedelta(minutes=10 * i) for i in range(6 * 24 * days)]
+    steps = np.array([float(rng.integers(600, 1200)) if 9 <= t.hour < 12 else (50.0 if 12 <= t.hour < 20 else 0.0)
+                      for t in starts])
+    a = samsung(pl.DataFrame({"start": starts, "steps": steps}))
+    b = bin_features(np.array([(t - t0).days for t in starts]), np.array([t.hour for t in starts]), steps,
+                     np.ones(len(starts), bool))
+    assert a is not None and set(FEATURES) <= set(a)
+    assert all(abs(a[k] - b[k]) < 1e-9 for k in FEATURES)
+    assert 0.05 < a["brisk"] < 0.1 and a["empty_daytime"] > 0.1 and 60 < a["best30"] < 120

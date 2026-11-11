@@ -59,6 +59,16 @@ SOURCES: dict[str, Source] = {
                "doi 10.5281/zenodo.4916206. Lima EM et al. (2021) Nat Commun 12:5117.",
                "https://zenodo.org/records/4916206",
                {"format": "zip of HDF5", "fs": 400, "approx_mb": 46_300}),
+        Source("nhanes_pam_2005", DOMAIN,
+               "NHANES 2005-2006 physical activity monitor (ActiGraph 7164 on the hip, 7 days): per-minute intensity "
+               "counts and step counts with clock hour, and demographics (age top-coded at 85) for ~7,000 people aged "
+               "6-85: the step-count head (the same unit a watch's step bins report)",
+               (RemoteFile(f"{NHANES}/2005/DataFiles/PAXRAW_D.zip", "PAXRAW_D.zip", 470_990_068),
+                RemoteFile(f"{NHANES}/2005/DataFiles/DEMO_D.xpt", "DEMO_D.xpt", 3_566_560)),
+               "public domain (US federal government work, NCHS)",
+               "CDC/NCHS National Health and Nutrition Examination Survey 2005-2006, Physical Activity Monitor (PAXRAW_D).",
+               "https://wwwn.cdc.gov/nchs/nhanes/",
+               {"format": "zip of SAS transport (xpt)", "approx_mb": 475}),
         Source("nhanes_pam", DOMAIN,
                "NHANES 2011-2014 wrist activity monitor (ActiGraph GT3X+, 7 days): hourly and daily MIMS summaries with "
                "wear and sleep-wake flags, and demographics (age top-coded at 80) for ~14,000 people aged 6-80: the "
