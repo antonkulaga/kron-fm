@@ -195,6 +195,15 @@ Evo 2 reads the genome around the variant, introns and splice sites included, so
 the codon model by 0.136 on missense (paired interval 0.119-0.153) and by 0.436 on synonymous. On each class it is
 below the specialist: ESM-2 or AlphaMissense on missense, AlphaGenome's splicing score on synonymous.
 
+**NVIDIA's CodonFM (EnCodon), quoted, not run here.** It is the closest published peer: masked codon models of
+80M, 600M and 1B parameters, trained on about 130M RefSeq coding sequences from over 22,000 species. Its preprint
+(NVIDIA, 2025) reports ClinVar missense as AUROC in a figure only, with no number in the text: EnCodon is "marginally
+outperformed by the ESM family" and ahead of the RNA and mRNA models it compares. ClinVar synonymous is reported as
+Mann-Whitney p-values over subsamples matched for codon, gene position, pLI and mutation rate, not as AUROC. So
+neither is comparable number for number. What it says for kron-dna: a codon model at that scale comes close to ESM-2
+(0.906 here), while kron-dna at 68.6M parameters and 75k steps is at 0.737. Running it here waits on the owner's go
+for its code (its weights load only through NVIDIA's repository).
+
 Does the codon model add anything to the protein model? A logistic regression on the two scores, cross-validated
 in 5 folds by gene (3,948 genes, so no gene is in both training and test), gives 0.911 on missense against 0.906 for
 ESM-2 alone. The gain is +0.005, with a paired bootstrap interval of 0.003-0.006: small but real. The two scores
