@@ -20,6 +20,13 @@ pool = "~/.config/agent-seat-blueprints/zulip/pool"
 [seat.ppg-trainer.watch.desk]
 cmd = "sh kit:bin/py.sh kit:classes/desk/watch-answers.py kron-fm ppg-trainer"
 
+[seat.ppg-trainer.slurm]
+job_prefix = "kron-ppg-"
+
+# One watcher for all of them: start, requeue, end with state and log (v0.1.182), in place of a watch per sbatch.
+[seat.ppg-trainer.watch.jobs]
+cmd = "bash kit:drivers/slurm/watch-jobs.sh"
+
 # The DNA trainer (docs/seats/DNA_TRAINER.md): trains kron_dna. A second clone of this repository.
 [seat.dna-trainer]
 roles = "trainer"
