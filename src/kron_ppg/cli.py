@@ -217,14 +217,17 @@ def wrist_age_export(run: Path = typer.Argument(..., help="a wrist-age run folde
 
 @app.command("probe-age")
 def probe_age(runs: list[Path] = typer.Argument(..., help="pulse-exploration probe run folders (each with hr_raw.csv)"),
-              model: Path = typer.Option(..., help="a wrist-age run folder with head.pt (the deployable clock)"),
+              model: list[Path] = typer.Option(..., help="a wrist-age run folder with head.pt, or a clock run; "
+                                               "given twice or more, the clocks' ages are averaged"),
+              reference: str | None = typer.Option(None, help="the averaged clocks' held-out score, to quote"),
               out: Path | None = typer.Option(None, help="write the estimate as JSON here too"),
               device: str = "cuda") -> None:
-    """One person's age from the watch probe's raw PPG: decode, quality gate, the wrist clock."""
-    from kron_ppg.probe_age import estimate
+    """One person's age from the watch probe's raw PPG: decode, quality gate, the wrist clock (or several, averaged)."""
+    from kron_ppg.probe_age import estimate, estimate_average
     from kron_ppg.wrist_age import json_safe
 
-    result = json_safe(estimate(runs, model, device))
+    result = json_safe(estimate(runs, model[0], device) if len(model) == 1
+                       else estimate_average(runs, model, device, reference_text=reference))
     text = json.dumps(result, indent=2)
     if out:
         out.parent.mkdir(parents=True, exist_ok=True)

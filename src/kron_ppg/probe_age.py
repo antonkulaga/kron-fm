@@ -284,3 +284,21 @@ def estimate(runs: list[Path], model_run: Path, device: str = "cuda", seconds: f
     out["reference"] = reference(model_run, metrics)
     out["readings_15s_equivalent"] = readings_15s
     return out
+
+
+def estimate_average(runs: list[Path], model_runs: list[Path], device: str = "cuda", seconds: float = 30.0,
+                     reference_text: str | None = None) -> dict:
+    """The mean of several clocks' person ages over the same recordings (each clock reads them in its own band).
+
+    On Aurora-BP, frozen c1 + ridge averaged with run 4 fine-tuned reads 6.34 y against 6.61 for c1 alone (the
+    research note). A clock that finds no window is left out of the mean and says so.
+    """
+    members = [estimate(runs, m, device, seconds) for m in model_runs]
+    ages = [m["age"] for m in members if m.get("age") is not None]
+    out = {"models": [str(m) for m in model_runs], "age": float(np.mean(ages)) if ages else None,
+           "members": [{k: m.get(k) for k in ("model", "age", "windows", "band_hz", "reference")} for m in members],
+           "runs": members[0]["runs"] if members else []}
+    if len(ages) > 1:
+        out["members_spread_years"] = float(np.ptp(ages))
+    out["reference"] = reference_text or "the mean of the members' ages; see each member's reference"
+    return out

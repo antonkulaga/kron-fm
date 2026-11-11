@@ -75,3 +75,14 @@ def test_sdk_green_reads_upright_and_its_duplicate_stamps_spread(tmp_path):
     assert np.percentile(d, 99) > -np.percentile(d, 1)  # systole up
     w, _, tally = probe_windows(rec)
     assert tally["accepted"] >= 3
+
+
+def test_estimate_average_means_the_members_and_skips_a_clock_without_windows(monkeypatch):
+    import kron_ppg.probe_age as pa
+
+    ages = {"a": 40.0, "b": 50.0, "c": None}
+    monkeypatch.setattr(pa, "estimate", lambda runs, m, device, seconds: {"model": str(m), "age": ages[str(m)],
+                                                                          "windows": 3, "runs": [{"run": "r"}]})
+    out = pa.estimate_average(["r"], ["a", "b", "c"], "cpu", reference_text="ref")
+    assert out["age"] == 45.0 and out["members_spread_years"] == 10.0 and out["reference"] == "ref"
+    assert [m["age"] for m in out["members"]] == [40.0, 50.0, None]
