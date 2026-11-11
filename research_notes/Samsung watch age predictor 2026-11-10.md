@@ -117,7 +117,10 @@ person, of the frozen c1 head and the 6k fine-tuned run 4 reads **6.30 y** (r 0.
 than c1 alone by 0.17-0.46 y (paired) and than the fine-tuned run 4 by 0.27-0.55 y. Adding the fine-tuned c1 as a
 third member changes nothing (6.34). Both members were fitted on open data only, so the average can be deployed (two
 encoders, about 30 ms per 5 s). The members and the learning rate were chosen by their Aurora scores, so the 6.30
-carries a small selection effect; seed 1 of c1 (running) will test it.
+carries a small selection effect. Two more seeds of the fine-tuned run 4 read 6.98 and 7.40 alone (the fine-tune
+varies with its seed far more than the frozen head): averaged with c1, each gives 6.39 and 6.52. With the fine-tuned
+member taken as the mean of its three seeds, so that no seed is chosen, the average reads **6.34 y (6.03-6.64)**, r 0.71,
+better than c1 alone by 0.13-0.42 y (paired). Seed 1 of c1 itself is running.
 
 ## Limits
 
