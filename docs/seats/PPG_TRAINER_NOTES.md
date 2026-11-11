@@ -31,7 +31,8 @@ secretary on the maintainer's word).
 ## Reporting (Anton, 2026-11-11)
 - Results page (tabbed artifact, republish the same file at each milestone): https://claude.ai/artifact/GJDyDo8i87LqDiT8s9EHip;
   its source sits beside the brief's private files (kron-samsung). Kept state report in #kron-fm > state (keep name
-  ppg-state), milestones in #kron-fm > milestones. No person's values on either.
+  ppg-state), milestones in #kron-fm > milestones, questions in #kron-fm > decisions. House style: the desk's
+  docs/REPORTING.md (finding first, one headline number with ± and n, marks, tables). No person's values.
 
 ## Cluster rules taken up
 - Every sbatch carries `--comment 'seat=kron-fm/ppg-trainer; what=<one line, no person or private data>;
