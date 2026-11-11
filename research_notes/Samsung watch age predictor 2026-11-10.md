@@ -133,8 +133,7 @@ Watch5, median 23) reads 14.6, MultiSite +16 y, PPG Sport +25 y, Vilnius -22 y; 
 Active2 reads +14 y. With each source's mean embedding removed before fitting, almost no age signal is left (slope
 of prediction on age 0.07-0.10 on Aurora). So the open heads learn age mostly *between* sources, old Vilnius
 against young students, and a new device carries its own offset of up to 10-25 y. Aurora is one device on which the
-offset happened to be small; it does not show the clock is calibrated on a Galaxy Watch. On one 40-year-old's
-Galaxy Watch probe recordings the heads read 32-48 y.
+offset happened to be small; it does not show the clock is calibrated on a Galaxy Watch.
 
 The fix is people of known, varied age recorded on the target watch, to fit the watch's offset (or the head)
 there: no open Galaxy Watch set has people over about 35. Until then a single person's age from the watch is not a
