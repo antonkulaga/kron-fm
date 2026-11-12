@@ -249,3 +249,13 @@ def test_prepare_holds_out_whole_genes(tmp_path):
     assert metas["holdout"]["sequences"] == 3 * len(out_genes)
     assert metas["train"]["sequences"] + metas["holdout"]["sequences"] == 120
     assert (tmp_path / "packed_holdout" / "tokens.npy").is_file() and (tmp_path / "packed" / "tokens.npy").is_file()
+
+
+def test_read_fasta_keeps_headers_and_joins_lines(tmp_path):
+    import gzip
+    text = ">a desc one\nACG\nTT\n\n>b\nGG\n"
+    (tmp_path / "x.fa").write_text(text)
+    with gzip.open(tmp_path / "x.fa.gz", "wt") as fh:
+        fh.write(text)
+    for name in ("x.fa", "x.fa.gz"):
+        assert list(read_fasta(tmp_path / name)) == [("a desc one", "ACGTT"), ("b", "GG")]

@@ -31,23 +31,13 @@ from kron_dna.losses import IGNORE_INDEX
 
 
 def read_fasta(path: str | Path) -> Iterator[tuple[str, str]]:
-    """``(header, sequence)`` pairs from a FASTA file, gzipped when its name ends in ``.gz``."""
-    path = Path(path)
-    opener = gzip.open if path.suffix == ".gz" else open
-    header, parts = None, []
-    with opener(path, "rt") as handle:
-        for line in handle:
-            line = line.strip()
-            if not line:
-                continue
-            if line.startswith(">"):
-                if header is not None:
-                    yield header, "".join(parts)
-                header, parts = line[1:], []
-            else:
-                parts.append(line)
-    if header is not None:
-        yield header, "".join(parts)
+    """``(header, sequence)`` pairs from a FASTA file (gzipped or not), read with polars-bio; the header is the name
+    and, when present, the description after a space, as on the ``>`` line."""
+    import polars_bio as pb
+
+    frame = pb.scan_fasta(str(path)).collect()
+    for name, description, sequence in frame.select("name", "description", "sequence").iter_rows():
+        yield (f"{name} {description}" if description else name), sequence
 
 
 def read_csv(path: str | Path, sequence_column: str = "CDS", keep: dict[str, str] | None = None
