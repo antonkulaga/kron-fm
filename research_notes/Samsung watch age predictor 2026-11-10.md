@@ -145,6 +145,24 @@ change little. Within these narrow-age sets a small error mostly reflects their 
 offset is fixed, not that people are ranked well inside one watch. Script: `scripts/kron_ppg_device_calibration.py`. Until then a single person's age from the watch is not a
 number to report. Script: `scripts/kron_ppg_device_offsets.py`.
 
+## Older wrist people in pretraining do not shrink the offset (2026-11-12)
+
+Run c3 is the c1 recipe (finger plus every open wrist set, self-supervised, 160k steps) with PulseWatch added: older
+people with AF, wearing a wrist device, unlabelled. The question was whether older wrist people seen in pretraining
+make the head less tied to each device. They do not:
+
+| Encoder | Open head on Aurora (MAE, y) | Mean error | With the offset removed | Aurora-fitted, 10-fold |
+|---|---|---|---|---|
+| c1 | 6.61 | +0.4 | 6.58 | 5.90 (r 0.76) |
+| c3 (c1 + PulseWatch) | 8.40 | +6.3 | 6.40 | 6.03 (r 0.75) |
+
+c3 carries as much age as c1 (Aurora-fitted 6.03 vs 5.90; ranked by r, 0.70 vs 0.67 for the open head), but its
+open head reads Aurora 6 y old. Held out one at a time, the eight open sets are read off by 10.8 y on average for c3
+(median read against median age) and 10.2 y for c1; the large cases stay (PPG Sport +24, MultiSite +16, Vilnius -23).
+So the offset comes from the head, fitted across cohorts of different devices and ages, not from what the encoder saw
+in pretraining. c1 stays the encoder; the fix stays a few people of known age per watch (above). Scripts:
+`scripts/kron_ppg_device_offsets.py "c3 full" <open run> <Aurora run>`, run folders `c3-pretrain`, `wa11-*`.
+
 ## Limits
 
 - The head learnt mostly from young people (20-35) plus 35 older AF patients; the test device is not Samsung.

@@ -1,9 +1,14 @@
 """Device confound check: ridge on open wrist embeddings with each source's mean embedding removed (source-centred),
-scored on Aurora centred by its own mean (no labels used); and leave-one-source-out mean error per source."""
+scored on Aurora centred by its own mean (no labels used); and leave-one-source-out mean error per source.
+usage: kron_ppg_device_offsets.py [TAG OPEN_RUN AURORA_RUN ...]  (default: c1 full and r4 5 Hz)"""
+import sys
 import numpy as np
 from kron_ppg.wrist_age import People, fit_ridge, bootstrap
 R = "data/output/runs/kron-ppg/"
-for tag, oo, aa in (("c1 full", "wa9-open-c1", "wa9-aurora15-c1"), ("r4 5Hz", "wa4-open-r4-lp5", "wa4-aurora15-r4-lp5")):
+a = sys.argv[1:]
+RUNS = [tuple(a[i:i + 3]) for i in range(0, len(a), 3)] or [("c1 full", "wa9-open-c1", "wa9-aurora15-c1"),
+                                                             ("r4 5Hz", "wa4-open-r4-lp5", "wa4-aurora15-r4-lp5")]
+for tag, oo, aa in RUNS:
     o, a = People.load(R + oo + "/people.npz"), People.load(R + aa + "/people.npz")
     xc = o.x.copy()
     for s in np.unique(o.source): m = o.source == s; xc[m] -= xc[m].mean(0)
