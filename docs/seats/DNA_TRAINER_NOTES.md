@@ -35,6 +35,9 @@ in place, and a `milestones` topic with one line per landed result, figures wher
 its report as `watchdog.py keep dna-trainer kron-dna-state '#kron-fm>state' FILE` (its source in the seat's scratch
 folder, outside the repository) and posts each landed result to `#kron-fm>milestones`. Both are updated at every
 snapshot and every new comparison. No person's health values and no cluster host names in either.
+Licence and terms questions are the owner's (2026-11-12: "Do not make decisions based on licences, it is my
+responsibility ... do not take away your results"). The seat reports a licence fact it notices, with its link, and keeps
+the result; it still never commits licensed data or weights, and keeps the notices a licence asks for.
 Anything that asks the owner to act carries the direct links he needs (a dataset, a note, a script, the results
 page): his rule of 2026-11-11, "always give urls".
 The house style is the desk's docs/REPORTING.md (finding first, one number with its interval and n, marks, tables

@@ -223,18 +223,21 @@ ESM-2 alone. The gain is +0.005, with a paired bootstrap interval of 0.003-0.006
 correlate only 0.45 (Spearman). Adding the GC and codon-usage deltas does not move it (0.911).
 
 **A supervised ensemble** (gradient-boosted trees, 5 folds split by gene so no gene is in both training and test,
-`kron-dna ensemble`). Its inputs are kron-dna 150k, ESM-2, the GC and codon-usage deltas and the consequence.
-AlphaGenome's scores are not among them: its terms forbid using its output to train machine-learning models, and a
-first version that did has been withdrawn. AUROC (95% interval):
+`kron-dna ensemble`). Inputs: kron-dna's score, ESM-2, AlphaGenome's four scorers, the GC and codon-usage deltas and
+the consequence. AUROC (95% interval):
 
 | inputs | missense | synonymous |
 |---|---|---|
-| everything but kron-dna | 0.909 (0.903-0.914) | 0.761 (0.742-0.780) |
-| everything | **0.924** (0.919-0.929) | 0.760 (0.742-0.778) |
+| kron-dna 75k alone | 0.711 (0.700-0.720) | 0.449 (0.430-0.471) |
+| ESM-2 alone | 0.902 (0.896-0.908) | 0.475 (0.456-0.498) |
+| everything but kron-dna (75k run) | 0.915 (0.910-0.921) | 0.933 (0.921-0.946) |
+| everything, kron-dna 75k | **0.925** (0.920-0.931) | **0.938** (0.926-0.951) |
+| kron-dna 150k + ESM-2 + deltas, no AlphaGenome | 0.924 (0.919-0.929) | 0.760 (0.742-0.778) |
 
-kron-dna adds +0.015 on missense (paired interval 0.012-0.018) and nothing on synonymous (-0.001, -0.007 to
-0.005). Without a splicing input, synonymous variants stay at 0.76. Not in yet: conservation, the models'
-embeddings, and a check on a set other than ClinVar.
+With everything, kron-dna 75k adds +0.010 on missense (paired interval 0.008-0.013) and +0.005 on synonymous
+(0.001-0.009). Without AlphaGenome, kron-dna 150k adds +0.015 on missense (0.012-0.018), and synonymous variants
+fall to 0.76: the splicing signal comes from AlphaGenome. Not in yet: conservation, the models' embeddings, and a
+check on a set other than ClinVar.
 
 ```bash
 uv sync --inexact --all-groups                          # polars-bio in `genomics`; fair-esm, alphagenome in `baselines`
