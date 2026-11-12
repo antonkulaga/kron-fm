@@ -180,7 +180,8 @@ ClinVar's benign class is common variants, so its number is not a clean zero-sho
 the splicing scores of AlphaGenome reach 0.94, which confirms that pathogenic synonymous variants are mostly splicing
 variants: a model that reads only the CDS scores them poorly (kron-dna below chance; Encodon 1B 0.62, below). ESM-2 runs in fp32: in bf16 the same model drops to
 0.70, measured on 1,000 of these variants. AlphaGenome was called through its API with the scorers its client
-recommends, taking the largest absolute effect over the tracks.
+recommends, taking the largest absolute effect over the tracks. The AlphaGenome numbers here are derived from its
+API output and are subject to the AlphaGenome Output Terms of Use: https://deepmind.google.com/science/alphagenome/output-terms
 
 **Evo 2 7B**, on a fixed subsample of the same variants (2,000 per class; all 756 pathogenic synonymous): the change
 in mean log-likelihood of a 4,096-base genomic window, alternate minus reference (`scripts/kron_dna/evo2/`, in its
@@ -221,20 +222,19 @@ in 5 folds by gene (3,948 genes, so no gene is in both training and test), gives
 ESM-2 alone. The gain is +0.005, with a paired bootstrap interval of 0.003-0.006: small but real. The two scores
 correlate only 0.45 (Spearman). Adding the GC and codon-usage deltas does not move it (0.911).
 
-**A first supervised ensemble** (gradient-boosted trees, 5 folds split by gene so no gene is in both training and
-test, on the same 15,756 variants). The inputs are scores already computed: kron-dna 75k, ESM-2, AlphaGenome's four
-scorers, the GC and codon-usage deltas, and the consequence. AUROC (95% interval):
+**A supervised ensemble** (gradient-boosted trees, 5 folds split by gene so no gene is in both training and test,
+`kron-dna ensemble`). Its inputs are kron-dna 150k, ESM-2, the GC and codon-usage deltas and the consequence.
+AlphaGenome's scores are not among them: its terms forbid using its output to train machine-learning models, and a
+first version that did has been withdrawn. AUROC (95% interval):
 
 | inputs | missense | synonymous |
 |---|---|---|
-| kron-dna alone | 0.711 (0.700-0.720) | 0.449 (0.430-0.471) |
-| ESM-2 alone | 0.902 (0.896-0.908) | 0.475 (0.456-0.498) |
-| everything but kron-dna | 0.915 (0.910-0.921) | 0.933 (0.921-0.946) |
-| everything | **0.925** (0.920-0.931) | **0.938** (0.926-0.951) |
+| everything but kron-dna | 0.909 (0.903-0.914) | 0.761 (0.742-0.780) |
+| everything | **0.924** (0.919-0.929) | 0.760 (0.742-0.778) |
 
-kron-dna adds +0.010 on missense (paired interval 0.008-0.013) and +0.005 on synonymous (0.001-0.009) to the rest.
-AlphaMissense alone is at 0.966 on missense, with population frequency behind it. Not in yet: conservation, the
-models' embeddings, and a check on a set other than ClinVar.
+kron-dna adds +0.015 on missense (paired interval 0.012-0.018) and nothing on synonymous (-0.001, -0.007 to
+0.005). Without a splicing input, synonymous variants stay at 0.76. Not in yet: conservation, the models'
+embeddings, and a check on a set other than ClinVar.
 
 ```bash
 uv sync --inexact --all-groups                          # polars-bio in `genomics`; fair-esm, alphagenome in `baselines`
