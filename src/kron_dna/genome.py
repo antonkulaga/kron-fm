@@ -82,11 +82,7 @@ class KronGenome(nn.Module):
         b, length = seq.shape
         if length % (2 ** c.n_down):
             raise ValueError(f"length {length} is not a multiple of {2 ** c.n_down}")
-        x = self.stem(one_hot(seq))
-        skips = []
-        for block in self.down:
-            skips.append(x)
-            x = F.max_pool1d(block(x), 2)
+        x, skips = self.encode(seq)
         h = x.transpose(1, 2)                                       # [B, bins, d_model]
         bins = h.shape[1]
         if segments is None:
@@ -96,15 +92,76 @@ class KronGenome(nn.Module):
         flat = segments.reshape(-1)
         starts = torch.nonzero(torch.diff(flat, prepend=flat[:1] - 1)).squeeze(1)
         cu = torch.cat([starts, torch.tensor([flat.numel()], device=seq.device)]).to(torch.int32)
-        h = h.reshape(1, b * bins, -1)
-        for layer in self.core:
-            h = layer(h, cu)
-        core = self.core_norm(h).reshape(b, bins, -1)
-        x = core.transpose(1, 2)
-        for block, skip in zip(self.up, reversed(skips)):
-            x = block(F.interpolate(x, scale_factor=2, mode="nearest")) + skip
+        core = self.run_core(h.reshape(1, b * bins, -1), cu).reshape(b, bins, -1)
+        x = self.decode(core.transpose(1, 2), skips)
         tracks = self.tracks(x).transpose(1, 2) if self.tracks is not None else None   # [B, L, n_tracks]
         return self.head(x).transpose(1, 2), core, tracks
+
+    def encode(self, seq: torch.Tensor) -> tuple[torch.Tensor, list[torch.Tensor]]:
+        """``[B, L]`` bases -> ``[B, d_model, L / 2**n_down]`` bins and the encoder's skips, finest first."""
+        x = self.stem(one_hot(seq))
+        skips = []
+        for block in self.down:
+            skips.append(x)
+            x = F.max_pool1d(block(x), 2)
+        return x, skips
+
+    def run_core(self, h: torch.Tensor, cu: torch.Tensor, checkpoint: bool = False) -> torch.Tensor:
+        """The KronLSTM core over ``[1, N, d_model]`` packed bins; ``checkpoint`` recomputes each layer in backward."""
+        for layer in self.core:
+            h = torch.utils.checkpoint.checkpoint(layer, h, cu, use_reentrant=False) if checkpoint else layer(h, cu)
+        return self.core_norm(h)
+
+    def decode(self, x: torch.Tensor, skips: list[torch.Tensor]) -> torch.Tensor:
+        """``[B, d_model, bins]`` -> ``[B, stem_channels, L]`` through the decoder and the encoder's skips."""
+        for block, skip in zip(self.up, reversed(skips)):
+            x = block(F.interpolate(x, scale_factor=2, mode="nearest")) + skip
+        return x
+
+    def forward_contig(self, seq: torch.Tensor, train_at: list[int], chunk: int = 1 << 20, halo: int = 4096
+                       ) -> list[tuple[torch.Tensor, torch.Tensor | None]]:
+        """A whole contig in one recurrence. ``seq`` is ``[L]`` (L a multiple of ``2**n_down``). The encoder runs
+        chunk by chunk (each with ``halo`` bases of context on both sides; gradient only for scored chunks), the core over
+        every bin of the contig at once (each layer recomputed in backward), and the decoder only on the chunks
+        that start at ``train_at``: returns per chunk ``(logits [1, len, 4], tracks [1, len, n_tracks] or None)``.
+        Memory grows with the contig only at bin resolution. The encoder's GroupNorm takes its statistics per
+        chunk, as training on windows of ``chunk`` bases does, so a chunk of the window length matches training."""
+        unit = 2 ** self.config.n_down
+        if seq.numel() % unit or chunk % unit or halo % unit:
+            raise ValueError(f"length, chunk and halo must be multiples of {unit}")
+        length = seq.numel()
+        grad = torch.is_grad_enabled()
+        enc = lambda piece: self.encode(piece)[0]                   # noqa: E731
+        span = lambda s: (max(0, s - halo), min(length, s + chunk + halo))  # noqa: E731
+        bins, scored = [], set(train_at)
+        for s in range(0, length, chunk):
+            lo, hi = span(s)
+            piece = seq[lo:hi].unsqueeze(0)
+            if grad and s in scored:            # the encoder learns through the core from the scored chunks only
+                x = torch.utils.checkpoint.checkpoint(enc, piece, use_reentrant=False)
+            else:
+                with torch.no_grad():
+                    x = enc(piece)
+            a = (s - lo) // unit
+            bins.append(x[:, :, a:a + (min(s + chunk, length) - s) // unit])
+        h = torch.cat(bins, 2).transpose(1, 2)
+        cu = torch.tensor([0, h.shape[1]], dtype=torch.int32, device=seq.device)
+        core = self.run_core(h, cu, checkpoint=grad).transpose(1, 2)    # [1, d_model, bins]
+        def heads(bins_, piece, a, b):
+            _, skips = self.encode(piece)
+            x = self.decode(bins_, skips)
+            logits = self.head(x)[:, :, a:b].transpose(1, 2)
+            if self.tracks is None:
+                return (logits,)
+            return logits, self.tracks(x)[:, :, a:b].transpose(1, 2)
+
+        outs = []
+        for s in train_at:                                          # one chunk's activations alive at a time
+            lo, hi = span(s)
+            args = (core[:, :, lo // unit:hi // unit], seq[lo:hi].unsqueeze(0), s - lo, s - lo + min(chunk, length - s))
+            out = torch.utils.checkpoint.checkpoint(heads, *args, use_reentrant=False) if grad else heads(*args)
+            outs.append((out[0], out[1] if len(out) > 1 else None))
+        return outs
 
     def n_parameters(self) -> int:
         return sum(p.numel() for p in self.parameters())

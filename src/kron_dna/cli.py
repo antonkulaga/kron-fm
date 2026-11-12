@@ -663,6 +663,11 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                  labels: bool = typer.Option(False, help="stage 2: also predict the genome-labels tracks (TRACKS)"),
                  init: Path | None = typer.Option(None, help="start a new run from this checkpoint's weights (stage 1)"),
                  track_weight: float = typer.Option(1.0, help="weight of the track loss beside the masked-base loss"),
+                 whole_contigs: bool = typer.Option(False, help="one whole contig per step in one recurrence; the "
+                                                    "encoder runs in --window chunks, the loss on --train-chunks of them"),
+                 train_chunks: int = typer.Option(4, help="with --whole-contigs: chunks decoded and scored per step"),
+                 max_contig: int = typer.Option(0, help="with --whole-contigs: a longer contig gives a random stretch "
+                                                "of this many bases (0: none)"),
                  seed: int = 0) -> None:
     """The multi-track model (KronGenome) over whole gap-free contigs: stage 1 masked-base prediction; with
     ``--labels``, stage 2 adds the Ensembl and GENCODE tracks of ``genome-labels`` and writes ``tracks.csv``."""
@@ -684,6 +689,25 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
     val_idx = index.filter(pl.col("chrom").is_in(list(held)))
     rng = np.random.default_rng(seed)
     unit = 2 ** n_down
+
+    def sample_contig(table, longest: bool = False) -> tuple[torch.Tensor, ...]:
+        """One whole contig (by length, so every base equally), padded with N to a multiple of 2**n_down."""
+        p = table["len"].to_numpy() / table["len"].sum()
+        i = int(np.argmax(p)) if longest else int(rng.choice(table.height, p=p))
+        r = dict(table.row(i, named=True))
+        at = r["offset"]
+        if max_contig and r["len"] > max_contig:
+            at += 0 if longest else int(rng.integers(0, r["len"] - max_contig + 1))
+            r["len"] = max_contig
+        n = -(-r["len"] // unit) * unit
+        codes = np.full(n, 4, dtype=np.int64)
+        codes[:r["len"]] = bases[at:at + r["len"]]
+        out = [torch.from_numpy(codes)]
+        if labels:
+            lab, act = np.zeros(n, dtype=np.uint8), np.zeros(n, dtype=np.uint8)
+            lab[:r["len"]], act[:r["len"]] = lab_mm[at:at + r["len"]], act_mm[at:at + r["len"]]
+            out += [torch.from_numpy(lab), torch.from_numpy(act), torch.from_numpy(np.arange(n) < r["len"])]
+        return tuple(out)
 
     def sample(table) -> tuple[torch.Tensor, ...]:
         p = table["len"].to_numpy() / table["len"].sum()                 # contigs by length: every base equally
@@ -737,6 +761,27 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                f"{train_idx.height} train / {val_idx.height} held-out contigs")
     autocast = torch.autocast("cuda", dtype=torch.bfloat16)
 
+    def contig_loss(seq, lab=None, act=None, valid=None, keep=None):
+        inputs, targets = G.mask_bases(seq.to(dev), mask_prob)
+        n_chunks = -(-seq.numel() // window)
+        picks = sorted(rng.choice(n_chunks, size=min(train_chunks, n_chunks), replace=False).tolist())
+        with autocast:
+            outs = model.forward_contig(inputs, [k * window for k in picks], chunk=window)
+        mlm, track, count = 0.0, 0.0, 0
+        for k, (logits, tracks) in zip(picks, outs):
+            sl = slice(k * window, k * window + logits.shape[1])
+            mlm = mlm + F.cross_entropy(logits.float()[0], targets[sl], ignore_index=-100, reduction="sum")
+            count += int((targets[sl] != -100).sum())
+            if lab is not None:
+                want = G.track_targets(lab[sl].to(dev), act[sl].to(dev))
+                ok = valid[sl].to(dev)
+                per = F.binary_cross_entropy_with_logits(tracks.float()[0], want, pos_weight=pos_weight,
+                                                         reduction="none")
+                track = track + (per * ok.unsqueeze(-1)).sum() / (ok.sum() * per.shape[-1]) / len(picks)
+                if keep is not None:
+                    keep.append((tracks.float()[0][ok], want[ok]))
+        return mlm / max(count, 1), (track if lab is not None else None)
+
     def loss_on(seq, seg, lab=None, act=None, valid=None, keep=None):
         inputs, targets = G.mask_bases(seq.to(dev), mask_prob)
         with autocast:
@@ -765,15 +810,24 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
         for g in opt.param_groups:
             g["lr"] = lr * min(1.0, (step + 1) / warmup) * 0.5 * (1 + math.cos(math.pi * min(step / steps, 1.0)))
         torch.cuda.reset_peak_memory_stats(dev)
-        loss, track = loss_on(*sample(train_idx))
+        if whole_contigs:
+            loss, track = contig_loss(*sample_contig(train_idx, longest=bench))
+        else:
+            loss, track = loss_on(*sample(train_idx))
         opt.zero_grad(set_to_none=True)
         (loss + track_weight * track if track is not None else loss).backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         opt.step()
         step += 1
+        if bench and step == 1:                                  # the first step compiles kernels: time the second
+            torch.cuda.synchronize()
+            t0 = time.time()
+            continue
         if bench:
             torch.cuda.synchronize()
-            typer.echo(f"bench: window {window:,}, batch {batch_size}: {time.time() - t0:.1f} s for one step, "
+            what = f"longest contig {min(train_idx['len'].max(), max_contig or 1 << 62):,} bases in {window:,} chunks, {train_chunks} scored" \
+                if whole_contigs else f"window {window:,}, batch {batch_size}"
+            typer.echo(f"bench: {what}: {time.time() - t0:.1f} s for one step, "
                        f"peak {torch.cuda.max_memory_allocated(dev) / 2**30:.1f} GiB, loss {loss.item():.3f}")
             return
         out_of_time = max_hours > 0 and time.time() - started > max_hours * 3600
@@ -781,7 +835,9 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
             model.eval()
             keep: list = []
             with torch.no_grad():
-                pairs = [loss_on(*sample(val_idx), keep=keep if labels else None) for _ in range(8)]
+                pairs = ([contig_loss(*sample_contig(val_idx), keep=keep if labels else None) for _ in range(2)]
+                         if whole_contigs else
+                         [loss_on(*sample(val_idx), keep=keep if labels else None) for _ in range(8)])
             model.train()
             h = hours + (time.time() - t0) / 3600
             bits = float(np.mean([m.item() for m, _ in pairs])) / math.log(2)

@@ -102,3 +102,20 @@ def test_track_head_shape_on_cpu_free_parts():
     c = G.KronGenomeConfig(d_model=32, n_heads=2, n_layers=1, ff_units=64, stem_channels=8, n_down=3, n_tracks=9)
     m = G.KronGenome(c)
     assert m.tracks.out_channels == 9 and m.tracks.in_channels == 8
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="the KronLSTM core needs CUDA")
+def test_forward_contig_matches_forward():
+    torch.manual_seed(0)
+    c = G.KronGenomeConfig(d_model=32, n_heads=2, n_layers=2, ff_units=64, stem_channels=8, n_down=3, dropout=0.0,
+                           n_tracks=2)
+    model = G.KronGenome(c).cuda().eval()
+    seq = torch.randint(0, 4, (1, 8192), device="cuda")
+    with torch.no_grad():
+        full, _, tracks = model(seq)
+        one = model.forward_contig(seq[0], train_at=[0], chunk=8192, halo=0)          # one chunk: exact
+        parts = model.forward_contig(seq[0], train_at=[2048, 6144], chunk=2048, halo=1024)
+    assert torch.allclose(one[0][0], full, atol=1e-3) and torch.allclose(one[0][1], tracks, atol=1e-3)
+    # several chunks: GroupNorm's statistics are per chunk, so close but not equal
+    r = torch.corrcoef(torch.stack([parts[0][0].flatten(), full[:, 2048:4096].flatten()]))[0, 1]
+    assert r > 0.99 and parts[1][1].shape == (1, 2048, 2)
