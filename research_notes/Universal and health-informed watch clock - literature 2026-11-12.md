@@ -57,3 +57,18 @@ No open dataset has raw wrist PPG with methylation; with blood labs, only BIG ID
 2. With UK Biobank: a head trained to predict blood PhenoAge from PPG (the open niche), and a survival head on
    mortality; finger PPG, so its transfer to the wrist must be tested.
 3. On the watch: a small set of people of known age per watch model to calibrate.
+
+## Pulse-PPG tried on our data (2026-11-12)
+
+Pulse-PPG (github.com/maxxu05/pulseppg at 716eaf9, weights from Zenodo 17345536; run in a scratch folder for
+evaluation only, under the trust register's row) as a frozen encoder: our 25 Hz windows resampled to its 50 Hz,
+three 8 s chunks per 30 s window (one per 15 s Aurora reading), max-pooled features averaged per person, the same
+ridge heads and people as our clocks. On Aurora-BP's 1,220 people:
+
+| Encoder | Head fitted on open wrist sets | same, offset removed | Head fitted on Aurora (10-fold) |
+|---|---|---|---|
+| Pulse-PPG | 13.51 y | 13.02 y | 7.30 y (r 0.60) |
+| our c1 | 6.61 y | 6.58 y | 5.94 y (r 0.76) |
+
+Pulse-PPG carries less age than our encoder, and its open-data head does not transfer at all (the median guess is
+9.63 y). It stays out of the clock.
