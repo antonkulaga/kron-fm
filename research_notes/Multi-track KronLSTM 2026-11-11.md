@@ -1,8 +1,8 @@
-# Multi-track KronLSTM: a design note (2026-11-11)
+# Multi-track KronLSTM: a design note (2026-11-11, updated 2026-11-12)
 
 The owner asked whether KronLSTM can read genome sequence and predict chromatin, expression and other tracks in
 parallel, so that the tracks teach each other and the model learns more biology. This note is the design and the
-data inventory; nothing here has run. The pilot is a GPU run of about 12 hours and waits for the owner's yes.
+data inventory; nothing here has run. The owner said yes to the pilot on 2026-11-12.
 
 ## Why
 
@@ -38,6 +38,25 @@ KronLSTM version would add what our backbone does cheaply: its recurrence runs i
 
 The intervals keep each test window out of training the same way the published models did, so a pilot can be
 scored against their published per-track correlations on the same test windows.
+
+## What the AlphaGenome papers suggest
+
+From AlphaGenome 1 (Nature 2026, doi 10.1038/s41586-025-10014-0) and AlphaGenome 2 (DeepMind, 2026-11-11,
+https://deepmind.google/blog/alphagenome-2-deciphering-how-cells-read-dna-to-better-understand-disease/):
+
+- A U-Net shape: base-level convolutions, a coarse long-range core (KronLSTM's place), skip connections back up to
+  base-level heads. Base resolution matters for splicing and accessibility; histone marks are fine at 128 bp.
+- Splicing at three levels: site, site usage, and donor-acceptor junctions (AG1's junction scorer alone beat
+  earlier methods on most splicing benchmarks).
+- Conditioning instead of thousands of parallel heads (AG2): one condition (cell type, tissue, state) and a species
+  identifier enter every stage through adaptive normalization; conditioning only the output layers gained little.
+  For kron-dna a species identifier fits the SynCodonLM corpus of 34k species.
+- Self-distillation: several teacher models of the same design, then one student trained on their averaged
+  predictions over randomly mutated inputs (AG1 and AG2 both report gains in variant-effect prediction).
+- Long training windows help (AG1: 1 Mb beat 32 kb even when both were evaluated at 1 Mb).
+
+**AlphaGenome as a teacher** (the owner's call, 2026-11-12): AG2 predictions through the API on the Enformer windows
+can serve as training targets, for chosen conditions, where measured tracks cost a paid download.
 
 ## The pilot, if approved
 

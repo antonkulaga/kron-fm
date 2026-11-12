@@ -159,3 +159,21 @@ def test_alphagenome_scores_cache_and_resume(tmp_path, monkeypatch):
     calls.clear()
     V.alphagenome_scores(table, positions, "", cache, scorers=("SPLICE_SITES",), workers=1, client=Fake())
     assert calls == [3] * 5                                        # the two scored are cached; the failure is retried
+
+
+def test_alphagenome2_keeps_the_largest_effect_over_conditions(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    seen = []
+
+    class Fake:
+        def score_variant(self, interval, variant, variant_scorers, condition=None):
+            seen.append(condition)
+            effect = {"A": 0.2, "B": 0.7}[condition]
+            return [SimpleNamespace(X=np.array([[effect]])) for _ in variant_scorers]
+
+    table = pl.DataFrame({"id": ["a"]})
+    positions = pl.DataFrame({"id": ["a"], "chrom": ["1"], "pos": [10], "ref": ["A"], "alt": ["G"]})
+    out = V.alphagenome_scores(table, positions, "", tmp_path / "ag2.parquet", scorers=("SPLICE_SITES",),
+                               workers=1, client=Fake(), version=2, conditions=("A", "B"))
+    assert seen == ["A", "B"] and out["alphagenome2:splice_sites"][0] == -0.7

@@ -185,7 +185,7 @@ wheels = [
 
 [[package]]
 name = "alphagenome"
-version = "0.11.0"
+version = "2.0.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "absl-py" },
@@ -208,9 +208,9 @@ dependencies = [
     { name = "typing-extensions" },
     { name = "zstandard" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/57/01/c12199a99f3b9989ce508a95928bd76b08955e25a7d419c807a23293b969/alphagenome-0.11.0.tar.gz", hash = "sha256:3afc81a6aeff9c1374fe2bf686b2340a248511da9e2c451b46527feb2de5d8c9", size = 8853150, upload-time = "2026-11-04T17:23:51.283Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/3e/b4/55a44b7d344cb50b425914aeb33f9f417c19b64903a24b5d4a3b02db2017/alphagenome-2.0.0.tar.gz", hash = "sha256:cb1d49d39fc82627b7eb387d979e898b7397a499284f711481fef59d5533b844", size = 12221598, upload-time = "2026-11-11T13:50:03.242Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/7e/32/e580c8ef06201bfbbfb5e2e447e7ee5b41b8fe1b51df494ef3798134cb34/alphagenome-0.11.0-py3-none-any.whl", hash = "sha256:6a57f513047295042a9ae92c37f6aeba145bb53af8411ee5b3554587b6f1a6b6", size = 232768, upload-time = "2026-11-04T17:23:49.542Z" },
+    { url = "https://files.pythonhosted.org/packages/b3/b8/5bd5ac7f79dfc71f3f99597ed8225d7e64a6ff44b3c8c1c0e06a712388e2/alphagenome-2.0.0-py3-none-any.whl", hash = "sha256:b76e97d69a806f19400e1d404345b180994e5c4d0ab9690c03380805fd65ee4d", size = 358130, upload-time = "2026-11-11T13:50:01.443Z" },
 ]
 
 [[package]]
@@ -1251,7 +1251,7 @@ requires-dist = [
 
 [package.metadata.requires-dev]
 baselines = [
-    { name = "alphagenome", specifier = ">=0.11.0" },
+    { name = "alphagenome", specifier = ">=2.0.0" },
     { name = "fair-esm", specifier = ">=2.0.0" },
 ]
 dev = [{ name = "pytest", specifier = ">=8.3" }]

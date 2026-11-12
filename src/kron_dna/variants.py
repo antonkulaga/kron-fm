@@ -302,20 +302,29 @@ ALPHAGENOME_SCORERS = ("SPLICE_SITES", "SPLICE_SITE_USAGE", "SPLICE_JUNCTIONS", 
 
 def alphagenome_scores(table: pl.DataFrame, positions: pl.DataFrame, api_key: str, cache: Path,
                        scorers: tuple[str, ...] = ALPHAGENOME_SCORERS, workers: int = 4,
-                       client=None) -> dict[str, np.ndarray]:
+                       client=None, version: int = 1, conditions: tuple[str, ...] = ()) -> dict[str, np.ndarray]:
     """AlphaGenome's recommended variant scorers over a 100 kb window, one score per scorer: ``-max |effect|``
     over its tracks (and genes, for RNA_SEQ), so lower means a larger predicted effect, as for the other scores.
+
+    ``version`` 2 is AlphaGenome 2, which predicts one condition (tissue, cell type) per call: each variant is scored
+    in every one of ``conditions``, and the largest effect over them is kept. Its scores are named ``alphagenome2:``.
 
     Results are appended to ``cache`` (a parquet keyed by ``id``) as they arrive, so a rerun skips what is done;
     a failed call is retried 5 times, then left NaN and not cached, so a rerun tries it again. ``client`` stands
     in for the API in tests."""
     from concurrent.futures import ThreadPoolExecutor
 
-    if client is None:
-        from alphagenome.models import dna_client
-        client = dna_client.create(api_key)
+    from importlib import import_module
+
     from alphagenome.data import genome
-    from alphagenome.models import dna_client, variant_scorers as VS
+
+    if version == 2 and not conditions:
+        raise ValueError("AlphaGenome 2 needs at least one condition")
+    dna_client = import_module(f"alphagenome.models.v{version}.dna_client")
+    VS = import_module(f"alphagenome.models.v{version}.variant_scorers")
+    if client is None:
+        client = dna_client.create(api_key)
+    per_call = list(conditions) if version == 2 else [None]
 
     chosen = [VS.RECOMMENDED_VARIANT_SCORERS[k] for k in scorers]
     done = pl.read_parquet(cache) if cache.exists() else pl.DataFrame(schema={"id": pl.Utf8, **{k: pl.Float64 for k in scorers}})
@@ -325,15 +334,22 @@ def alphagenome_scores(table: pl.DataFrame, positions: pl.DataFrame, api_key: st
     def one(row: dict) -> dict:
         v = genome.Variant(chromosome=f"chr{row['chrom']}", position=int(row["pos"]),
                            reference_bases=row["ref"], alternate_bases=row["alt"])
-        for attempt in range(5):
-            try:
-                res = client.score_variant(interval=v.reference_interval.resize(dna_client.SEQUENCE_LENGTH_100KB),
-                                           variant=v, variant_scorers=chosen)
-                return {"id": row["id"], **{k: float(np.nanmax(np.abs(r.X))) if r.X.size else float("nan")
-                                            for k, r in zip(scorers, res)}}
-            except Exception:                                 # transient gRPC / proxy failures
-                time.sleep(2 ** attempt)
-        return None
+        best = {k: float("nan") for k in scorers}
+        for condition in per_call:
+            extra = {"condition": condition} if condition else {}
+            for attempt in range(5):
+                try:
+                    res = client.score_variant(interval=v.reference_interval.resize(dna_client.SEQUENCE_LENGTH_100KB),
+                                               variant=v, variant_scorers=chosen, **extra)
+                    break
+                except Exception:                             # transient gRPC / proxy failures
+                    time.sleep(2 ** attempt)
+            else:
+                return None
+            for k, r in zip(scorers, res):
+                if r.X.size:
+                    best[k] = float(np.nanmax([best[k], float(np.nanmax(np.abs(r.X)))]))
+        return {"id": row["id"], **best}
 
     rows = todo.to_dicts()
     with ThreadPoolExecutor(workers) as pool:
@@ -343,7 +359,8 @@ def alphagenome_scores(table: pl.DataFrame, positions: pl.DataFrame, api_key: st
             done.write_parquet(cache)
             print(f"AlphaGenome: {done.height:,} variants scored", flush=True)
     joined = table.select("id").join(done, on="id", how="left", maintain_order="left")
-    return {f"alphagenome:{k.lower()}": -joined[k].fill_null(float("nan")).to_numpy().astype(float) for k in scorers}
+    prefix = "alphagenome" if version == 1 else "alphagenome2"
+    return {f"{prefix}:{k.lower()}": -joined[k].fill_null(float("nan")).to_numpy().astype(float) for k in scorers}
 
 
 def bootstrap_ci(metric, *arrays: np.ndarray, n: int = 1000, seed: int = 0, level: float = 0.95) -> list[float] | None:

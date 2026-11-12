@@ -444,6 +444,9 @@ def clinvar(vcf: Path = typer.Option(None, help="ClinVar GRCh38 VCF (default: da
             alphamissense: Path | None = typer.Option(None, help="AlphaMissense_hg38.tsv.gz: score its pathogenicity too"),
             alphagenome_key: Path | None = typer.Option(None, help="a file holding an AlphaGenome API key: score "
                                                         "its splicing and RNA-seq effects too (`baselines` group)"),
+            alphagenome_version: int = typer.Option(1, help="1, or 2 for AlphaGenome 2 (needs --ag-condition)"),
+            ag_conditions: list[str] = typer.Option([], "--ag-condition", help="AlphaGenome 2 conditions (e.g. "
+                                                    "UBERON:0001134); the largest effect over them is kept"),
             esm_models: list[str] = typer.Option([], "--esm", help="ESM-2 models to score missense with "
                                                  "(e.g. esm2_t33_650M_UR50D; needs the `baselines` group)"),
             out: Path | None = typer.Option(None, help="results JSON (default: data/output/eval/clinvar/zero_shot.json)"),
@@ -483,8 +486,10 @@ def clinvar(vcf: Path = typer.Option(None, help="ClinVar GRCh38 VCF (default: da
     positions = (V.read_clinvar(vcf).filter(pl.col("id").is_in(table["id"].implode()))
                  if alphamissense or alphagenome_key else None)
     if alphagenome_key:
+        cache = "alphagenome.parquet" if alphagenome_version == 1 else "alphagenome2.parquet"
         scores |= V.alphagenome_scores(table, positions, alphagenome_key.read_text().strip(),
-                                       interim_dir("cds", "clinvar") / "alphagenome.parquet")
+                                       interim_dir("cds", "clinvar") / cache, version=alphagenome_version,
+                                       conditions=tuple(ag_conditions))
     if alphamissense:
         scores["alphamissense"] = V.alphamissense_scores(table, positions, alphamissense)
         typer.echo(f"AlphaMissense: {int(np.isfinite(scores['alphamissense']).sum()):,} of {table.height:,} variants scored")
