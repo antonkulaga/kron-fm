@@ -144,7 +144,8 @@ corpus (it saw no ClinVar labels):
 | mlm (SynCodonLM, 75k steps, 1,000-codon window) | 0.737 (0.727-0.747) | 0.670 (0.623-0.715) | 0.429 (0.407-0.451) |
 | mlm (SynCodonLM, 100k steps, 1,000-codon window) | 0.762 (0.752-0.771) | 0.685 (0.640-0.730) | 0.443 (0.422-0.465) |
 | mlm (SynCodonLM, 125k steps, 1,000-codon window) | 0.776 (0.766-0.784) | 0.707 (0.663-0.751) | 0.437 (0.416-0.459) |
-| mlm (SynCodonLM, 150k steps, 1,000-codon window) | **0.790** (0.782-0.799) | **0.723** (0.678-0.769) | 0.439 (0.418-0.461) |
+| mlm (SynCodonLM, 150k steps, 1,000-codon window) | 0.790 (0.782-0.799) | 0.723 (0.678-0.769) | 0.439 (0.418-0.461) |
+| mlm (SynCodonLM, 175k steps, 1,000-codon window) | **0.797** (0.789-0.806) | **0.743** (0.700-0.784) | 0.447 (0.426-0.470) |
 | codon-usage delta | 0.539 (0.528-0.550) | 0.593 (0.545-0.642) | 0.533 (0.510-0.556) |
 | GC delta | 0.467 (0.457-0.476) | 0.418 (0.373-0.465) | **0.602** (0.586-0.618) |
 
@@ -172,6 +173,7 @@ the human runs' 5% gene hold-out (263 P / 213 B missense). A score covers only w
 | AlphaMissense | protein, structure, population frequency | **0.966** (0.963-0.969) | **0.950** (0.933-0.967) | - |
 | AlphaGenome, splice junctions | 100 kb of genome | 0.594 (0.582-0.605) | 0.540 (0.494-0.594) | **0.939** (0.926-0.951) |
 | AlphaGenome, RNA-seq | 100 kb of genome | 0.530 (0.519-0.541) | 0.489 (0.434-0.541) | 0.810 (0.793-0.830) |
+| AlphaGenome 2, splice junctions (max of muscle, frontal cortex, liver) | 100 kb of genome, per tissue | 0.581 (0.570-0.592) | - | 0.940 (0.928-0.953) |
 | GC delta | the substitution | 0.467 (0.457-0.476) | 0.418 (0.373-0.465) | 0.602 (0.586-0.618) |
 
 The codon model is far behind on both classes. On missense, a protein language model of a similar size (ESM-2,
@@ -180,7 +182,10 @@ ClinVar's benign class is common variants, so its number is not a clean zero-sho
 the splicing scores of AlphaGenome reach 0.94, which confirms that pathogenic synonymous variants are mostly splicing
 variants: a model that reads only the CDS scores them poorly (kron-dna below chance; Encodon 1B 0.62, below). ESM-2 runs in fp32: in bf16 the same model drops to
 0.70, measured on 1,000 of these variants. AlphaGenome was called through its API with the scorers its client
-recommends, taking the largest absolute effect over the tracks. The AlphaGenome numbers here are derived from its
+recommends, taking the largest absolute effect over the tracks. AlphaGenome 2 (announced 2026-11-11) predicts one tissue or
+cell type per call; it was run in three tissues with measured splicing data and the largest effect kept. On these
+coding variants it matches AlphaGenome 1 (synonymous 0.940 vs 0.939); its reported gains are in cell-type-specific
+expression effects, which this test does not measure. The AlphaGenome numbers here are derived from its
 API output and are subject to the AlphaGenome Output Terms of Use: https://deepmind.google.com/science/alphagenome/output-terms
 
 **Evo 2 7B**, on a fixed subsample of the same variants (2,000 per class; all 756 pathogenic synonymous): the change
@@ -249,19 +254,19 @@ uv run kron-dna clinvar --esm esm2_t33_650M_UR50D --alphamissense AlphaMissense_
 same 68.6M model and batch, up to 300k steps. Its snapshots, by `evaluate` on 4,096 rows of each set
 (total / aa / syn bits per masked codon):
 
-| set | step 25k | step 50k | step 75k | step 100k | step 125k | step 150k | human `mlm`, 15k steps |
-|---|---|---|---|---|---|---|---|
-| held-out species | 4.879 / 3.606 / 1.273 | 4.735 / 3.474 / 1.261 | 4.642 / 3.387 / 1.256 | 4.568 / 3.316 / 1.252 | 4.504 / 3.255 / 1.249 | 4.449 / 3.203 / 1.246 | |
-| SynCodonLM test (species seen in training) | 4.892 / 3.622 / 1.270 | 4.757 / 3.498 / 1.259 | 4.668 / 3.414 / 1.254 | 4.596 / 3.346 / 1.250 | 4.533 / 3.286 / 1.246 | 4.479 / 3.236 / 1.243 | |
-| SynCodonLM test, the step-1 sample | 4.882 / 3.610 / 1.272 | 4.747 / 3.486 / 1.261 | 4.657 / 3.402 / 1.256 | 4.585 / 3.333 / 1.252 | 4.522 / 3.274 / 1.249 | 4.468 / 3.223 / 1.245 | 5.153 / - / 1.394 |
-| yeast | 5.099 / 3.727 / 1.372 | 5.018 / 3.650 / 1.368 | 4.977 / 3.610 / 1.367 | 4.939 / 3.577 / 1.363 | 4.905 / 3.545 / 1.360 | 4.882 / 3.522 / 1.359 | 5.342 / - / 1.492 |
-| held-out human genes | 4.788 / 3.528 / 1.260 | 4.645 / 3.401 / 1.245 | 4.542 / 3.306 / 1.236 | 4.458 / 3.228 / 1.230 | 4.381 / 3.155 / 1.226 | 4.317 / 3.095 / 1.221 | 4.784 / 3.526 / 1.258 |
+| set | step 25k | step 50k | step 75k | step 100k | step 125k | step 150k | step 175k | human `mlm`, 15k steps |
+|---|---|---|---|---|---|---|---|---|
+| held-out species | 4.879 / 3.606 / 1.273 | 4.735 / 3.474 / 1.261 | 4.642 / 3.387 / 1.256 | 4.568 / 3.316 / 1.252 | 4.504 / 3.255 / 1.249 | 4.449 / 3.203 / 1.246 | 4.401 / 3.157 / 1.244 | |
+| SynCodonLM test (species seen in training) | 4.892 / 3.622 / 1.270 | 4.757 / 3.498 / 1.259 | 4.668 / 3.414 / 1.254 | 4.596 / 3.346 / 1.250 | 4.533 / 3.286 / 1.246 | 4.479 / 3.236 / 1.243 | 4.431 / 3.190 / 1.241 | |
+| SynCodonLM test, the step-1 sample | 4.882 / 3.610 / 1.272 | 4.747 / 3.486 / 1.261 | 4.657 / 3.402 / 1.256 | 4.585 / 3.333 / 1.252 | 4.522 / 3.274 / 1.249 | 4.468 / 3.223 / 1.245 | 4.423 / 3.181 / 1.243 | 5.153 / - / 1.394 |
+| yeast | 5.099 / 3.727 / 1.372 | 5.018 / 3.650 / 1.368 | 4.977 / 3.610 / 1.367 | 4.939 / 3.577 / 1.363 | 4.905 / 3.545 / 1.360 | 4.882 / 3.522 / 1.359 | 4.858 / 3.500 / 1.358 | 5.342 / - / 1.492 |
+| held-out human genes | 4.788 / 3.528 / 1.260 | 4.645 / 3.401 / 1.245 | 4.542 / 3.306 / 1.236 | 4.458 / 3.228 / 1.230 | 4.381 / 3.155 / 1.226 | 4.317 / 3.095 / 1.221 | 4.262 / 3.045 / 1.217 | 4.784 / 3.526 / 1.258 |
 
 After 25k steps the corpus model already beats the human-only model on yeast and on SynCodonLM; after 50k it
 also beats it on human genes (4.645 against 4.784), the human-only model's own domain. Human is ~0.1% of
 SynCodonLM, and its genes there are not split by the human hold-out, so the "held-out human genes" row is not
 held out for this model. On the mRFP probe the snapshots reach test rho 0.695 (0.612-0.757) at 25k, 0.642 (0.545-0.715) at 50k and 0.648
-(0.549-0.725) at 75k 0.644 (0.555-0.720) at 100k, 0.674 (0.580-0.752) at 125k and 0.622 (0.525-0.709) at 150k, against 0.716
+(0.549-0.725) at 75k 0.644 (0.555-0.720) at 100k, 0.674 (0.580-0.752) at 125k 0.622 (0.525-0.709) at 150k and 0.667 (0.581-0.748) at 175k, against 0.716
 (0.632-0.780) for the human `mlm` model. These are 95% bootstrap intervals over the 219 test variants, and they all
 overlap: one gene's split cannot rank these models.
 
