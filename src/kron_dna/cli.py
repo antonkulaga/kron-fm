@@ -587,6 +587,69 @@ def genome_prepare(fasta: Path = typer.Argument(..., help="a genome FASTA (e.g. 
                f" -> {out}")
 
 
+@app.command("genome-labels")
+def genome_labels(regulatory: Path = typer.Option(None, help="Ensembl Regulatory Build GFF3 (default: data/input/regulation/"
+                                                  "ensembl116/Homo_sapiens.GRCh38.regulatory_features.v116.gff3.gz)"),
+                  activity: Path = typer.Option(None, help="its activity matrix TSV (feature_id, feature_type, then one "
+                                                "ACTIVE/INACTIVE column per epigenome)"),
+                  gtf: Path = typer.Option(None, help="GENCODE basic GTF (default: data/input/regulation/gencode/"
+                                           "gencode.basic.gtf.gz)"),
+                  name: str = typer.Option("hg38", help="prepared genome under data/interim/genome/")) -> None:
+    """Per-base label tracks for stage 2, laid out like ``bases.u8``: ``labels.u8`` (bits of ``LABEL_BITS``: Ensembl
+    promoter, enhancer, CTCF, open chromatin; GENCODE exon, splice donor, acceptor, CDS) and ``activity.u8`` (share of
+    the Regulatory Build's epigenomes where the covering feature is ACTIVE, 0..255; the largest where features overlap)."""
+    import numpy as np
+    import polars as pl
+    import polars_bio as pb
+
+    from kron_dna import genome as G
+
+    reg_dir = input_dir("regulation")
+    regulatory = regulatory or reg_dir / "ensembl116" / "Homo_sapiens.GRCh38.regulatory_features.v116.gff3.gz"
+    activity = activity or reg_dir / "ensembl116" / "Homo_sapiens.GRCh38.regulatory_activity.v116.tsv.gz"
+    gtf = gtf or reg_dir / "gencode" / "gencode.basic.gtf.gz"
+    out = interim_dir("genome", name)
+    index = pl.read_parquet(out / "contigs.parquet")
+    total = int((index["end"] - index["start"]).sum())
+    labels = np.zeros(total, dtype=np.uint8)
+    act = np.zeros(total, dtype=np.uint8)
+
+    acts = pl.read_csv(activity, separator="\t")
+    epis = acts.columns[2:]
+    acts = acts.select(id="feature_id", frac=pl.sum_horizontal(pl.col(c) == "ACTIVE" for c in epis) / len(epis))
+    reg = (pb.scan_gff(str(regulatory)).collect()
+           .with_columns(id=pl.col("attributes").list.eval(pl.element().struct.field("value")).list.first(),
+                         chrom="chr" + pl.col("chrom"), start=pl.col("start").cast(pl.Int64) - 1,
+                         end=pl.col("end").cast(pl.Int64))
+           .join(acts, on="id", how="left"))
+    typer.echo(f"regulatory: {reg.height} features, {len(epis)} epigenomes, "
+               f"{reg['frac'].is_null().sum()} without activity")
+    gt = (pb.scan_gtf(str(gtf), attr_fields=["transcript_id"]).filter(pl.col("type").is_in(["exon", "CDS"]))
+          .select(["chrom", "start", "end", "type", "strand", "transcript_id"]).collect())
+    exons = gt.filter(pl.col("type") == "exon")
+    donors, acceptors = G.splice_sites(exons)
+    tracks = [(reg.filter(pl.col("type") == t), G.LABEL_BITS[t]) for t in
+              ("promoter", "enhancer", "CTCF_binding_site", "open_chromatin_region")]
+    zero = lambda f: f.with_columns(start=pl.col("start").cast(pl.Int64) - 1, end=pl.col("end").cast(pl.Int64))
+    tracks += [(zero(exons), G.LABEL_BITS["exon"]), (zero(gt.filter(pl.col("type") == "CDS")), G.LABEL_BITS["CDS"]),
+               (donors, G.LABEL_BITS["donor"]), (acceptors, G.LABEL_BITS["acceptor"])]
+    counts = {}
+    for frame, bit in tracks:
+        n = 0
+        for (chrom,), part in frame.group_by("chrom"):
+            n += G.paint(index, chrom, part["start"].to_numpy(), part["end"].to_numpy(), labels, 1 << bit)
+        counts[bit] = n
+    for (chrom,), part in reg.filter(pl.col("frac").is_not_null()).group_by("chrom"):
+        G.paint(index, chrom, part["start"].to_numpy(), part["end"].to_numpy(), act,
+                np.round(part["frac"].to_numpy() * 255).astype(np.uint8), mode="max")
+    labels.tofile(out / "labels.u8")
+    act.tofile(out / "activity.u8")
+    for label, bit in G.LABEL_BITS.items():
+        share = float(((labels >> bit) & 1).mean())
+        typer.echo(f"{label:>22}: {counts[bit]:>9} intervals, {100 * share:6.3f} % of bases")
+    typer.echo(f"activity > 0 on {100 * float((act > 0).mean()):.2f} % of bases -> {out}")
+
+
 @app.command("genome-train")
 def genome_train(out: Path = typer.Argument(..., help="run directory (resumes from its checkpoint.pt)"),
                  name: str = typer.Option("hg38", help="prepared genome under data/interim/genome/"),
@@ -597,8 +660,12 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                  d_model: int = 384, n_layers: int = 8, stem_channels: int = 96, max_hours: float = 0.0,
                  n_down: int = typer.Option(7, help="halvings before the core: 2**n_down bases per core step"),
                  bench: bool = typer.Option(False, help="time one step and report peak memory, then stop"),
+                 labels: bool = typer.Option(False, help="stage 2: also predict the genome-labels tracks (TRACKS)"),
+                 init: Path | None = typer.Option(None, help="start a new run from this checkpoint's weights (stage 1)"),
+                 track_weight: float = typer.Option(1.0, help="weight of the track loss beside the masked-base loss"),
                  seed: int = 0) -> None:
-    """Stage 1 of the multi-track model: masked-base prediction over whole gap-free contigs (KronGenome)."""
+    """The multi-track model (KronGenome) over whole gap-free contigs: stage 1 masked-base prediction; with
+    ``--labels``, stage 2 adds the Ensembl and GENCODE tracks of ``genome-labels`` and writes ``tracks.csv``."""
     import numpy as np
     import polars as pl
 
@@ -608,6 +675,9 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
 
     src = interim_dir("genome", name)
     bases = np.memmap(src / "bases.u8", dtype=np.uint8, mode="r")
+    if labels:
+        lab_mm = np.memmap(src / "labels.u8", dtype=np.uint8, mode="r")
+        act_mm = np.memmap(src / "activity.u8", dtype=np.uint8, mode="r")
     index = pl.read_parquet(src / "contigs.parquet").with_columns((pl.col("end") - pl.col("start")).alias("len"))
     held = set(val_chroms.split(","))
     train_idx = index.filter(~pl.col("chrom").is_in(list(held)))
@@ -615,9 +685,9 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
     rng = np.random.default_rng(seed)
     unit = 2 ** n_down
 
-    def sample(table) -> tuple[torch.Tensor, torch.Tensor]:
+    def sample(table) -> tuple[torch.Tensor, ...]:
         p = table["len"].to_numpy() / table["len"].sum()                 # contigs by length: every base equally
-        seqs, segs = [], []
+        seqs, segs, labs, acts, valid = [], [], [], [], []
         for _ in range(batch_size):
             r = table.row(int(rng.choice(table.height, p=p)), named=True)
             take = min(window, r["len"])
@@ -628,11 +698,28 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
             seg[(take + unit - 1) // unit:] = 1                           # padding is its own segment
             seqs.append(codes)
             segs.append(seg)
-        return torch.from_numpy(np.stack(seqs)), torch.from_numpy(np.stack(segs))
+            if labels:
+                lab, act = np.zeros(window, dtype=np.uint8), np.zeros(window, dtype=np.uint8)
+                lab[:take], act[:take] = lab_mm[at:at + take], act_mm[at:at + take]
+                labs.append(lab)
+                acts.append(act)
+                valid.append(np.arange(window) < take)
+        batch = [torch.from_numpy(np.stack(seqs)), torch.from_numpy(np.stack(segs))]
+        if labels:
+            batch += [torch.from_numpy(np.stack(x)) for x in (labs, acts, valid)]
+        return tuple(batch)
 
     dev = torch.device("cuda")
-    config = G.KronGenomeConfig(d_model=d_model, n_layers=n_layers, stem_channels=stem_channels, n_down=n_down)
+    config = G.KronGenomeConfig(d_model=d_model, n_layers=n_layers, stem_channels=stem_channels, n_down=n_down,
+                                n_tracks=len(G.TRACKS) if labels else 0)
     model = G.KronGenome(config).to(dev)
+    pos_weight = None
+    if labels:                       # rare tracks (splice sites) weighted up by sqrt(neg/pos), from a sample of bases
+        probe = np.asarray(lab_mm[:: max(1, len(lab_mm) // 50_000_000)])
+        share = np.array([((probe >> b) & 1).mean() for b in range(len(G.LABEL_BITS))] + [0.5])
+        pos_weight = torch.tensor(np.clip(np.sqrt((1 - share) / np.maximum(share, 1e-9)), 1, 100),
+                                  dtype=torch.float32, device=dev)
+        typer.echo("track positive weights: " + ", ".join(f"{t} {w:.1f}" for t, w in zip(G.TRACKS, pos_weight)))
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.1, betas=(0.9, 0.95))
     out.mkdir(parents=True, exist_ok=True)
     ckpt = out / "checkpoint.pt"
@@ -643,28 +730,44 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
         opt.load_state_dict(state["optimizer"])
         step, hours = state["step"], state.get("hours", 0.0)
         typer.echo(f"resumed at step {step}")
+    elif init is not None and not bench:
+        missing, unexpected = model.load_state_dict(torch.load(init, map_location="cpu")["model"], strict=False)
+        typer.echo(f"initialised from {init}; new: {missing}; dropped: {unexpected}")
     typer.echo(f"KronGenome {model.n_parameters() / 1e6:.1f}M parameters, window {window:,} bases, "
                f"{train_idx.height} train / {val_idx.height} held-out contigs")
     autocast = torch.autocast("cuda", dtype=torch.bfloat16)
 
-    def loss_on(seq, seg):
-        inputs, labels = G.mask_bases(seq.to(dev), mask_prob)
+    def loss_on(seq, seg, lab=None, act=None, valid=None, keep=None):
+        inputs, targets = G.mask_bases(seq.to(dev), mask_prob)
         with autocast:
-            logits, _ = model(inputs, seg.to(dev))
-        return F.cross_entropy(logits.float().reshape(-1, 4), labels.reshape(-1), ignore_index=-100)
+            logits, _, tracks = model(inputs, seg.to(dev))
+        mlm = F.cross_entropy(logits.float().reshape(-1, 4), targets.reshape(-1), ignore_index=-100)
+        if lab is None:
+            return mlm, None
+        want = G.track_targets(lab.to(dev), act.to(dev))
+        ok = valid.to(dev)
+        per = F.binary_cross_entropy_with_logits(tracks.float(), want, pos_weight=pos_weight, reduction="none")
+        track = (per * ok.unsqueeze(-1)).sum() / (ok.sum() * per.shape[-1])
+        if keep is not None:                                      # held-out scores for tracks.csv
+            keep.append((tracks.float()[ok], want[ok]))
+        return mlm, track
 
     t0, started = time.time(), time.time()
     metrics = out / "metrics.csv"
     if not metrics.exists():
-        metrics.write_text("step,lr,train_loss,val_bits_per_base,hours\n")
+        metrics.write_text("step,lr,train_loss,val_bits_per_base,hours" + (",train_track_loss,val_track_loss"
+                                                                           if labels else "") + "\n")
+    track_csv = out / "tracks.csv"
+    if labels and not track_csv.exists():
+        track_csv.write_text("step,track,auroc,average_precision,prevalence\n")
     model.train()
     while step < steps:
         for g in opt.param_groups:
             g["lr"] = lr * min(1.0, (step + 1) / warmup) * 0.5 * (1 + math.cos(math.pi * min(step / steps, 1.0)))
         torch.cuda.reset_peak_memory_stats(dev)
-        loss = loss_on(*sample(train_idx))
+        loss, track = loss_on(*sample(train_idx))
         opt.zero_grad(set_to_none=True)
-        loss.backward()
+        (loss + track_weight * track if track is not None else loss).backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         opt.step()
         step += 1
@@ -676,15 +779,28 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
         out_of_time = max_hours > 0 and time.time() - started > max_hours * 3600
         if step % eval_every == 0 or step == steps or out_of_time:
             model.eval()
+            keep: list = []
             with torch.no_grad():
-                vals = [loss_on(*sample(val_idx)).item() for _ in range(8)]
+                pairs = [loss_on(*sample(val_idx), keep=keep if labels else None) for _ in range(8)]
             model.train()
             h = hours + (time.time() - t0) / 3600
-            bits = float(np.mean(vals)) / math.log(2)
+            bits = float(np.mean([m.item() for m, _ in pairs])) / math.log(2)
+            extra = ""
+            if labels:
+                val_track = float(np.mean([t.item() for _, t in pairs]))
+                extra = f",{track.item():.4f},{val_track:.4f}"
+                scores = torch.cat([k[0] for k in keep])
+                truth = torch.cat([k[1] for k in keep])
+                with track_csv.open("a") as fh:
+                    for j, name_ in enumerate(G.TRACKS):
+                        y = truth[:, j] >= 0.5
+                        auroc, ap = G.ranking_scores(scores[:, j], y)
+                        fh.write(f"{step},{name_},{auroc:.4f},{ap:.4f},{float(y.float().mean()):.6f}\n")
+                del keep, scores, truth
             with metrics.open("a") as fh:
-                fh.write(f"{step},{opt.param_groups[0]['lr']:.3e},{loss.item():.4f},{bits:.4f},{h:.3f}\n")
+                fh.write(f"{step},{opt.param_groups[0]['lr']:.3e},{loss.item():.4f},{bits:.4f},{h:.3f}{extra}\n")
             typer.echo(f"step {step}: train {loss.item():.4f}, held-out {bits:.3f} bits/base, {h:.2f} h, "
-                       f"peak {torch.cuda.max_memory_allocated(dev) / 2**30:.1f} GiB")
+                       f"peak {torch.cuda.max_memory_allocated(dev) / 2**30:.1f} GiB" + (f", tracks {extra}" if extra else ""))
             _save_atomic({"model": model.state_dict(), "optimizer": opt.state_dict(), "config": config.to_dict(),
                           "step": step, "hours": h}, ckpt)
         if out_of_time:

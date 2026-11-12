@@ -32,7 +32,7 @@ def test_forward_shapes_cuda():
     seq = torch.randint(0, 4, (2, 1024), device="cuda")
     seg = torch.zeros(2, 1024 // 16, dtype=torch.long, device="cuda")
     seg[:, 32:] = 1
-    logits, core = model(seq, seg)
+    logits, core, _ = model(seq, seg)
     assert logits.shape == (2, 1024, 4) and core.shape == (2, 64, 64)
 
 
@@ -41,3 +41,64 @@ def test_encode_and_split_contigs():
     codes = G.encode_bases(seq)
     assert codes[:4].tolist() == [0, 1, 2, 3] and codes[84] == 4                      # R -> N
     assert G.contigs_of(codes, min_gap=50, min_len=5) == [(0, 20), (80, len(seq))]     # the 10-N run stays inside
+
+
+def test_paint_maps_chromosome_coordinates_into_contigs():
+    import numpy as np
+    import polars as pl
+    index = pl.DataFrame({"chrom": ["chr1", "chr1"], "start": [100, 500], "end": [200, 600], "offset": [0, 100]})
+    out = np.zeros(200, dtype=np.uint8)
+    n = G.paint(index, "chr1", np.array([150, 190, 300]), np.array([160, 520, 310]), out, 1 << 2)
+    assert n == 3                                            # the third interval falls in a gap; the second spans it
+    assert out[50:60].tolist() == [4] * 10 and out[90:100].tolist() == [4] * 10 and out[100:120].tolist() == [4] * 20
+    act = np.zeros(200, dtype=np.uint8)
+    G.paint(index, "chr1", np.array([150]), np.array([152]), act, 7, mode="max")
+    G.paint(index, "chr1", np.array([150]), np.array([152]), act, 3, mode="max")
+    assert act[50:52].tolist() == [7, 7]
+
+
+def test_splice_sites_by_strand():
+    import polars as pl
+    ex = pl.DataFrame({"chrom": ["chr1"] * 4, "start": [101, 201, 101, 201], "end": [150, 250, 150, 250],
+                       "strand": ["+", "+", "-", "-"], "transcript_id": ["a", "a", "b", "b"]})
+    donors, acceptors = G.splice_sites(ex)
+    # intron 151..200 (1-based) = 0-based [150, 200): GT at [150,152) on +, AG at [198,200) on +; swapped on -
+    d = {(r["strand"], r["start"], r["end"]) for r in donors.iter_rows(named=True)}
+    a = {(r["strand"], r["start"], r["end"]) for r in acceptors.iter_rows(named=True)}
+    assert d == {("+", 150, 152), ("-", 198, 200)} and a == {("+", 198, 200), ("-", 150, 152)}
+
+
+def test_paint_takes_a_value_per_interval():
+    import numpy as np
+    import polars as pl
+    index = pl.DataFrame({"chrom": ["chr1"], "start": [0], "end": [10], "offset": [0]})
+    out = np.zeros(10, dtype=np.uint8)
+    G.paint(index, "chr1", np.array([0, 2]), np.array([4, 6]), out, np.array([5, 9]), mode="max")
+    assert out.tolist() == [5, 5, 9, 9, 9, 9, 0, 0, 0, 0]
+
+
+def test_track_targets_unpack_bits_and_activity():
+    import torch
+    lab = torch.tensor([[0b10000001, 0]], dtype=torch.uint8)
+    act = torch.tensor([[255, 0]], dtype=torch.uint8)
+    t = G.track_targets(lab, act)
+    assert t.shape == (1, 2, len(G.TRACKS))
+    assert t[0, 0].tolist() == [1, 0, 0, 0, 0, 0, 0, 1, 1] and t[0, 1].sum() == 0
+
+
+def test_ranking_scores_match_sklearn():
+    import numpy as np
+    import torch
+    from sklearn.metrics import average_precision_score, roc_auc_score
+    rng = np.random.default_rng(0)
+    y = rng.random(500) < 0.1
+    s = rng.random(500) + y * 0.5
+    auroc, ap = G.ranking_scores(torch.tensor(s), torch.tensor(y))
+    assert abs(auroc - roc_auc_score(y, s)) < 1e-6 and abs(ap - average_precision_score(y, s)) < 1e-6
+
+
+def test_track_head_shape_on_cpu_free_parts():
+    import torch
+    c = G.KronGenomeConfig(d_model=32, n_heads=2, n_layers=1, ff_units=64, stem_channels=8, n_down=3, n_tracks=9)
+    m = G.KronGenome(c)
+    assert m.tracks.out_channels == 9 and m.tracks.in_channels == 8

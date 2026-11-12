@@ -34,6 +34,7 @@ class KronGenomeConfig:
     dropout: float = 0.1
     stem_channels: int = 96     # channels at single-base resolution
     n_down: int = 7             # 2**7 = 128-bp bins
+    n_tracks: int = 0           # stage 2: per-base track logits beside the masked-base head (TRACKS)
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -56,7 +57,8 @@ class ConvBlock(nn.Module):
 
 
 class KronGenome(nn.Module):
-    """``[B, L]`` bases (L a multiple of ``2**n_down``) -> ``[B, L, 4]`` masked-base logits and the core states.
+    """``[B, L]`` bases (L a multiple of ``2**n_down``) -> ``[B, L, 4]`` masked-base logits, the core states and, with
+    ``n_tracks``, ``[B, L, n_tracks]`` track logits (else None).
 
     ``segments`` (``[B, L // 2**n_down]`` int, optional) gives each bin a segment id; the recurrence restarts at every
     change of id, so windows that span a gap are split into independent pieces. Default: one segment per row."""
@@ -72,8 +74,10 @@ class KronGenome(nn.Module):
         self.core_norm = nn.RMSNorm(c.d_model, eps=1e-5)
         self.up = nn.ModuleList(ConvBlock(widths[i + 1], widths[i]) for i in reversed(range(c.n_down)))
         self.head = nn.Conv1d(widths[0], 4, 1)
+        self.tracks = nn.Conv1d(widths[0], c.n_tracks, 1) if c.n_tracks else None
 
-    def forward(self, seq: torch.Tensor, segments: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, seq: torch.Tensor, segments: torch.Tensor | None = None
+                ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
         c = self.config
         b, length = seq.shape
         if length % (2 ** c.n_down):
@@ -99,7 +103,8 @@ class KronGenome(nn.Module):
         x = core.transpose(1, 2)
         for block, skip in zip(self.up, reversed(skips)):
             x = block(F.interpolate(x, scale_factor=2, mode="nearest")) + skip
-        return self.head(x).transpose(1, 2), core
+        tracks = self.tracks(x).transpose(1, 2) if self.tracks is not None else None   # [B, L, n_tracks]
+        return self.head(x).transpose(1, 2), core, tracks
 
     def n_parameters(self) -> int:
         return sum(p.numel() for p in self.parameters())
@@ -138,3 +143,75 @@ def contigs_of(codes: np.ndarray, min_gap: int = 50, min_len: int = 10_000) -> l
             out.append((start, s))
         start = e
     return out
+
+
+#: Bits of the per-base label byte (genome-labels).
+LABEL_BITS = {"promoter": 0, "enhancer": 1, "CTCF_binding_site": 2, "open_chromatin_region": 3,
+              "exon": 4, "donor": 5, "acceptor": 6, "CDS": 7}
+
+
+def paint(index, chrom: str, starts: np.ndarray, ends: np.ndarray, out: np.ndarray, value,
+          mode: str = "or") -> int:
+    """Write ``value`` over the 0-based half-open ``[starts, ends)`` of ``chrom`` into ``out``, an array laid out like
+    the contig bases (``index`` rows: chrom, start, end, offset). ``value`` is one number or one per interval.
+    ``mode`` "or" sets bits, "max" keeps the larger. Returns how many intervals touched a contig."""
+    values = np.broadcast_to(np.asarray(value, dtype=np.uint8), (len(starts),))
+    rows = index.filter(index["chrom"] == chrom).sort("start")
+    cs, ce, co = (rows[c].to_numpy() for c in ("start", "end", "offset"))
+    touched = 0
+    for s, e, v in zip(starts, ends, values):
+        i = max(0, int(np.searchsorted(cs, s, side="right")) - 1)
+        while i < len(cs) and cs[i] < e:
+            lo, hi = max(s, cs[i]), min(e, ce[i])
+            if lo < hi:
+                seg = out[co[i] + lo - cs[i]: co[i] + hi - cs[i]]
+                if mode == "or":
+                    seg |= v
+                else:
+                    np.maximum(seg, v, out=seg)
+                touched += 1
+            i += 1
+    return touched
+
+
+def splice_sites(exons):
+    """GENCODE exons (polars: chrom, start, end 1-based closed, strand, transcript_id) -> two frames of 0-based
+    half-open 2-bp intervals, ``(donors, acceptors)``: the intron's first two bases and last two, by strand."""
+    import polars as pl
+    introns = (exons.sort("transcript_id", "start")
+               .with_columns(nxt=pl.col("start").shift(-1).over("transcript_id"))
+               .filter(pl.col("nxt").is_not_null())
+               .select("chrom", "strand", i0=pl.col("end").cast(pl.Int64), i1=pl.col("nxt").cast(pl.Int64) - 1))
+    head = introns.select("chrom", "strand", start=pl.col("i0"), end=pl.col("i0") + 2)      # 0-based [end, end+2)
+    tail = introns.select("chrom", "strand", start=pl.col("i1") - 2, end=pl.col("i1"))
+    plus, minus = pl.col("strand") == "+", pl.col("strand") == "-"
+    donors = pl.concat([head.filter(plus), tail.filter(minus)]).unique()
+    acceptors = pl.concat([tail.filter(plus), head.filter(minus)]).unique()
+    return donors, acceptors
+
+
+#: Stage-2 track outputs: the label bits in order, then the activity share.
+TRACKS = [*LABEL_BITS, "activity"]
+
+
+def track_targets(labels: torch.Tensor, activity: torch.Tensor) -> torch.Tensor:
+    """``[B, L]`` uint8 label bytes and activity (0..255) -> ``[B, L, len(TRACKS)]`` float targets in [0, 1]."""
+    bits = torch.arange(len(LABEL_BITS), device=labels.device)
+    out = ((labels.long().unsqueeze(-1) >> bits) & 1).float()
+    return torch.cat([out, activity.float().unsqueeze(-1) / 255], dim=-1)
+
+
+def ranking_scores(scores: torch.Tensor, labels: torch.Tensor) -> tuple[float, float]:
+    """``(AUROC, average precision)`` of 1-D ``scores`` against 0/1 ``labels`` (ties broken by order); NaN without
+    both classes. Runs on whatever device the tensors are on."""
+    labels = labels.float()
+    pos = labels.sum()
+    neg = labels.numel() - pos
+    if pos == 0 or neg == 0:
+        return float("nan"), float("nan")
+    order = torch.argsort(scores, descending=True)
+    hit = labels[order]
+    tp = torch.cumsum(hit, 0)
+    ap = (tp / torch.arange(1, hit.numel() + 1, device=hit.device) * hit).sum() / pos
+    auroc = ((1 - hit) * (pos - tp)).sum() / (pos * neg)        # positives ranked below each negative
+    return float(1 - auroc), float(ap)
