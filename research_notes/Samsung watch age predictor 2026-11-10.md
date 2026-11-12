@@ -138,7 +138,11 @@ against young students, and a new device carries its own offset of up to 10-25 y
 offset happened to be small; it does not show the clock is calibrated on a Galaxy Watch.
 
 The fix is people of known, varied age recorded on the target watch, to fit the watch's offset (or the head)
-there: no open Galaxy Watch set has people over about 35. Until then a single person's age from the watch is not a
+there: no open Galaxy Watch set has people over about 35. How many: with one open set held out, shifting the head by
+the mean error of k of that set's people (an offset only) brings the worst cases down from 10-25 y to 4-7 y already
+at k = 3-5 (c1: PPG Sport 24.7 -> 4.0, Vilnius 19.7 -> 6.7; the 5 Hz head: Galaxy Active2 12.6 -> 4.6); more people
+change little. Within these narrow-age sets a small error mostly reflects their small age spread, so this shows the
+offset is fixed, not that people are ranked well inside one watch. Script: `scripts/kron_ppg_device_calibration.py`. Until then a single person's age from the watch is not a
 number to report. Script: `scripts/kron_ppg_device_offsets.py`.
 
 ## Limits
