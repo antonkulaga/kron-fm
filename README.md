@@ -145,7 +145,8 @@ corpus (it saw no ClinVar labels):
 | mlm (SynCodonLM, 100k steps, 1,000-codon window) | 0.762 (0.752-0.771) | 0.685 (0.640-0.730) | 0.443 (0.422-0.465) |
 | mlm (SynCodonLM, 125k steps, 1,000-codon window) | 0.776 (0.766-0.784) | 0.707 (0.663-0.751) | 0.437 (0.416-0.459) |
 | mlm (SynCodonLM, 150k steps, 1,000-codon window) | 0.790 (0.782-0.799) | 0.723 (0.678-0.769) | 0.439 (0.418-0.461) |
-| mlm (SynCodonLM, 175k steps, 1,000-codon window) | **0.797** (0.789-0.806) | **0.743** (0.700-0.784) | 0.447 (0.426-0.470) |
+| mlm (SynCodonLM, 175k steps, 1,000-codon window) | 0.797 (0.789-0.806) | 0.743 (0.700-0.784) | 0.447 (0.426-0.470) |
+| mlm (SynCodonLM, 200k steps, 1,000-codon window) | **0.807** (0.799-0.816) | **0.763** (0.718-0.804) | 0.444 (0.423-0.466) |
 | codon-usage delta | 0.539 (0.528-0.550) | 0.593 (0.545-0.642) | 0.533 (0.510-0.556) |
 | GC delta | 0.467 (0.457-0.476) | 0.418 (0.373-0.465) | **0.602** (0.586-0.618) |
 
@@ -254,19 +255,19 @@ uv run kron-dna clinvar --esm esm2_t33_650M_UR50D --alphamissense AlphaMissense_
 same 68.6M model and batch, up to 300k steps. Its snapshots, by `evaluate` on 4,096 rows of each set
 (total / aa / syn bits per masked codon):
 
-| set | step 25k | step 50k | step 75k | step 100k | step 125k | step 150k | step 175k | human `mlm`, 15k steps |
-|---|---|---|---|---|---|---|---|---|
-| held-out species | 4.879 / 3.606 / 1.273 | 4.735 / 3.474 / 1.261 | 4.642 / 3.387 / 1.256 | 4.568 / 3.316 / 1.252 | 4.504 / 3.255 / 1.249 | 4.449 / 3.203 / 1.246 | 4.401 / 3.157 / 1.244 | |
-| SynCodonLM test (species seen in training) | 4.892 / 3.622 / 1.270 | 4.757 / 3.498 / 1.259 | 4.668 / 3.414 / 1.254 | 4.596 / 3.346 / 1.250 | 4.533 / 3.286 / 1.246 | 4.479 / 3.236 / 1.243 | 4.431 / 3.190 / 1.241 | |
-| SynCodonLM test, the step-1 sample | 4.882 / 3.610 / 1.272 | 4.747 / 3.486 / 1.261 | 4.657 / 3.402 / 1.256 | 4.585 / 3.333 / 1.252 | 4.522 / 3.274 / 1.249 | 4.468 / 3.223 / 1.245 | 4.423 / 3.181 / 1.243 | 5.153 / - / 1.394 |
-| yeast | 5.099 / 3.727 / 1.372 | 5.018 / 3.650 / 1.368 | 4.977 / 3.610 / 1.367 | 4.939 / 3.577 / 1.363 | 4.905 / 3.545 / 1.360 | 4.882 / 3.522 / 1.359 | 4.858 / 3.500 / 1.358 | 5.342 / - / 1.492 |
-| held-out human genes | 4.788 / 3.528 / 1.260 | 4.645 / 3.401 / 1.245 | 4.542 / 3.306 / 1.236 | 4.458 / 3.228 / 1.230 | 4.381 / 3.155 / 1.226 | 4.317 / 3.095 / 1.221 | 4.262 / 3.045 / 1.217 | 4.784 / 3.526 / 1.258 |
+| set | step 25k | step 50k | step 75k | step 100k | step 125k | step 150k | step 175k | step 200k | human `mlm`, 15k steps |
+|---|---|---|---|---|---|---|---|---|---|
+| held-out species | 4.879 / 3.606 / 1.273 | 4.735 / 3.474 / 1.261 | 4.642 / 3.387 / 1.256 | 4.568 / 3.316 / 1.252 | 4.504 / 3.255 / 1.249 | 4.449 / 3.203 / 1.246 | 4.401 / 3.157 / 1.244 | 4.363 / 3.121 / 1.242 | |
+| SynCodonLM test (species seen in training) | 4.892 / 3.622 / 1.270 | 4.757 / 3.498 / 1.259 | 4.668 / 3.414 / 1.254 | 4.596 / 3.346 / 1.250 | 4.533 / 3.286 / 1.246 | 4.479 / 3.236 / 1.243 | 4.431 / 3.190 / 1.241 | 4.391 / 3.153 / 1.238 | |
+| SynCodonLM test, the step-1 sample | 4.882 / 3.610 / 1.272 | 4.747 / 3.486 / 1.261 | 4.657 / 3.402 / 1.256 | 4.585 / 3.333 / 1.252 | 4.522 / 3.274 / 1.249 | 4.468 / 3.223 / 1.245 | 4.423 / 3.181 / 1.243 | 4.385 / 3.144 / 1.240 | 5.153 / - / 1.394 |
+| yeast | 5.099 / 3.727 / 1.372 | 5.018 / 3.650 / 1.368 | 4.977 / 3.610 / 1.367 | 4.939 / 3.577 / 1.363 | 4.905 / 3.545 / 1.360 | 4.882 / 3.522 / 1.359 | 4.858 / 3.500 / 1.358 | 4.839 / 3.482 / 1.357 | 5.342 / - / 1.492 |
+| held-out human genes | 4.788 / 3.528 / 1.260 | 4.645 / 3.401 / 1.245 | 4.542 / 3.306 / 1.236 | 4.458 / 3.228 / 1.230 | 4.381 / 3.155 / 1.226 | 4.317 / 3.095 / 1.221 | 4.262 / 3.045 / 1.217 | 4.213 / 3.000 / 1.213 | 4.784 / 3.526 / 1.258 |
 
 After 25k steps the corpus model already beats the human-only model on yeast and on SynCodonLM; after 50k it
 also beats it on human genes (4.645 against 4.784), the human-only model's own domain. Human is ~0.1% of
 SynCodonLM, and its genes there are not split by the human hold-out, so the "held-out human genes" row is not
 held out for this model. On the mRFP probe the snapshots reach test rho 0.695 (0.612-0.757) at 25k, 0.642 (0.545-0.715) at 50k and 0.648
-(0.549-0.725) at 75k 0.644 (0.555-0.720) at 100k, 0.674 (0.580-0.752) at 125k 0.622 (0.525-0.709) at 150k and 0.667 (0.581-0.748) at 175k, against 0.716
+(0.549-0.725) at 75k 0.644 (0.555-0.720) at 100k, 0.674 (0.580-0.752) at 125k 0.622 (0.525-0.709) at 150k 0.667 (0.581-0.748) at 175k and 0.657 (0.570-0.731) at 200k, against 0.716
 (0.632-0.780) for the human `mlm` model. These are 95% bootstrap intervals over the 219 test variants, and they all
 overlap: one gene's split cannot rank these models.
 
