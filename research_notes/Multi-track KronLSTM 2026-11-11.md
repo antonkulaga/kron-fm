@@ -55,8 +55,37 @@ https://deepmind.google/blog/alphagenome-2-deciphering-how-cells-read-dna-to-bet
   predictions over randomly mutated inputs (AG1 and AG2 both report gains in variant-effect prediction).
 - Long training windows help (AG1: 1 Mb beat 32 kb even when both were evaluated at 1 Mb).
 
-**AlphaGenome as a teacher** (the owner's call, 2026-11-12): AG2 predictions through the API on the Enformer windows
-can serve as training targets, for chosen conditions, where measured tracks cost a paid download.
+**Targets** (the owner, 2026-11-12: "why predict with alphagenome as teacher if we can download regulatory info from
+ensembl?"): measured and annotated data first. The Ensembl Regulatory Build (promoters, enhancers, CTCF sites, open
+chromatin, and their activity per epigenome), GENCODE exons and splice sites, and a set of free ENCODE coverage tracks
+(DNase, CAGE, RNA-seq). AlphaGenome 2 predictions only where no measured data exists, or as an extra teacher if the
+measured-only model plateaus. Genomic formats read with polars-bio.
+
+## Context length (owner, 2026-11-12: "can we make it way longer ... can it get full chromosome?")
+
+KronLSTM's cost is linear in length. The pilot takes 1 Mb (AlphaGenome's choice), binned to 128 bp before the
+long-range core (8,192 steps), single-base heads after it. A whole chromosome (chr1: 248 Mb, ~1.9M steps at 128 bp)
+streams at inference in constant memory; training uses 1 Mb chunks with the recurrent state carried along the
+chromosome (truncated backpropagation). Test: the same model at 1 Mb versus with chromosome-long carried state, on the
+same held-out windows. Prior expectation small (99% of validated enhancer-gene pairs within 1 Mb), but unmeasured.
+The unit for carried state is the gap-free contig, not the chromosome (owner: "or at least full contig?"): the state
+resets at each run of N. Contigs up to a few Mb train in one piece (8 Mb = 65k steps at 128 bp; memory to be measured
+at 1, 4 and 8 Mb before the pilot), longer ones in carried-state chunks.
+
+## Hybrid with protein embeddings (owner, 2026-11-12: "a hybrid model giving latest esm embedding as additional input
+for coding regions, can it reuse the shared backbone?")
+
+Yes. Each base in a coding exon gets the frozen per-residue ESM embedding of its amino acid (shared by the codon's
+three bases, zero elsewhere), projected and added at the stem, so the encoder, KronLSTM core and heads stay shared.
+Embeddings for all human proteins are precomputed once (~25 GB bf16). The same addition works per codon in kron-dna.
+Evidence it pays: the gene-split ensemble of ESM-2 and kron-dna beats ESM-2 alone (0.925 vs 0.906). Stage 2b.
+
+## Compression before the core (owner, 2026-11-12: "is having convolutions with 128 bins the most modern approach?")
+
+Fixed convolutional downsampling to 128 bp is what AlphaGenome 1 and 2 and Borzoi use, so it is the baseline. Two
+newer options are measured against it: no compression (single-base core; KronLSTM is linear, so it is affordable,
+only slower), and learned dynamic chunking in the style of H-Net (2025), where the model learns its own boundaries.
+Order: fixed bins first, then the H-Net-style chunker on the same held-out contigs.
 
 ## The pilot, if approved
 

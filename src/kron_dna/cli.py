@@ -555,6 +555,143 @@ def ensemble(scores: list[Path] = typer.Argument(..., help="per-variant parquet 
     typer.echo(f"wrote {out}")
 
 
+@app.command("genome-prepare")
+def genome_prepare(fasta: Path = typer.Argument(..., help="a genome FASTA (e.g. UCSC hg38.fa.gz)"),
+                   min_gap: int = typer.Option(50, help="a run of N at least this long splits a contig"),
+                   min_len: int = typer.Option(10_000, help="contigs shorter than this are dropped"),
+                   name: str = typer.Option("hg38", help="folder under data/interim/genome/")) -> None:
+    """Whole gap-free contigs of a genome, as one uint8 array (A, C, G, T, N = 0..4) and a contig index."""
+    import numpy as np
+    import polars as pl
+    import polars_bio as pb
+
+    from kron_dna import genome as G
+
+    out = interim_dir("genome", name)
+    out.mkdir(parents=True, exist_ok=True)
+    keep = {f"chr{c}" for c in [*map(str, range(1, 23)), "X", "Y"]}
+    rows, offset = [], 0
+    with open(out / "bases.u8", "wb") as fh:
+        for chrom, seq in pb.scan_fasta(str(fasta)).select("name", "sequence").collect().iter_rows():
+            if chrom not in keep:
+                continue
+            codes = G.encode_bases(seq)
+            for start, end in G.contigs_of(codes, min_gap, min_len):
+                fh.write(codes[start:end].tobytes())
+                rows.append((chrom, start, end, offset))
+                offset += end - start
+            typer.echo(f"{chrom}: {sum(1 for r in rows if r[0] == chrom)} contigs")
+    index = pl.DataFrame(rows, schema=["chrom", "start", "end", "offset"], orient="row")
+    index.write_parquet(out / "contigs.parquet")
+    typer.echo(f"{index.height} contigs, {offset / 1e9:.2f} Gb, longest {(index['end'] - index['start']).max() / 1e6:.1f} Mb"
+               f" -> {out}")
+
+
+@app.command("genome-train")
+def genome_train(out: Path = typer.Argument(..., help="run directory (resumes from its checkpoint.pt)"),
+                 name: str = typer.Option("hg38", help="prepared genome under data/interim/genome/"),
+                 window: int = typer.Option(1 << 20, help="bases per window (a multiple of 128); a shorter contig "
+                                            "is taken whole and padded"),
+                 batch_size: int = 1, steps: int = 20_000, lr: float = 3e-4, warmup: int = 500,
+                 mask_prob: float = 0.15, val_chroms: str = "chr8,chr9", eval_every: int = 500,
+                 d_model: int = 384, n_layers: int = 8, stem_channels: int = 96, max_hours: float = 0.0,
+                 n_down: int = typer.Option(7, help="halvings before the core: 2**n_down bases per core step"),
+                 bench: bool = typer.Option(False, help="time one step and report peak memory, then stop"),
+                 seed: int = 0) -> None:
+    """Stage 1 of the multi-track model: masked-base prediction over whole gap-free contigs (KronGenome)."""
+    import numpy as np
+    import polars as pl
+
+    import torch.nn.functional as F
+
+    from kron_dna import genome as G
+
+    src = interim_dir("genome", name)
+    bases = np.memmap(src / "bases.u8", dtype=np.uint8, mode="r")
+    index = pl.read_parquet(src / "contigs.parquet").with_columns((pl.col("end") - pl.col("start")).alias("len"))
+    held = set(val_chroms.split(","))
+    train_idx = index.filter(~pl.col("chrom").is_in(list(held)))
+    val_idx = index.filter(pl.col("chrom").is_in(list(held)))
+    rng = np.random.default_rng(seed)
+    unit = 2 ** n_down
+
+    def sample(table) -> tuple[torch.Tensor, torch.Tensor]:
+        p = table["len"].to_numpy() / table["len"].sum()                 # contigs by length: every base equally
+        seqs, segs = [], []
+        for _ in range(batch_size):
+            r = table.row(int(rng.choice(table.height, p=p)), named=True)
+            take = min(window, r["len"])
+            at = r["offset"] + int(rng.integers(0, r["len"] - take + 1))
+            codes = np.full(window, 4, dtype=np.int64)
+            codes[:take] = bases[at:at + take]
+            seg = np.zeros(window // unit, dtype=np.int64)
+            seg[(take + unit - 1) // unit:] = 1                           # padding is its own segment
+            seqs.append(codes)
+            segs.append(seg)
+        return torch.from_numpy(np.stack(seqs)), torch.from_numpy(np.stack(segs))
+
+    dev = torch.device("cuda")
+    config = G.KronGenomeConfig(d_model=d_model, n_layers=n_layers, stem_channels=stem_channels, n_down=n_down)
+    model = G.KronGenome(config).to(dev)
+    opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.1, betas=(0.9, 0.95))
+    out.mkdir(parents=True, exist_ok=True)
+    ckpt = out / "checkpoint.pt"
+    step, hours = 0, 0.0
+    if ckpt.exists() and not bench:
+        state = torch.load(ckpt, map_location="cpu")
+        model.load_state_dict(state["model"])
+        opt.load_state_dict(state["optimizer"])
+        step, hours = state["step"], state.get("hours", 0.0)
+        typer.echo(f"resumed at step {step}")
+    typer.echo(f"KronGenome {model.n_parameters() / 1e6:.1f}M parameters, window {window:,} bases, "
+               f"{train_idx.height} train / {val_idx.height} held-out contigs")
+    autocast = torch.autocast("cuda", dtype=torch.bfloat16)
+
+    def loss_on(seq, seg):
+        inputs, labels = G.mask_bases(seq.to(dev), mask_prob)
+        with autocast:
+            logits, _ = model(inputs, seg.to(dev))
+        return F.cross_entropy(logits.float().reshape(-1, 4), labels.reshape(-1), ignore_index=-100)
+
+    t0, started = time.time(), time.time()
+    metrics = out / "metrics.csv"
+    if not metrics.exists():
+        metrics.write_text("step,lr,train_loss,val_bits_per_base,hours\n")
+    model.train()
+    while step < steps:
+        for g in opt.param_groups:
+            g["lr"] = lr * min(1.0, (step + 1) / warmup) * 0.5 * (1 + math.cos(math.pi * min(step / steps, 1.0)))
+        torch.cuda.reset_peak_memory_stats(dev)
+        loss = loss_on(*sample(train_idx))
+        opt.zero_grad(set_to_none=True)
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        opt.step()
+        step += 1
+        if bench:
+            torch.cuda.synchronize()
+            typer.echo(f"bench: window {window:,}, batch {batch_size}: {time.time() - t0:.1f} s for one step, "
+                       f"peak {torch.cuda.max_memory_allocated(dev) / 2**30:.1f} GiB, loss {loss.item():.3f}")
+            return
+        out_of_time = max_hours > 0 and time.time() - started > max_hours * 3600
+        if step % eval_every == 0 or step == steps or out_of_time:
+            model.eval()
+            with torch.no_grad():
+                vals = [loss_on(*sample(val_idx)).item() for _ in range(8)]
+            model.train()
+            h = hours + (time.time() - t0) / 3600
+            bits = float(np.mean(vals)) / math.log(2)
+            with metrics.open("a") as fh:
+                fh.write(f"{step},{opt.param_groups[0]['lr']:.3e},{loss.item():.4f},{bits:.4f},{h:.3f}\n")
+            typer.echo(f"step {step}: train {loss.item():.4f}, held-out {bits:.3f} bits/base, {h:.2f} h, "
+                       f"peak {torch.cuda.max_memory_allocated(dev) / 2**30:.1f} GiB")
+            _save_atomic({"model": model.state_dict(), "optimizer": opt.state_dict(), "config": config.to_dict(),
+                          "step": step, "hours": h}, ckpt)
+        if out_of_time:
+            typer.echo("stopping at --max-hours; resubmit the same command to continue")
+            return
+
+
 @app.command("export-onnx")
 def export_onnx_cmd(run: Path = typer.Argument(..., help="a `kron-dna train` run directory or checkpoint"),
                     out: Path | None = typer.Option(None, help="output directory (default: <run>/onnx)"),
