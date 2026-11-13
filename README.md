@@ -296,7 +296,28 @@ The tracks cost a little masked-base prediction. A control trained the same 20k 
 masked bases alone reaches 1.503 held-out bits per base (mean of the last 10 evals) against stage 2's 1.533. Both runs
 drew the same held-out windows at each eval, so the evals pair: the control is lower at all 40 of them, by 0.025 bits
 per base on average (sd 0.005). Runs with the regulatory tracks only and with the gene-structure tracks only follow,
-to find which group costs it; ClinVar by region (`kron-dna genome-clinvar`) compares the three models first.
+to find which group costs it.
+
+ClinVar SNVs genome-wide (`kron-dna genome-clinvar`, reviewed pathogenic and benign, up to 1,000 per region, label
+and split; 1,719 fall outside the contigs). The masked marginal, `log p(alt) - log p(ref)` with the variant masked in a
+256 kb tile, is at chance or below in every region for all three models (held-out chromosomes, all non-coding: stage 1
+0.474, stage 2 0.495, control 0.478): the masked-base head has not learned what makes a variant damaging, with or
+without the tracks. Stage 2's track head does: the largest change of a splice track within 50 bp between reference
+and alternative sequence (splice-delta), held-out chromosomes, AUROC with 95 % bootstrap interval:
+
+| region | pathogenic / benign | splice-delta | distance to nearest splice site | masked marginal, stage 2 |
+|---|---|---|---|---|
+| near a splice site (within 10 bp) | 174 / 1000 | 0.923 (0.901-0.942) | 0.839 | 0.423 |
+| intron or intergenic | 41 / 1000 | 0.904 (0.841-0.952) | 0.294 | 0.444 |
+| UTR exon | 50 / 1000 | 0.630 (0.569-0.697) | 0.409 | 0.520 |
+| coding | 1000 / 1000 | 0.618 (0.594-0.643) | 0.579 | 0.504 |
+| splice site (2 intron bases) | 1000 / 60 | 0.580 (0.502-0.660) | 0.500 | 0.515 |
+
+Near splice sites it beats the distance baseline; in introns the baseline points the wrong way (pathogenic intronic
+variants lie farther from exons than benign ones) and the track delta still reaches 0.90. At the canonical splice
+bases themselves it is weak. Pooling all non-coding regions gives 0.944, but distance alone gives 0.930 there because
+the regions differ in their pathogenic share, so the per-region numbers are the result.
+
 `--whole-contigs` runs the core over a whole contig of up to 48 Mb in one recurrence (462 of 484 hg38 contigs;
 38 s per step with 8 scored 1 Mb chunks, 28.2 GiB); stage 3 trains that way, after those runs.
 
