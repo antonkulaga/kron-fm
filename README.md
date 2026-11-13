@@ -295,8 +295,20 @@ last step:
 The tracks cost a little masked-base prediction. A control trained the same 20k further steps from stage 1 on
 masked bases alone reaches 1.503 held-out bits per base (mean of the last 10 evals) against stage 2's 1.533. Both runs
 drew the same held-out windows at each eval, so the evals pair: the control is lower at all 40 of them, by 0.025 bits
-per base on average (sd 0.005). Runs with the regulatory tracks only and with the gene-structure tracks only follow,
-to find which group costs it.
+per base on average (sd 0.005). No one group of tracks
+causes it. The same 20k steps with only the regulatory tracks (promoter, enhancer, CTCF, open chromatin, activity)
+or only the gene-structure tracks (exon, splice donor and acceptor, coding sequence) cost about as much as all nine:
+
+| run (20k steps from stage 1) | held-out bits per base, last 10 evals | paired difference from the control (sd) |
+|---|---|---|
+| masked bases only (control) | 1.503 | |
+| + regulatory tracks | 1.532 | +0.025 (0.005), worse at 40 of 40 |
+| + gene-structure tracks | 1.536 | +0.030 (0.005), worse at 40 of 40 |
+| + all 9 tracks (stage 2) | 1.533 | +0.025 (0.005), worse at 40 of 40 |
+
+Each group's tracks score the same trained alone as trained together (splice donor AUROC 0.990 alone, 0.987 in stage 2;
+promoter 0.973, 0.978), so the groups neither help nor hurt each other. The cost comes from training a track head at
+loss weight 1.0 at all, which points at the weight (`--track-weight`) as the lever.
 
 ClinVar SNVs genome-wide (`kron-dna genome-clinvar`, reviewed pathogenic and benign, up to 1,000 per region, label
 and split; 1,719 fall outside the contigs). The masked marginal, `log p(alt) - log p(ref)` with the variant masked in a
