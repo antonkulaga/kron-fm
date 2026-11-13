@@ -868,6 +868,74 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
             return
 
 
+@app.command("genome-clinvar")
+def genome_clinvar(runs: list[Path] = typer.Option([], "--run", help="genome-train run directories (or checkpoints)"),
+                   vcf: Path = typer.Option(None, help="ClinVar GRCh38 VCF (default: data/input/variants/clinvar/"
+                                            "clinvar.vcf.gz)"),
+                   name: str = typer.Option("hg38", help="prepared genome (with genome-labels) under data/interim/genome/"),
+                   window: int = typer.Option(1 << 20, help="bases of genome per pass; a variant has at least a "
+                                              "quarter of it on each side"),
+                   per_class: int = typer.Option(2000, help="variants kept per (region, label, held-out or not), by "
+                                                 "seed; 0 = all"),
+                   val_chroms: str = typer.Option("chr8,chr9", help="the chromosomes genome-train held out"),
+                   near: int = typer.Option(10, help="bases from a splice site that count as near it"),
+                   batch_size: int = 2, device: str = "cuda", seed: int = 0, n_boot: int = 1000,
+                   out: Path | None = typer.Option(None, help="JSON summary (default: data/output/eval/clinvar/"
+                                                   "genome.json; the scores go beside it as .parquet)")) -> None:
+    """Zero-shot ClinVar for KronGenome by region (coding, splice site, near one, UTR exon, regulatory element,
+    intron or intergenic): AUROC of the masked marginal ``log p(alt) - log p(ref)``, pathogenic against benign."""
+    import json
+
+    import numpy as np
+    import polars as pl
+
+    from kron_core.paths import output_dir
+    from kron_dna import genome as G
+    from kron_dna import genome_variants as GV
+    from kron_dna import variants as V
+
+    vcf = vcf or input_dir("variants", "clinvar") / "clinvar.vcf.gz"
+    src = interim_dir("genome", name)
+    bases = np.memmap(src / "bases.u8", dtype=np.uint8, mode="r")
+    labels = np.memmap(src / "labels.u8", dtype=np.uint8, mode="r")
+    index = pl.read_parquet(src / "contigs.parquet")
+    table, dropped = GV.place(V.read_clinvar(vcf), index, bases, labels, set(val_chroms.split(",")), near)
+    typer.echo(f"{table.height} variants placed; dropped {dropped}")
+    if per_class:
+        table = table.filter(pl.int_range(pl.len()).shuffle(seed).over("region", "label", "held_out") < per_class)
+    table = table.sort("g")
+    with pl.Config(tbl_rows=-1):
+        typer.echo(str(table.group_by("region", "held_out", "label").len().sort("region", "held_out", "label")))
+    dev = torch.device(device)
+    g, c_off, c_len = (table[c].to_numpy() for c in ("g", "c_off", "c_len"))
+    t_start, t_len = GV.tile_of(g, c_off, c_len, window)
+    scores = {}
+    for run in runs:
+        ckpt = run / "checkpoint.pt" if run.is_dir() else run
+        state = torch.load(ckpt, map_location="cpu")
+        model = G.KronGenome(G.KronGenomeConfig(**state["config"])).to(dev)
+        model.load_state_dict(state["model"])
+        model.eval()
+        t0 = time.time()
+        key = run.name if run.is_dir() else run.parent.name
+        scores[key] = GV.masked_marginals(model, bases, g, table["ref_code"].to_numpy(), table["alt_code"].to_numpy(),
+                                          t_start, t_len, window, dev, batch_size)
+        typer.echo(f"{key} (step {state.get('step')}): {len(np.unique(t_start))} tiles in {time.time() - t0:.0f} s")
+        del model
+    rows = GV.summarize(table, scores, n_boot)
+    out = out or output_dir("eval", "clinvar") / "genome.json"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps({"dropped": dropped, "window": window, "runs": {k: str(r) for k, r in
+                                                                             zip(scores, runs)}, "rows": rows},
+                              indent=2) + "\n")
+    table.select("id", "chrom", "pos", "ref", "alt", "region", "held_out", "label").with_columns(
+        **{k: pl.Series(v) for k, v in scores.items()}).write_parquet(out.with_suffix(".parquet"))
+    for r in rows:
+        typer.echo(f"{r['region']:>21} | {r['chromosomes']:>20} | P {r['pathogenic']:>5} B {r['benign']:>5} | "
+                   + "  ".join(f"{k} {r[k]:.3f}" if r[k] is not None else f"{k} -" for k in scores))
+    typer.echo(f"-> {out}")
+
+
 @app.command("export-onnx")
 def export_onnx_cmd(run: Path = typer.Argument(..., help="a `kron-dna train` run directory or checkpoint"),
                     out: Path | None = typer.Option(None, help="output directory (default: <run>/onnx)"),
