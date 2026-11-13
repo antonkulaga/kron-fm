@@ -292,10 +292,13 @@ last step:
 | enhancer | 4.44% | 0.898 | 0.371 |
 | exon | 6.15% | 0.888 | 0.566 |
 
-Adding the tracks did not cost masked-base prediction. Whether they help is judged against a control trained the same
-20k further steps on masked bases alone (queued), on held-out bits, ClinVar non-coding and splice variants, and frozen
-probes. `--whole-contigs` runs the core over a whole contig of up to 48 Mb in one recurrence (462 of 484 hg38 contigs;
-38 s per step with 8 scored 1 Mb chunks, 28.2 GiB); stage 3 trains that way, after the control.
+The tracks cost a little masked-base prediction. A control trained the same 20k further steps from stage 1 on
+masked bases alone reaches 1.503 held-out bits per base (mean of the last 10 evals) against stage 2's 1.533. Both runs
+drew the same held-out windows at each eval, so the evals pair: the control is lower at all 40 of them, by 0.025 bits
+per base on average (sd 0.005). Runs with the regulatory tracks only and with the gene-structure tracks only follow,
+to find which group costs it; ClinVar by region (`kron-dna genome-clinvar`) compares the three models first.
+`--whole-contigs` runs the core over a whole contig of up to 48 Mb in one recurrence (462 of 484 hg38 contigs;
+38 s per step with 8 scored 1 Mb chunks, 28.2 GiB); stage 3 trains that way, after those runs.
 
 **Not built yet:**
 - clustering of a genome's paralogs (`prepare --holdout-genes`
