@@ -86,6 +86,16 @@ def test_track_targets_unpack_bits_and_activity():
     assert t[0, 0].tolist() == [1, 0, 0, 0, 0, 0, 0, 1, 1] and t[0, 1].sum() == 0
 
 
+def test_track_mask_groups_and_names():
+    import pytest
+    assert all(G.track_mask("all"))
+    reg, gene = G.track_mask("regulatory"), G.track_mask("gene")
+    assert not any(r and g for r, g in zip(reg, gene)) and all(r or g for r, g in zip(reg, gene))
+    assert G.track_mask("donor,acceptor") == [t in ("donor", "acceptor") for t in G.TRACKS]
+    with pytest.raises(ValueError):
+        G.track_mask("splice")
+
+
 def test_ranking_scores_match_sklearn():
     import numpy as np
     import torch

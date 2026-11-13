@@ -249,6 +249,19 @@ def splice_sites(exons):
 
 #: Stage-2 track outputs: the label bits in order, then the activity share.
 TRACKS = [*LABEL_BITS, "activity"]
+TRACK_GROUPS = {"all": TRACKS,
+                "regulatory": ["promoter", "enhancer", "CTCF_binding_site", "open_chromatin_region", "activity"],
+                "gene": ["exon", "donor", "acceptor", "CDS"]}
+
+
+def track_mask(spec: str) -> list[bool]:
+    """Which of ``TRACKS`` the loss trains, from a group name of ``TRACK_GROUPS`` or comma-separated track names.
+    The head keeps all tracks (so checkpoints stay interchangeable); the others are still scored, untrained."""
+    names = TRACK_GROUPS.get(spec) or [t.strip() for t in spec.split(",") if t.strip()]
+    unknown = sorted(set(names) - set(TRACKS))
+    if unknown or not names:
+        raise ValueError(f"unknown tracks {unknown or spec!r}; groups {list(TRACK_GROUPS)}, tracks {TRACKS}")
+    return [t in names for t in TRACKS]
 
 
 def track_targets(labels: torch.Tensor, activity: torch.Tensor) -> torch.Tensor:

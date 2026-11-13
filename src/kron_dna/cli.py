@@ -663,6 +663,8 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                  labels: bool = typer.Option(False, help="stage 2: also predict the genome-labels tracks (TRACKS)"),
                  init: Path | None = typer.Option(None, help="start a new run from this checkpoint's weights (stage 1)"),
                  track_weight: float = typer.Option(1.0, help="weight of the track loss beside the masked-base loss"),
+                 tracks: str = typer.Option("all", help="with --labels: tracks the loss trains, a group (all, "
+                                            "regulatory, gene) or names from TRACKS; all are still scored"),
                  whole_contigs: bool = typer.Option(False, help="one whole contig per step in one recurrence; the "
                                                     "encoder runs in --window chunks, the loss on --train-chunks of them"),
                  train_chunks: int = typer.Option(4, help="with --whole-contigs: chunks decoded and scored per step"),
@@ -738,12 +740,14 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                                 n_tracks=len(G.TRACKS) if labels else 0)
     model = G.KronGenome(config).to(dev)
     pos_weight = None
+    train_mask = torch.tensor(G.track_mask(tracks), dtype=torch.float32, device=dev)
     if labels:                       # rare tracks (splice sites) weighted up by sqrt(neg/pos), from a sample of bases
         probe = np.asarray(lab_mm[:: max(1, len(lab_mm) // 50_000_000)])
         share = np.array([((probe >> b) & 1).mean() for b in range(len(G.LABEL_BITS))] + [0.5])
         pos_weight = torch.tensor(np.clip(np.sqrt((1 - share) / np.maximum(share, 1e-9)), 1, 100),
                                   dtype=torch.float32, device=dev)
         typer.echo("track positive weights: " + ", ".join(f"{t} {w:.1f}" for t, w in zip(G.TRACKS, pos_weight)))
+        typer.echo("tracks trained: " + ", ".join(t for t, m in zip(G.TRACKS, train_mask.tolist()) if m))
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.1, betas=(0.9, 0.95))
     out.mkdir(parents=True, exist_ok=True)
     ckpt = out / "checkpoint.pt"
@@ -777,7 +781,7 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                 ok = valid[sl].to(dev)
                 per = F.binary_cross_entropy_with_logits(tracks.float()[0], want, pos_weight=pos_weight,
                                                          reduction="none")
-                track = track + (per * ok.unsqueeze(-1)).sum() / (ok.sum() * per.shape[-1]) / len(picks)
+                track = track + (per * ok.unsqueeze(-1) * train_mask).sum() / (ok.sum() * train_mask.sum()) / len(picks)
                 if keep is not None:
                     keep.append((tracks.float()[0][ok], want[ok]))
         return mlm / max(count, 1), (track if lab is not None else None)
@@ -792,7 +796,7 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
         want = G.track_targets(lab.to(dev), act.to(dev))
         ok = valid.to(dev)
         per = F.binary_cross_entropy_with_logits(tracks.float(), want, pos_weight=pos_weight, reduction="none")
-        track = (per * ok.unsqueeze(-1)).sum() / (ok.sum() * per.shape[-1])
+        track = (per * ok.unsqueeze(-1) * train_mask).sum() / (ok.sum() * train_mask.sum())
         if keep is not None:                                      # held-out scores for tracks.csv
             keep.append((tracks.float()[ok], want[ok]))
         return mlm, track
