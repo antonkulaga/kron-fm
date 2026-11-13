@@ -879,6 +879,10 @@ def genome_clinvar(runs: list[Path] = typer.Option([], "--run", help="genome-tra
                                                  "seed; 0 = all"),
                    val_chroms: str = typer.Option("chr8,chr9", help="the chromosomes genome-train held out"),
                    near: int = typer.Option(10, help="bases from a splice site that count as near it"),
+                   delta_window: int = typer.Option(1 << 17, help="with a track head: also score the largest "
+                                                    "change of the track predictions within 50 bp, ref against alt, "
+                                                    "in a window this long centred on the variant (0: skip)"),
+                   delta_batch: int = 8,
                    batch_size: int = 2, device: str = "cuda", seed: int = 0, n_boot: int = 1000,
                    out: Path | None = typer.Option(None, help="JSON summary (default: data/output/eval/clinvar/"
                                                    "genome.json; the scores go beside it as .parquet)")) -> None:
@@ -909,7 +913,7 @@ def genome_clinvar(runs: list[Path] = typer.Option([], "--run", help="genome-tra
     dev = torch.device(device)
     g, c_off, c_len = (table[c].to_numpy() for c in ("g", "c_off", "c_len"))
     t_start, t_len = GV.tile_of(g, c_off, c_len, window)
-    scores = {}
+    scores = {"distance to splice site": GV.splice_distance(labels, g)}   # lower = closer = more damaging
     for run in runs:
         ckpt = run / "checkpoint.pt" if run.is_dir() else run
         state = torch.load(ckpt, map_location="cpu")
@@ -921,12 +925,20 @@ def genome_clinvar(runs: list[Path] = typer.Option([], "--run", help="genome-tra
         scores[key] = GV.masked_marginals(model, bases, g, table["ref_code"].to_numpy(), table["alt_code"].to_numpy(),
                                           t_start, t_len, window, dev, batch_size)
         typer.echo(f"{key} (step {state.get('step')}): {len(np.unique(t_start))} tiles in {time.time() - t0:.0f} s")
+        if model.tracks is not None and delta_window:
+            t0 = time.time()
+            d = GV.track_deltas(model, bases, g, table["ref_code"].to_numpy(), table["alt_code"].to_numpy(),
+                                c_off, c_len, delta_window, dev, delta_batch)
+            splice = [G.TRACKS.index("donor"), G.TRACKS.index("acceptor")]
+            scores[f"{key}:splice-delta"] = -d[:, splice].max(1)        # lower = more damaging, as the marginal
+            scores[f"{key}:track-delta"] = -d.max(1)
+            typer.echo(f"{key}: track deltas in {delta_window:,}-base windows, {time.time() - t0:.0f} s")
         del model
     rows = GV.summarize(table, scores, n_boot)
     out = out or output_dir("eval", "clinvar") / "genome.json"
     out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(json.dumps({"dropped": dropped, "window": window, "runs": {k: str(r) for k, r in
-                                                                             zip(scores, runs)}, "rows": rows},
+    out.write_text(json.dumps({"dropped": dropped, "window": window, "delta_window": delta_window,
+                               "runs": [str(r) for r in runs], "rows": rows},
                               indent=2) + "\n")
     table.select("id", "chrom", "pos", "ref", "alt", "region", "held_out", "label").with_columns(
         **{k: pl.Series(v) for k, v in scores.items()}).write_parquet(out.with_suffix(".parquet"))

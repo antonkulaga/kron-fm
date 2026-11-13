@@ -55,6 +55,18 @@ def region_of(labels: np.ndarray, g: np.ndarray, near: int = 10) -> np.ndarray:
                      list(REGIONS[:5]), REGIONS[5]).astype(object)
 
 
+def splice_distance(labels: np.ndarray, g: np.ndarray, block: int = 1 << 27) -> np.ndarray:
+    """Bases from each global offset ``g`` to the nearest splice-site base (GENCODE donor or acceptor) in the layout:
+    a model-free baseline, since pathogenic non-coding variants cluster near exons. Contig ends are ignored."""
+    mask = (1 << G.LABEL_BITS["donor"]) | (1 << G.LABEL_BITS["acceptor"])
+    sites = np.concatenate([np.nonzero(np.asarray(labels[a:a + block]) & mask)[0] + a
+                            for a in range(0, len(labels), block)])
+    k = np.searchsorted(sites, g)
+    left = np.abs(g - sites[np.clip(k - 1, 0, len(sites) - 1)])
+    right = np.abs(sites[np.clip(k, 0, len(sites) - 1)] - g)
+    return np.minimum(left, right).astype(float)
+
+
 def tile_of(g: np.ndarray, c_off: np.ndarray, c_len: np.ndarray, window: int) -> tuple[np.ndarray, np.ndarray]:
     """``(tile start, tile length)`` in the layout for each variant: tiles every ``window // 2`` along its contig,
     the one whose middle half holds it; a contig shorter than ``window`` is one tile."""
@@ -102,6 +114,41 @@ def masked_marginals(model: G.KronGenome, bases: np.ndarray, g: np.ndarray, ref:
         members, which = np.concatenate(rows), np.concatenate(cols)
         at = g[members] - tiles[np.array(list(chunk))[which], 0]
         out[members] = logp[which, at, alt[members]] - logp[which, at, ref[members]]
+    return out
+
+
+@torch.no_grad()
+def track_deltas(model: G.KronGenome, bases: np.ndarray, g: np.ndarray, ref: np.ndarray, alt: np.ndarray,
+                 c_off: np.ndarray, c_len: np.ndarray, window: int, device: torch.device, batch_size: int = 8,
+                 flank: int = 50) -> np.ndarray:
+    """``[n, n_tracks]``: for each variant, the largest ``|p(alt) - p(ref)|`` of each track within ``flank`` bases of
+    it, from two unmasked passes (reference and alternative) over a ``window`` centred on it (clamped to its contig;
+    a shorter contig is padded with N as a segment of its own)."""
+    unit = 2 ** model.config.n_down
+    out = np.zeros((len(g), model.config.n_tracks), dtype=np.float32)
+    autocast = torch.autocast(device.type, dtype=torch.bfloat16, enabled=device.type == "cuda")
+    local = g - c_off
+    start = np.clip(local - window // 2, 0, np.maximum(c_len - window, 0))
+    take = np.minimum(c_len, window)
+    for b0 in range(0, len(g), batch_size):
+        idx = np.arange(b0, min(b0 + batch_size, len(g)))
+        seqs, segs = [], []
+        for i in idx:
+            codes = np.full(window, 4, dtype=np.int64)
+            codes[:take[i]] = bases[c_off[i] + start[i]:c_off[i] + start[i] + take[i]]
+            seg = np.zeros(window // unit, dtype=np.int64)
+            seg[(take[i] + unit - 1) // unit:] = 1
+            mutant = codes.copy()
+            mutant[local[i] - start[i]] = alt[i]
+            seqs += [codes, mutant]
+            segs += [seg, seg]
+        with autocast:
+            _, _, tracks = model(torch.from_numpy(np.stack(seqs)).to(device), torch.from_numpy(np.stack(segs)).to(device))
+        prob = torch.sigmoid(tracks.float())
+        for j, i in enumerate(idx):
+            at = int(local[i] - start[i])
+            lo, hi = max(0, at - flank), min(int(take[i]), at + flank + 1)
+            out[i] = (prob[2 * j + 1, lo:hi] - prob[2 * j, lo:hi]).abs().amax(0).cpu().numpy()
     return out
 
 

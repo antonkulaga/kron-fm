@@ -30,6 +30,13 @@ def test_region_order_and_near_splice():
         "coding", "splice site", "near splice site", "UTR exon", "regulatory element", "intron or intergenic"]
 
 
+def test_splice_distance():
+    labels = np.zeros(100, dtype=np.uint8)
+    labels[[20, 21]] = 1 << G.LABEL_BITS["donor"]
+    labels[70] = 1 << G.LABEL_BITS["acceptor"]
+    assert GV.splice_distance(labels, np.array([0, 20, 30, 50, 99]), block=16).tolist() == [20, 0, 9, 20, 29]
+
+
 def test_tile_keeps_a_quarter_window_of_context():
     window = 64
     c_off, c_len = np.full(300, 1000), np.full(300, 300)
@@ -78,3 +85,18 @@ def test_masked_marginals_match_a_direct_pass():
             logits, _, _ = model(seq[None])
         lp = torch.log_softmax(logits.float()[0, g[i] - start[i]], -1)
         assert got[i] == pytest.approx(float(lp[alt[i]] - lp[ref[i]]), abs=3e-3)   # bf16 logits
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="the KronLSTM core needs CUDA")
+def test_track_deltas_zero_for_a_silent_change_and_shaped():
+    torch.manual_seed(0)
+    c = G.KronGenomeConfig(d_model=32, n_heads=2, n_layers=1, ff_units=64, stem_channels=8, n_down=3, dropout=0.0,
+                           n_tracks=9)
+    model = G.KronGenome(c).cuda().eval()
+    bases = np.random.default_rng(0).integers(0, 4, 500).astype(np.uint8)
+    g = np.array([10, 250, 490])
+    ref = bases[g].astype(np.int64)
+    off, length = np.zeros(3, np.int64), np.full(3, 500)
+    same = GV.track_deltas(model, bases, g, ref, ref, off, length, 128, torch.device("cuda"), batch_size=2)
+    moved = GV.track_deltas(model, bases, g, ref, (ref + 1) % 4, off, length, 128, torch.device("cuda"))
+    assert same.shape == (3, 9) and np.abs(same).max() == 0 and (moved.max(1) > 0).all()
