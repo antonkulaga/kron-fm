@@ -271,6 +271,32 @@ held out for this model. On the mRFP probe the snapshots reach test rho 0.695 (0
 (0.632-0.780) for the human `mlm` model. These are 95% bootstrap intervals over the 219 test variants, and they all
 overlap: one gene's split cannot rank these models.
 
+**KronGenome, a base-resolution genome model** (`kron-dna genome-train`). 28.7M parameters: a convolutional U-Net
+down to 128-bp bins, a bidirectional KronLSTM core over the bins, a decoder back to bases. hg38, chr8 and chr9 held
+out. Stage 1 predicts masked bases in 1 Mb windows (20k steps, 5.4 h on one A100). Stage 2 starts from it and adds 9
+per-base tracks (`kron-dna genome-labels`: Ensembl Regulatory Build v116 and GENCODE v50, painted per base; splice
+sites are the 2 intron bases at each end; activity is the share of the Build's 112 epigenomes where the element is
+active), 20k more steps. Held-out bits per base, mean of the last 10 evals (each eval is 8 random 1 Mb windows and
+moves by about 0.05): stage 1 1.540, stage 2 1.532 (uniform 2.0). Stage 2's tracks on the held-out chromosomes at its
+last step:
+
+| track | share of bases | AUROC | average precision |
+|---|---|---|---|
+| coding sequence | 1.19% | 0.986 | 0.724 |
+| CTCF binding site | 0.069% | 0.991 | 0.346 |
+| splice donor | 0.025% | 0.987 | 0.340 |
+| splice acceptor | 0.027% | 0.986 | 0.308 |
+| promoter | 0.51% | 0.978 | 0.516 |
+| active in at least half of the epigenomes | 1.90% | 0.958 | 0.565 |
+| open chromatin | 0.070% | 0.907 | 0.045 |
+| enhancer | 4.44% | 0.898 | 0.371 |
+| exon | 6.15% | 0.888 | 0.566 |
+
+Adding the tracks did not cost masked-base prediction. Whether they help is judged against a control trained the same
+20k further steps on masked bases alone (queued), on held-out bits, ClinVar non-coding and splice variants, and frozen
+probes. `--whole-contigs` runs the core over a whole contig of up to 48 Mb in one recurrence (462 of 484 hg38 contigs;
+38 s per step with 8 scored 1 Mb chunks, 28.2 GiB); stage 3 trains that way, after the control.
+
 **Not built yet:**
 - clustering of a genome's paralogs (`prepare --holdout-genes`
   keeps every isoform of a gene on one side, but paralogs under other gene names still cross);
