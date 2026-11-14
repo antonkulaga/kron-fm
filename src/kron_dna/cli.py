@@ -789,6 +789,9 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                  grad_accum: int = typer.Option(1, help="micro-batches summed per optimizer step"),
                  compile_convs: bool = typer.Option(False, help="torch.compile each conv block"),
                  eval_window: int = typer.Option(0, help="held-out windows of this length (0: the curriculum's last)"),
+                 jepa_weight: float = typer.Option(0.0, help="JEPA-DNA latent loss: predict an EMA target encoder's "
+                                                   "core states of the unmasked window (cosine), at this weight"),
+                 jepa_ema: float = typer.Option(0.996, help="with --jepa-weight: EMA decay of the target encoder"),
                  mito: str = typer.Option("", help="also train on this prepared organelle genome (genome-prepare-mito), "
                                           "each sequence tagged with its genetic code table as context (nuclear: 0)"),
                  mito_share: float = typer.Option(0.03, help="with --mito: share of training windows from it"),
@@ -925,7 +928,7 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
     dev = torch.device("cuda", torch.cuda.current_device())
     config = G.KronGenomeConfig(d_model=d_model, n_layers=n_layers, stem_channels=stem_channels, n_down=n_down,
                                 n_tracks=len(G.TRACKS) if labels else 0, arch=arch, head_hidden=head_hidden,
-                                n_contexts=34 if mito else 0)
+                                n_contexts=34 if mito else 0, jepa=jepa_weight > 0)
     model = G.KronGenome(config).to(dev)
     if compile_convs:
         for blocks in [model.down, model.up] + ([model.up2] if arch == "v2" else []):
@@ -962,6 +965,12 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
     say(f"KronGenome {arch} {model.n_parameters() / 1e6:.1f}M parameters, curriculum "
                f"{', '.join(f'{w:,} x {n:,} steps' for w, n in phases)}, eval window {eval_window:,}, "
                f"{train_idx.height} train / {val_idx.height} held-out contigs")
+    target = None
+    if jepa_weight > 0:                               # the EMA target: a frozen copy, updated after every step
+        import copy
+        target = copy.deepcopy(model).eval()
+        for p_ in target.parameters():
+            p_.requires_grad_(False)
     train_model = model
     if world > 1:
         train_model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[dev.index])
@@ -997,6 +1006,13 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
             logits, _, tracks = (train_model if model.training else model)(inputs, seg.to(dev),
                                                                             ctx.to(dev) if mito else None)
         mlm = F.cross_entropy(logits.float().reshape(-1, 4), targets.reshape(-1), ignore_index=-100)
+        if target is not None and model.training and model.last_jepa is not None:
+            with torch.no_grad(), autocast:
+                _, want_core, _ = target(seq.to(dev), seg.to(dev), ctx.to(dev) if mito else None)
+            keep_bins = seg.to(dev) == 0                                # not padding
+            cos = F.cosine_similarity(model.last_jepa.float(), want_core.float(), dim=-1)
+            jepa_losses.append(float((1 - cos)[keep_bins].mean().detach()))
+            mlm = mlm + jepa_weight * (1 - cos)[keep_bins].mean()
         if lab is None:
             return mlm, None
         want = G.track_targets(lab.to(dev), act.to(dev))
@@ -1007,6 +1023,7 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
             keep.append((tracks.float()[ok], want[ok]))
         return mlm, track
 
+    jepa_losses: list[float] = []
     t0, started = time.time(), time.time()
     metrics = out / "metrics.csv"
     if main and not metrics.exists():
@@ -1032,6 +1049,10 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
             ((loss + track_weight * track if track is not None else loss) / grad_accum).backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         opt.step()
+        if target is not None:
+            with torch.no_grad():
+                for pt, pm in zip(target.parameters(), model.parameters()):
+                    pt.lerp_(pm.detach(), 1 - jepa_ema)
         step += 1
         if bench and step == 1:                                  # the first step compiles kernels: time the second
             torch.cuda.synchronize()
@@ -1089,8 +1110,10 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
             with metrics.open("a") as fh:
                 fh.write(f"{step},{opt.param_groups[0]['lr']:.3e},{loss.item():.4f},{bits:.4f},{h:.3f}{extra}\n")
             say(f"step {step} (window {win:,} x {bat}): train {loss.item():.4f}, held-out {bits:.3f} bits/base"
-                       + (f", mito {mito_bits:.3f}" if mito_bits is not None else "") + f", {h:.2f} h, "
+                       + (f", mito {mito_bits:.3f}" if mito_bits is not None else "")
+                       + (f", jepa {np.mean(jepa_losses):.4f}" if jepa_losses else "") + f", {h:.2f} h, "
                        f"peak {torch.cuda.max_memory_allocated(dev) / 2**30:.1f} GiB" + (f", tracks {tracks_note}" if tracks_note else ""))
+            jepa_losses.clear()
             _save_atomic({"model": model.state_dict(), "optimizer": opt.state_dict(), "config": config.to_dict(),
                           "step": step, "hours": h}, ckpt)
             if world > 1:

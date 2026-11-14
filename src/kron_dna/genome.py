@@ -38,6 +38,7 @@ class KronGenomeConfig:
     arch: str = "v1"            # "v2": per-position RMS norm, two convs per block, scaled projected decoder skips,
                                 # MLP heads (see ConvBlock2); "v1" checkpoints load unchanged
     head_hidden: int = 0        # v2: hidden width of the MLP heads (0 = 2 x stem_channels)
+    jepa: bool = False          # a predictor of an EMA target's core states from the masked input's (JEPA-DNA)
     n_contexts: int = 0         # v2: learned context embeddings added to the core's input bins: 0 nuclear, else
                                 # the organelle's NCBI genetic code table (2 vertebrate mito, 5 invertebrate, ...)
 
@@ -132,6 +133,9 @@ class KronGenome(nn.Module):
             self.head = nn.Conv1d(widths[0], 4, 1)
             self.tracks = nn.Conv1d(widths[0], c.n_tracks, 1) if c.n_tracks else None
         self.context = nn.Embedding(c.n_contexts, c.d_model) if c.n_contexts else None
+        self.jepa_pred = nn.Sequential(nn.RMSNorm(c.d_model, eps=1e-5), nn.Linear(c.d_model, 2 * c.d_model), nn.GELU(),
+                                       nn.Linear(2 * c.d_model, c.d_model)) if c.jepa else None
+        self.last_jepa = None
         if self.context is not None:
             nn.init.zeros_(self.context.weight)              # a new context starts as the nuclear model
 
@@ -155,6 +159,8 @@ class KronGenome(nn.Module):
         starts = torch.nonzero(torch.diff(flat, prepend=flat[:1] - 1)).squeeze(1)
         cu = torch.cat([starts, torch.tensor([flat.numel()], device=seq.device)]).to(torch.int32)
         core = self.run_core(h.reshape(1, b * bins, -1), cu).reshape(b, bins, -1)
+        # inside forward, so data-parallel training syncs the predictor's gradients
+        self.last_jepa = self.jepa_pred(core) if self.jepa_pred is not None and self.training else None
         x = self.decode(core.transpose(1, 2), skips)
         tracks = self.tracks(x).transpose(1, 2) if self.tracks is not None else None   # [B, L, n_tracks]
         return self.head(x).transpose(1, 2), core, tracks
