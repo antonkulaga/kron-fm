@@ -788,6 +788,10 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                                                      "cards and micro-batches (0: --batch-size windows)"),
                  grad_accum: int = typer.Option(1, help="micro-batches summed per optimizer step"),
                  compile_convs: bool = typer.Option(False, help="torch.compile each conv block"),
+                 local_track: str = typer.Option("", help="two-pathway: width,layers[,span] of a light 1-bp KronLSTM "
+                                                 "beside the long-range core, e.g. 128,2,8192"),
+                 checkpoint_core: bool = typer.Option(False, help="recompute each core layer in backward: ~8x less "
+                                                      "core activation memory for ~30 % more compute"),
                  eval_window: int = typer.Option(0, help="held-out windows of this length (0: the curriculum's last)"),
                  jepa_weight: float = typer.Option(0.0, help="JEPA-DNA latent loss: predict an EMA target encoder's "
                                                    "core states of the unmasked window (cosine), at this weight"),
@@ -862,6 +866,7 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
         n_epi = reg_active.shape[1]
         say(f"cell-type conditioning: {n_epi} epigenomes, {reg_active.shape[0]:,} regulatory elements")
     epi_batch: list = []                                                  # the last sample()'s bin targets
+    epi_unit = 128 if arch == "v3" else unit                               # v3 pools its 1-bp states per 128 bp
 
     def epi_targets(at: int, take: int, window: int, flip: bool) -> tuple[np.ndarray, np.ndarray]:
         """``[bins, E]`` bool: an epigenome is active in a 128-bp bin when an element active there covers a base of
@@ -870,12 +875,12 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
         ids[:take] = regfeat[at:at + take]
         if flip:
             ids[:take] = ids[:take][::-1]
-        ids = ids.reshape(-1, unit)
+        ids = ids.reshape(-1, epi_unit)
         hit = np.zeros((ids.shape[0], n_epi), dtype=bool)
         rows, cols = np.nonzero(ids >= 0)
         if len(rows):
             np.logical_or.at(hit, rows, reg_active[ids[rows, cols]])
-        return hit, np.arange(window // unit) < (take + unit - 1) // unit
+        return hit, np.arange(window // epi_unit) < (take + epi_unit - 1) // epi_unit
 
     def phase_at(s: int) -> tuple[int, int]:
         """(window, batch) at optimizer step s."""
@@ -942,8 +947,8 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                 codes[:take] = G.reverse_complement(codes[:take].astype(np.uint8))
             if epigenome_weight > 0:
                 if from_mito:
-                    epi_t.append(np.zeros((window // unit, n_epi), dtype=bool))
-                    epi_v.append(np.zeros(window // unit, dtype=bool))
+                    epi_t.append(np.zeros((window // epi_unit, n_epi), dtype=bool))
+                    epi_v.append(np.zeros(window // epi_unit, dtype=bool))
                 else:
                     h_, v_ = epi_targets(at, take, window, flip_row)
                     epi_t.append(h_)
@@ -972,8 +977,11 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                                 n_tracks=len(G.TRACKS) if labels else 0, arch=arch, head_hidden=head_hidden,
                                 n_contexts=34 if mito else 0, jepa=jepa_weight > 0,
                                 n_epigenomes=n_epi if epigenome_weight > 0 else 0, chunk_ratio=chunk_ratio,
-                                chunk_length_feature=chunk_length_feature)
+                                chunk_length_feature=chunk_length_feature,
+                                **(dict(zip(("local_width", "local_layers", "local_span"),
+                                            map(int, local_track.split(",")))) if local_track else {}))
     model = G.KronGenome(config).to(dev)
+    model.checkpoint_core = checkpoint_core
     if compile_convs:
         for blocks in [model.down, model.up] + ([model.up2] if arch == "v2" else []):
             for i in range(len(blocks)):
@@ -987,7 +995,7 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                                   dtype=torch.float32, device=dev)
         say("track positive weights: " + ", ".join(f"{t} {w:.1f}" for t, w in zip(G.TRACKS, pos_weight)))
         say("tracks trained: " + ", ".join(t for t, m in zip(G.TRACKS, train_mask.tolist()) if m))
-    if arch == "v2":   # no weight decay on norms, biases, scales and embeddings
+    if arch in ("v2", "v3"):   # no weight decay on norms, biases, scales and embeddings
         decay = [p_ for n_, p_ in model.named_parameters() if p_.ndim >= 2 and "context" not in n_]
         rest = [p_ for n_, p_ in model.named_parameters() if not (p_.ndim >= 2 and "context" not in n_)]
         opt = torch.optim.AdamW([{"params": decay, "weight_decay": 0.1}, {"params": rest, "weight_decay": 0.0}],
@@ -1138,12 +1146,12 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
             with torch.no_grad():
                 pairs = ([contig_loss(*sample_contig(val_idx), keep=keep if labels else None) for _ in range(2)]
                          if whole_contigs else
-                         [loss_on(*sample(val_idx, window=eval_window, batch=1 if arch == "v2" else batch_size,
+                         [loss_on(*sample(val_idx, window=eval_window, batch=1 if arch in ("v2", "v3") else batch_size,
                                           gen=eval_rng),
                                   keep=keep if labels else None, mask_gen=mask_gen) for _ in range(8)])
                 mito_bits = None
                 if mito:
-                    mw = -(-int(mito_val["len"].max()) // unit) * unit
+                    mw = -(-int(mito_val["len"].max()) // max(unit, 128)) * max(unit, 128)
                     mito_bits = float(np.mean([loss_on(*sample(mito_val, window=mw, batch=4, gen=eval_rng,
                                                                mito_table=mito_val, share=1.0), mask_gen=mask_gen)[0].item()
                                                for _ in range(8)])) / math.log(2)

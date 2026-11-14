@@ -42,6 +42,9 @@ class KronGenomeConfig:
                                 # FiLM-modulated by a learned epigenome embedding (Bolero-style)
     chunk_ratio: float = 0.0    # learned chunking (H-Net): > 0 replaces fixed pooling past 2**n_down bp by a router
                                 # that picks chunk starts, ~1 in chunk_ratio positions on average (ratio loss)
+    local_width: int = 0        # two-pathway: a light KronLSTM at single bases beside the long-range core (0: off)
+    local_layers: int = 2
+    local_span: int = 8192      # the local track's state restarts every this many bases (bounded memory)
     chunk_length_feature: bool = False  # with chunking: tell the core each chunk's log-length (time-aware gating)
     jepa: bool = False          # a predictor of an EMA target's core states from the masked input's (JEPA-DNA)
     n_contexts: int = 0         # v2: learned context embeddings added to the core's input bins: 0 nuclear, else
@@ -117,6 +120,9 @@ class KronGenome(nn.Module):
         super().__init__()
         self.config = c = config
         widths = [c.stem_channels + (c.d_model - c.stem_channels) * i // max(c.n_down, 1) for i in range(c.n_down + 1)]
+        if c.arch == "v3":
+            self._init_v3(c)
+            return
         if c.arch not in ("v1", "v2"):
             raise ValueError(f"unknown arch {c.arch!r}")
         v2 = c.arch == "v2"
@@ -158,13 +164,115 @@ class KronGenome(nn.Module):
                 nn.init.zeros_(self.chunk_len.weight)
                 nn.init.zeros_(self.chunk_len.bias)
         self.last_ratio_loss = None
+        self.checkpoint_core = False
+        if c.local_width:                 # local track: 1-bp recurrence, fused gated into the decoder's finest level
+            self.local_in = nn.Conv1d(widths[0], c.local_width, 1)
+            heads = max(1, c.local_width // 32)
+            self.local_core = nn.ModuleList(BiKronLSTMBlock(c.local_width, heads, 2 * c.local_width, c.dropout, i)
+                                            for i in range(c.local_layers))
+            self.local_out = nn.Conv1d(c.local_width, widths[0], 1)
+            self.local_gate = nn.Parameter(torch.zeros(1))      # recompute each core layer in backward (memory for longer windows)
         self.last_chunks = None
         if self.context is not None:
             nn.init.zeros_(self.context.weight)              # a new context starts as the nuclear model
 
+    def _init_v3(self, c) -> None:
+        """v3, no conv tower and no fixed bins: one-hot -> a k=15 embedding -> a light 1-bp KronLSTM (the local
+        track, state restarting every ``local_span`` bases) -> an H-Net router on its states picks chunk starts at
+        single-base resolution (~1 in ``chunk_ratio``) -> the full core over the chunks -> every base takes its chunk's
+        state (straight-through), fused with its local state -> per-base MLP heads."""
+        if not (c.local_width and c.chunk_ratio):
+            raise ValueError("arch v3 needs local_width and chunk_ratio")
+        w = c.local_width
+        self.stem = nn.Conv1d(N_IN, w, 15, padding=7)
+        heads = max(1, w // 32)
+        self.local_core = nn.ModuleList(BiKronLSTMBlock(w, heads, 2 * w, c.dropout, i) for i in range(c.local_layers))
+        self.to_core = nn.Linear(w, c.d_model)
+        self.route_q = nn.Linear(c.d_model, c.d_model, bias=False)
+        self.route_k = nn.Linear(c.d_model, c.d_model, bias=False)
+        nn.init.eye_(self.route_q.weight)          # start from "neighbours alike, few boundaries": at 1 bp a random
+        nn.init.eye_(self.route_k.weight)          # router would cut every 2nd base and swamp the core
+        self.chunk_len = nn.Linear(1, c.d_model) if c.chunk_length_feature else None
+        if self.chunk_len is not None:
+            nn.init.zeros_(self.chunk_len.weight); nn.init.zeros_(self.chunk_len.bias)
+        self.core = nn.ModuleList(BiKronLSTMBlock(c.d_model, c.n_heads, c.ff_units, c.dropout, i)
+                                  for i in range(c.n_layers))
+        self.core_norm = nn.RMSNorm(c.d_model, eps=1e-5)
+        self.from_core = nn.Linear(c.d_model, w)
+        self.fuse_norm = ChannelRMSNorm(w)
+        hidden = c.head_hidden or 2 * w
+        self.head = MLPHead(w, hidden, 4)
+        self.tracks = MLPHead(w, hidden, c.n_tracks) if c.n_tracks else None
+        self.context = nn.Embedding(c.n_contexts, c.d_model) if c.n_contexts else None
+        if self.context is not None:
+            nn.init.zeros_(self.context.weight)
+        self.jepa_pred = nn.Sequential(nn.RMSNorm(c.d_model, eps=1e-5), nn.Linear(c.d_model, 2 * c.d_model), nn.GELU(),
+                                       nn.Linear(2 * c.d_model, c.d_model)) if c.jepa else None
+        self.last_jepa = self.last_epi = self.last_ratio_loss = self.last_chunks = None
+        self.checkpoint_core = False
+        if c.n_epigenomes:
+            hid = 256
+            self.epi_in = nn.Sequential(nn.RMSNorm(c.d_model, eps=1e-5), nn.Linear(c.d_model, hid))
+            self.epi_film = nn.Embedding(c.n_epigenomes, 2 * hid)
+            nn.init.zeros_(self.epi_film.weight)
+            self.epi_out = nn.Linear(hid, 1)
+
+    def _forward_v3(self, seq, segments, context):
+        c = self.config
+        b, length = seq.shape
+        dev = seq.device
+        if segments is None:
+            segments = torch.zeros(b, length, dtype=torch.long, device=dev)
+        segments = segments + torch.arange(b, device=dev).unsqueeze(1) * (segments.max() + 1)
+        x = self.stem(one_hot(seq)).transpose(1, 2).reshape(1, b * length, -1)         # [1, B*L, w]
+        flat_seg = segments.reshape(-1)
+        pos = torch.arange(b * length, device=dev)
+        cut = (torch.diff(flat_seg, prepend=flat_seg[:1] - 1) != 0) | (pos % length % c.local_span == 0)
+        cu_l = torch.cat([torch.nonzero(cut).squeeze(1), torch.tensor([b * length], device=dev)]).to(torch.int32)
+        ck = self.checkpoint_core and torch.is_grad_enabled()
+        for layer in self.local_core:
+            x = torch.utils.checkpoint.checkpoint(layer, x, cu_l, use_reentrant=False) if ck else layer(x, cu_l)
+        local = x.reshape(b, length, -1)                                                # [B, L, w]
+        h = self.to_core(local)
+        if self.context is not None:
+            ctx = context.long() if context is not None else torch.zeros(b, dtype=torch.long, device=dev)
+            h = h + self.context(ctx).unsqueeze(1).to(h.dtype)
+        q, k = self.route_q(h), self.route_k(h)
+        cos = F.cosine_similarity(q[:, 1:], k[:, :-1], dim=-1)
+        p = torch.cat([torch.ones(b, 1, device=dev, dtype=cos.dtype), 0.5 * (1 - cos)], 1).float().clamp(0, 1)
+        seg_start = torch.diff(segments, dim=1, prepend=segments[:, :1] - 1) != 0
+        bound = (p >= 0.5) | seg_start
+        flat_b = bound.reshape(-1)
+        chunk_id = torch.cumsum(flat_b.long(), 0) - 1
+        chunks = h.reshape(b * length, -1)[flat_b]
+        seg_c = flat_seg[flat_b]
+        starts = torch.nonzero(torch.diff(seg_c, prepend=seg_c[:1] - 1)).squeeze(1)
+        cu = torch.cat([starts, torch.tensor([seg_c.numel()], device=dev)]).to(torch.int32)
+        if self.chunk_len is not None:
+            lengths = torch.bincount(chunk_id, minlength=chunks.shape[0]).float()
+            chunks = chunks + self.chunk_len(torch.log(lengths).unsqueeze(-1)).to(chunks.dtype)
+        core_c = self.run_core(chunks.unsqueeze(0), cu, checkpoint=ck)[0]
+        up = core_c[chunk_id].reshape(b, length, -1)
+        conf = torch.where(bound, p, 1 - p)
+        up = up * (conf + (1 - conf).detach()).unsqueeze(-1).to(up.dtype)
+        if self.training:
+            ratio = c.chunk_ratio
+            f, gm = flat_b.float().mean(), p.mean()
+            self.last_ratio_loss = ratio / (ratio - 1) * ((ratio - 1) * f * gm + (1 - f) * (1 - gm))
+        self.last_chunks = float(flat_b.float().mean())
+        # JEPA in v3: predict the EMA target's per-base chunk states (comparable per base, whatever the chunking)
+        self.last_jepa = self.jepa_pred(up) if self.jepa_pred is not None and self.training else None
+        if c.n_epigenomes:                      # cell types per 128-bp bin: the chunk states pooled over each bin
+            self.last_epi = self.epigenome_logits(up.reshape(b, length // 128, 128, -1).mean(2))
+        fused = self.fuse_norm((local + self.from_core(up)).transpose(1, 2))           # [B, w, L]
+        tracks = self.tracks(fused).transpose(1, 2) if self.tracks is not None else None
+        return self.head(fused).transpose(1, 2), up, tracks
+
     def forward(self, seq: torch.Tensor, segments: torch.Tensor | None = None, context: torch.Tensor | None = None
                 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
         c = self.config
+        if c.arch == "v3":
+            return self._forward_v3(seq, segments, context)
         b, length = seq.shape
         if length % (2 ** c.n_down):
             raise ValueError(f"length {length} is not a multiple of {2 ** c.n_down}")
@@ -183,11 +291,12 @@ class KronGenome(nn.Module):
         flat = segments.reshape(-1)
         starts = torch.nonzero(torch.diff(flat, prepend=flat[:1] - 1)).squeeze(1)
         cu = torch.cat([starts, torch.tensor([flat.numel()], device=seq.device)]).to(torch.int32)
-        core = self.run_core(h.reshape(1, b * bins, -1), cu).reshape(b, bins, -1)
+        core = self.run_core(h.reshape(1, b * bins, -1), cu,
+                             checkpoint=self.checkpoint_core and torch.is_grad_enabled()).reshape(b, bins, -1)
         # inside forward, so data-parallel training syncs the predictor's gradients
         self.last_jepa = self.jepa_pred(core) if self.jepa_pred is not None and self.training else None
         self.last_epi = self.epigenome_logits(core) if self.config.n_epigenomes else None
-        x = self.decode(core.transpose(1, 2), skips)
+        x = self.add_local(self.decode(core.transpose(1, 2), skips), skips)
         tracks = self.tracks(x).transpose(1, 2) if self.tracks is not None else None   # [B, L, n_tracks]
         return self.head(x).transpose(1, 2), core, tracks
 
@@ -215,7 +324,7 @@ class KronGenome(nn.Module):
         if self.config.chunk_length_feature:                               # a recurrent step over a long chunk
             lengths = torch.bincount(chunk_id, minlength=chunks.shape[0]).float()   # should forget more: say how long
             chunks = chunks + self.chunk_len(torch.log(lengths).unsqueeze(-1)).to(chunks.dtype)
-        core_c = self.run_core(chunks.unsqueeze(0), cu)[0]                 # [C, d]
+        core_c = self.run_core(chunks.unsqueeze(0), cu, checkpoint=self.checkpoint_core and torch.is_grad_enabled())[0]
         up = core_c[chunk_id].reshape(b, n, d)
         conf = torch.where(bound, p, 1 - p)
         up = up * (conf + (1 - conf).detach()).unsqueeze(-1).to(up.dtype)   # value 1, gradient to the router
@@ -226,9 +335,27 @@ class KronGenome(nn.Module):
         self.last_chunks = float(flat_b.float().mean())
         # the cell-type head reads the core's states at the encoder's resolution (2**n_down bp per position)
         self.last_epi = self.epigenome_logits(up) if self.config.n_epigenomes else None
-        x = self.decode(up.transpose(1, 2), skips)
+        x = self.add_local(self.decode(up.transpose(1, 2), skips), skips)
         tracks = self.tracks(x).transpose(1, 2) if self.tracks is not None else None
         return self.head(x).transpose(1, 2), up, tracks
+
+    def add_local(self, x: torch.Tensor, skips: list[torch.Tensor]) -> torch.Tensor:
+        """The local track: a light bidirectional KronLSTM over every base of the stem's output, its state restarting
+        every ``local_span`` bases, added to the decoder's 1-bp output through a learned gate (zero at start)."""
+        c = self.config
+        if not c.local_width:
+            return x
+        stem = skips[0] if skips else x                             # [B, C0, L] at 1 bp
+        b, _, length = stem.shape
+        h = self.local_in(stem).transpose(1, 2).reshape(1, b * length, -1)
+        span = min(c.local_span, length)
+        starts = torch.arange(0, b * length, span, device=x.device)
+        cu = torch.cat([starts, torch.tensor([b * length], device=x.device)]).to(torch.int32)
+        for layer in self.local_core:
+            h = (torch.utils.checkpoint.checkpoint(layer, h, cu, use_reentrant=False)
+                 if self.checkpoint_core and torch.is_grad_enabled() else layer(h, cu))
+        h = h.reshape(b, length, -1).transpose(1, 2)
+        return x + self.local_gate * self.local_out(h)
 
     def epigenome_logits(self, core: torch.Tensor) -> torch.Tensor:
         """``[B, bins, d_model]`` core states -> ``[B, bins, n_epigenomes]`` activity logits: one head, its hidden
