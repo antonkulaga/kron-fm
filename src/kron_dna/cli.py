@@ -792,6 +792,9 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                  jepa_weight: float = typer.Option(0.0, help="JEPA-DNA latent loss: predict an EMA target encoder's "
                                                    "core states of the unmasked window (cosine), at this weight"),
                  jepa_ema: float = typer.Option(0.996, help="with --jepa-weight: EMA decay of the target encoder"),
+                 epigenome_weight: float = typer.Option(0.0, help="cell-type conditioning: also predict Regulatory Build "
+                                                        "activity per 128-bp bin in each epigenome "
+                                                        "(genome-labels-extra), at this loss weight"),
                  mito: str = typer.Option("", help="also train on this prepared organelle genome (genome-prepare-mito), "
                                           "each sequence tagged with its genetic code table as context (nuclear: 0)"),
                  mito_share: float = typer.Option(0.03, help="with --mito: share of training windows from it"),
@@ -845,6 +848,27 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
         say(f"mito: {mito_train.height} train / {mito_val.height} held-out genomes "
                    f"({int(mito_train['len'].sum()):,} / {int(mito_val['len'].sum()):,} bases), share {mito_share}")
 
+    if epigenome_weight > 0:
+        regfeat = np.memmap(src / "regfeat.i32", dtype=np.int32, mode="r")
+        reg_active = np.load(src / "regfeat_active.npy")                  # [features, epigenomes] bool
+        n_epi = reg_active.shape[1]
+        say(f"cell-type conditioning: {n_epi} epigenomes, {reg_active.shape[0]:,} regulatory elements")
+    epi_batch: list = []                                                  # the last sample()'s bin targets
+
+    def epi_targets(at: int, take: int, window: int, flip: bool) -> tuple[np.ndarray, np.ndarray]:
+        """``[bins, E]`` bool: an epigenome is active in a 128-bp bin when an element active there covers a base of
+        it; and ``[bins]`` valid (inside the window's bases)."""
+        ids = np.full(window, -1, dtype=np.int64)
+        ids[:take] = regfeat[at:at + take]
+        if flip:
+            ids[:take] = ids[:take][::-1]
+        ids = ids.reshape(-1, unit)
+        hit = np.zeros((ids.shape[0], n_epi), dtype=bool)
+        rows, cols = np.nonzero(ids >= 0)
+        if len(rows):
+            np.logical_or.at(hit, rows, reg_active[ids[rows, cols]])
+        return hit, np.arange(window // unit) < (take + unit - 1) // unit
+
     def phase_at(s: int) -> tuple[int, int]:
         """(window, batch) at optimizer step s."""
         acc = 0
@@ -885,6 +909,7 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
         batch = batch or batch_size
         p = table["len"].to_numpy() / table["len"].sum()                 # contigs by length: every base equally
         seqs, segs, ctxs, labs, acts, valid = [], [], [], [], [], []
+        epi_t, epi_v = [], []
         for _ in range(batch):
             from_mito = mito_table is not None and gen.random() < share
             if from_mito:
@@ -907,6 +932,14 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
             flip_row = flip and gen.random() < 0.5
             if flip_row:
                 codes[:take] = G.reverse_complement(codes[:take].astype(np.uint8))
+            if epigenome_weight > 0:
+                if from_mito:
+                    epi_t.append(np.zeros((window // unit, n_epi), dtype=bool))
+                    epi_v.append(np.zeros(window // unit, dtype=bool))
+                else:
+                    h_, v_ = epi_targets(at, take, window, flip_row)
+                    epi_t.append(h_)
+                    epi_v.append(v_)
             seg = np.zeros(window // unit, dtype=np.int64)
             seg[(take + unit - 1) // unit:] = 1                           # padding is its own segment
             seqs.append(codes)
@@ -920,6 +953,7 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                 labs.append(lab)
                 acts.append(act)
                 valid.append((np.arange(window) < take) & (not from_mito))
+        epi_batch[:] = [(torch.from_numpy(np.stack(epi_t)), torch.from_numpy(np.stack(epi_v)))] if epi_t else []
         out = [torch.from_numpy(np.stack(seqs)), torch.from_numpy(np.stack(segs)), torch.tensor(ctxs)]
         if labels:
             out += [torch.from_numpy(np.stack(x)) for x in (labs, acts, valid)]
@@ -928,7 +962,8 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
     dev = torch.device("cuda", torch.cuda.current_device())
     config = G.KronGenomeConfig(d_model=d_model, n_layers=n_layers, stem_channels=stem_channels, n_down=n_down,
                                 n_tracks=len(G.TRACKS) if labels else 0, arch=arch, head_hidden=head_hidden,
-                                n_contexts=34 if mito else 0, jepa=jepa_weight > 0)
+                                n_contexts=34 if mito else 0, jepa=jepa_weight > 0,
+                                n_epigenomes=n_epi if epigenome_weight > 0 else 0)
     model = G.KronGenome(config).to(dev)
     if compile_convs:
         for blocks in [model.down, model.up] + ([model.up2] if arch == "v2" else []):
@@ -1006,6 +1041,14 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
             logits, _, tracks = (train_model if model.training else model)(inputs, seg.to(dev),
                                                                             ctx.to(dev) if mito else None)
         mlm = F.cross_entropy(logits.float().reshape(-1, 4), targets.reshape(-1), ignore_index=-100)
+        if epigenome_weight > 0 and model.last_epi is not None and epi_batch:
+            want_e, ok_e = (x.to(dev) for x in epi_batch[0])
+            per_e = F.binary_cross_entropy_with_logits(model.last_epi.float(), want_e.float(), reduction="none")
+            loss_e = (per_e * ok_e.unsqueeze(-1)).sum() / (ok_e.sum().clamp_min(1) * per_e.shape[-1])
+            if model.training:
+                mlm = mlm + epigenome_weight * loss_e
+            else:
+                epi_keep.append((model.last_epi.float()[ok_e].cpu(), want_e[ok_e].cpu()))
         if target is not None and model.training and model.last_jepa is not None:
             with torch.no_grad(), autocast:
                 _, want_core, _ = target(seq.to(dev), seg.to(dev), ctx.to(dev) if mito else None)
@@ -1024,6 +1067,7 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
         return mlm, track
 
     jepa_losses: list[float] = []
+    epi_keep: list = []
     t0, started = time.time(), time.time()
     metrics = out / "metrics.csv"
     if main and not metrics.exists():
@@ -1104,6 +1148,17 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                         auroc, ap = G.ranking_scores(scores[:, j], y)
                         fh.write(f"{step},{name_},{auroc:.4f},{ap:.4f},{float(y.float().mean()):.6f}\n")
                 del keep, scores, truth
+            if epi_keep:
+                sc = torch.cat([k[0] for k in epi_keep])
+                tr = torch.cat([k[1] for k in epi_keep])
+                aucs = [G.ranking_scores(sc[:, j], tr[:, j])[0] for j in range(sc.shape[1]) if 0 < tr[:, j].sum() < len(tr)]
+                epi_note = f"epigenome AUROC mean {np.mean(aucs):.4f} (min {np.min(aucs):.3f}, {len(aucs)} epigenomes)"
+                if main:
+                    with (out / "epigenomes.csv").open("a") as fh:
+                        fh.write(f"{step},{np.mean(aucs):.4f},{np.median(aucs):.4f},{np.min(aucs):.4f},"
+                                 f"{float(tr.float().mean()):.5f}\n")
+                say(epi_note)
+                epi_keep.clear()
             tracks_note = extra
             if mito_bits is not None:
                 extra += f",{mito_bits:.4f}"

@@ -38,6 +38,8 @@ class KronGenomeConfig:
     arch: str = "v1"            # "v2": per-position RMS norm, two convs per block, scaled projected decoder skips,
                                 # MLP heads (see ConvBlock2); "v1" checkpoints load unchanged
     head_hidden: int = 0        # v2: hidden width of the MLP heads (0 = 2 x stem_channels)
+    n_epigenomes: int = 0       # cell-type conditioning: activity per 128-bp bin in each epigenome, one shared head
+                                # FiLM-modulated by a learned epigenome embedding (Bolero-style)
     jepa: bool = False          # a predictor of an EMA target's core states from the masked input's (JEPA-DNA)
     n_contexts: int = 0         # v2: learned context embeddings added to the core's input bins: 0 nuclear, else
                                 # the organelle's NCBI genetic code table (2 vertebrate mito, 5 invertebrate, ...)
@@ -136,6 +138,13 @@ class KronGenome(nn.Module):
         self.jepa_pred = nn.Sequential(nn.RMSNorm(c.d_model, eps=1e-5), nn.Linear(c.d_model, 2 * c.d_model), nn.GELU(),
                                        nn.Linear(2 * c.d_model, c.d_model)) if c.jepa else None
         self.last_jepa = None
+        if c.n_epigenomes:
+            hid = 256
+            self.epi_in = nn.Sequential(nn.RMSNorm(c.d_model, eps=1e-5), nn.Linear(c.d_model, hid))
+            self.epi_film = nn.Embedding(c.n_epigenomes, 2 * hid)     # per epigenome: scale and shift
+            nn.init.zeros_(self.epi_film.weight)
+            self.epi_out = nn.Linear(hid, 1)
+        self.last_epi = None
         if self.context is not None:
             nn.init.zeros_(self.context.weight)              # a new context starts as the nuclear model
 
@@ -161,9 +170,18 @@ class KronGenome(nn.Module):
         core = self.run_core(h.reshape(1, b * bins, -1), cu).reshape(b, bins, -1)
         # inside forward, so data-parallel training syncs the predictor's gradients
         self.last_jepa = self.jepa_pred(core) if self.jepa_pred is not None and self.training else None
+        self.last_epi = self.epigenome_logits(core) if self.config.n_epigenomes else None
         x = self.decode(core.transpose(1, 2), skips)
         tracks = self.tracks(x).transpose(1, 2) if self.tracks is not None else None   # [B, L, n_tracks]
         return self.head(x).transpose(1, 2), core, tracks
+
+    def epigenome_logits(self, core: torch.Tensor) -> torch.Tensor:
+        """``[B, bins, d_model]`` core states -> ``[B, bins, n_epigenomes]`` activity logits: one head, its hidden
+        layer scaled and shifted per epigenome (FiLM), so a new cell type is one more embedding row."""
+        h = self.epi_in(core)                                        # [B, bins, hid]
+        scale, shift = self.epi_film.weight.chunk(2, dim=-1)        # [E, hid] each, zero at start
+        h = F.gelu(h.unsqueeze(2) * (1 + scale) + shift)            # [B, bins, E, hid]
+        return self.epi_out(h).squeeze(-1)
 
     def encode(self, seq: torch.Tensor) -> tuple[torch.Tensor, list[torch.Tensor]]:
         """``[B, L]`` bases -> ``[B, d_model, L / 2**n_down]`` bins and the encoder's skips, finest first."""
