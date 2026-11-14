@@ -40,6 +40,9 @@ class KronGenomeConfig:
     head_hidden: int = 0        # v2: hidden width of the MLP heads (0 = 2 x stem_channels)
     n_epigenomes: int = 0       # cell-type conditioning: activity per 128-bp bin in each epigenome, one shared head
                                 # FiLM-modulated by a learned epigenome embedding (Bolero-style)
+    chunk_ratio: float = 0.0    # learned chunking (H-Net): > 0 replaces fixed pooling past 2**n_down bp by a router
+                                # that picks chunk starts, ~1 in chunk_ratio positions on average (ratio loss)
+    chunk_length_feature: bool = False  # with chunking: tell the core each chunk's log-length (time-aware gating)
     jepa: bool = False          # a predictor of an EMA target's core states from the masked input's (JEPA-DNA)
     n_contexts: int = 0         # v2: learned context embeddings added to the core's input bins: 0 nuclear, else
                                 # the organelle's NCBI genetic code table (2 vertebrate mito, 5 invertebrate, ...)
@@ -113,7 +116,7 @@ class KronGenome(nn.Module):
     def __init__(self, config: KronGenomeConfig) -> None:
         super().__init__()
         self.config = c = config
-        widths = [c.stem_channels + (c.d_model - c.stem_channels) * i // c.n_down for i in range(c.n_down + 1)]
+        widths = [c.stem_channels + (c.d_model - c.stem_channels) * i // max(c.n_down, 1) for i in range(c.n_down + 1)]
         if c.arch not in ("v1", "v2"):
             raise ValueError(f"unknown arch {c.arch!r}")
         v2 = c.arch == "v2"
@@ -145,6 +148,17 @@ class KronGenome(nn.Module):
             nn.init.zeros_(self.epi_film.weight)
             self.epi_out = nn.Linear(hid, 1)
         self.last_epi = None
+        if c.chunk_ratio:
+            if c.jepa:
+                raise ValueError("learned chunking does not combine with jepa yet")
+            self.route_q = nn.Linear(c.d_model, c.d_model, bias=False)
+            self.route_k = nn.Linear(c.d_model, c.d_model, bias=False)
+            if c.chunk_length_feature:
+                self.chunk_len = nn.Linear(1, c.d_model)
+                nn.init.zeros_(self.chunk_len.weight)
+                nn.init.zeros_(self.chunk_len.bias)
+        self.last_ratio_loss = None
+        self.last_chunks = None
         if self.context is not None:
             nn.init.zeros_(self.context.weight)              # a new context starts as the nuclear model
 
@@ -160,6 +174,8 @@ class KronGenome(nn.Module):
             ctx = context.long() if context is not None else torch.zeros(b, dtype=torch.long, device=seq.device)
             h = h + self.context(ctx).unsqueeze(1).to(h.dtype)
         bins = h.shape[1]
+        if self.config.chunk_ratio:
+            return self._forward_chunked(h, skips, segments)
         if segments is None:
             segments = torch.arange(b, device=seq.device).unsqueeze(1).expand(b, bins)
         else:
@@ -174,6 +190,45 @@ class KronGenome(nn.Module):
         x = self.decode(core.transpose(1, 2), skips)
         tracks = self.tracks(x).transpose(1, 2) if self.tracks is not None else None   # [B, L, n_tracks]
         return self.head(x).transpose(1, 2), core, tracks
+
+    def _forward_chunked(self, h: torch.Tensor, skips: list[torch.Tensor], segments: torch.Tensor | None):
+        """H-Net dynamic chunking between the encoder and the core: a boundary probability per position from the
+        cosine dissimilarity of neighbouring states; positions with p >= 0.5 (and every segment start) begin a chunk;
+        the core runs over the chunks (packed, so windows may differ in chunk count); every position takes its chunk's
+        core state, multiplied by a straight-through confidence so the router learns; then the usual decoder."""
+        b, n, d = h.shape
+        dev = h.device
+        if segments is None:
+            segments = torch.zeros(b, n, dtype=torch.long, device=dev)
+        segments = segments + torch.arange(b, device=dev).unsqueeze(1) * (segments.max() + 1)
+        q, k = self.route_q(h), self.route_k(h)
+        cos = F.cosine_similarity(q[:, 1:], k[:, :-1], dim=-1)
+        p = torch.cat([torch.ones(b, 1, device=dev, dtype=cos.dtype), 0.5 * (1 - cos)], 1).float().clamp(0, 1)
+        seg_start = torch.diff(segments, dim=1, prepend=segments[:, :1] - 1) != 0
+        bound = (p >= 0.5) | seg_start
+        flat_b = bound.reshape(-1)
+        chunk_id = torch.cumsum(flat_b.long(), 0) - 1                       # [b*n]: each position's chunk
+        chunks = h.reshape(b * n, d)[flat_b]                                # [C, d]: the chunk-start states
+        seg_c = segments.reshape(-1)[flat_b]
+        starts = torch.nonzero(torch.diff(seg_c, prepend=seg_c[:1] - 1)).squeeze(1)
+        cu = torch.cat([starts, torch.tensor([seg_c.numel()], device=dev)]).to(torch.int32)
+        if self.config.chunk_length_feature:                               # a recurrent step over a long chunk
+            lengths = torch.bincount(chunk_id, minlength=chunks.shape[0]).float()   # should forget more: say how long
+            chunks = chunks + self.chunk_len(torch.log(lengths).unsqueeze(-1)).to(chunks.dtype)
+        core_c = self.run_core(chunks.unsqueeze(0), cu)[0]                 # [C, d]
+        up = core_c[chunk_id].reshape(b, n, d)
+        conf = torch.where(bound, p, 1 - p)
+        up = up * (conf + (1 - conf).detach()).unsqueeze(-1).to(up.dtype)   # value 1, gradient to the router
+        if self.training:                                                   # H-Net's ratio loss: mean boundary rate
+            ratio = self.config.chunk_ratio                                 # near 1 / ratio, in hard and soft form
+            f, gm = flat_b.float().mean(), p.mean()
+            self.last_ratio_loss = ratio / (ratio - 1) * ((ratio - 1) * f * gm + (1 - f) * (1 - gm))
+        self.last_chunks = float(flat_b.float().mean())
+        # the cell-type head reads the core's states at the encoder's resolution (2**n_down bp per position)
+        self.last_epi = self.epigenome_logits(up) if self.config.n_epigenomes else None
+        x = self.decode(up.transpose(1, 2), skips)
+        tracks = self.tracks(x).transpose(1, 2) if self.tracks is not None else None
+        return self.head(x).transpose(1, 2), up, tracks
 
     def epigenome_logits(self, core: torch.Tensor) -> torch.Tensor:
         """``[B, bins, d_model]`` core states -> ``[B, bins, n_epigenomes]`` activity logits: one head, its hidden

@@ -792,6 +792,14 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                  jepa_weight: float = typer.Option(0.0, help="JEPA-DNA latent loss: predict an EMA target encoder's "
                                                    "core states of the unmasked window (cosine), at this weight"),
                  jepa_ema: float = typer.Option(0.996, help="with --jepa-weight: EMA decay of the target encoder"),
+                 start_step: int = typer.Option(0, help="with --init: continue the schedule (curriculum, LR, paired "
+                                                "evals) from this step, so the init run's own history is the control"),
+                 stop_step: int = typer.Option(0, help="stop after this step (0: the end of the curriculum)"),
+                 chunk_ratio: float = typer.Option(0.0, help="learned chunking (H-Net): the router keeps ~1 in this many "
+                                                   "2**n_down-bp positions as chunk starts (use with --n-down 4)"),
+                 ratio_weight: float = typer.Option(0.03, help="with --chunk-ratio: weight of the ratio loss"),
+                 chunk_length_feature: bool = typer.Option(False, help="with --chunk-ratio: give the core each chunk's "
+                                                           "log-length, so its gates can scale with the span"),
                  epigenome_weight: float = typer.Option(0.0, help="cell-type conditioning: also predict Regulatory Build "
                                                         "activity per 128-bp bin in each epigenome "
                                                         "(genome-labels-extra), at this loss weight"),
@@ -963,7 +971,8 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
     config = G.KronGenomeConfig(d_model=d_model, n_layers=n_layers, stem_channels=stem_channels, n_down=n_down,
                                 n_tracks=len(G.TRACKS) if labels else 0, arch=arch, head_hidden=head_hidden,
                                 n_contexts=34 if mito else 0, jepa=jepa_weight > 0,
-                                n_epigenomes=n_epi if epigenome_weight > 0 else 0)
+                                n_epigenomes=n_epi if epigenome_weight > 0 else 0, chunk_ratio=chunk_ratio,
+                                chunk_length_feature=chunk_length_feature)
     model = G.KronGenome(config).to(dev)
     if compile_convs:
         for blocks in [model.down, model.up] + ([model.up2] if arch == "v2" else []):
@@ -997,6 +1006,7 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
     elif init is not None and not bench:
         missing, unexpected = model.load_state_dict(torch.load(init, map_location="cpu")["model"], strict=False)
         say(f"initialised from {init}; new: {missing}; dropped: {unexpected}")
+        step = start_step
     say(f"KronGenome {arch} {model.n_parameters() / 1e6:.1f}M parameters, curriculum "
                f"{', '.join(f'{w:,} x {n:,} steps' for w, n in phases)}, eval window {eval_window:,}, "
                f"{train_idx.height} train / {val_idx.height} held-out contigs")
@@ -1041,6 +1051,9 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
             logits, _, tracks = (train_model if model.training else model)(inputs, seg.to(dev),
                                                                             ctx.to(dev) if mito else None)
         mlm = F.cross_entropy(logits.float().reshape(-1, 4), targets.reshape(-1), ignore_index=-100)
+        if chunk_ratio and model.training and model.last_ratio_loss is not None:
+            mlm = mlm + ratio_weight * model.last_ratio_loss
+            chunk_rates.append(model.last_chunks)
         if epigenome_weight > 0 and model.last_epi is not None and epi_batch:
             want_e, ok_e = (x.to(dev) for x in epi_batch[0])
             per_e = F.binary_cross_entropy_with_logits(model.last_epi.float(), want_e.float(), reduction="none")
@@ -1068,6 +1081,7 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
 
     jepa_losses: list[float] = []
     epi_keep: list = []
+    chunk_rates: list[float] = []
     t0, started = time.time(), time.time()
     metrics = out / "metrics.csv"
     if main and not metrics.exists():
@@ -1078,7 +1092,7 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
     if main and labels and not track_csv.exists():
         track_csv.write_text("step,track,auroc,average_precision,prevalence\n")
     model.train()
-    while step < steps:
+    while step < (stop_step or steps):
         for g in opt.param_groups:
             g["lr"] = lr * min(1.0, (step + 1) / warmup) * 0.5 * (1 + math.cos(math.pi * min(step / steps, 1.0)))
         torch.cuda.reset_peak_memory_stats(dev)
@@ -1166,9 +1180,11 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                 fh.write(f"{step},{opt.param_groups[0]['lr']:.3e},{loss.item():.4f},{bits:.4f},{h:.3f}{extra}\n")
             say(f"step {step} (window {win:,} x {bat}): train {loss.item():.4f}, held-out {bits:.3f} bits/base"
                        + (f", mito {mito_bits:.3f}" if mito_bits is not None else "")
-                       + (f", jepa {np.mean(jepa_losses):.4f}" if jepa_losses else "") + f", {h:.2f} h, "
+                       + (f", jepa {np.mean(jepa_losses):.4f}" if jepa_losses else "")
+                       + (f", chunk every {unit / np.mean(chunk_rates):.0f} bp" if chunk_rates else "") + f", {h:.2f} h, "
                        f"peak {torch.cuda.max_memory_allocated(dev) / 2**30:.1f} GiB" + (f", tracks {tracks_note}" if tracks_note else ""))
             jepa_losses.clear()
+            chunk_rates.clear()
             _save_atomic({"model": model.state_dict(), "optimizer": opt.state_dict(), "config": config.to_dict(),
                           "step": step, "hours": h}, ckpt)
             if world > 1:
