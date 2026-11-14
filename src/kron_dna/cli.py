@@ -863,6 +863,12 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
         [(window, steps)]
     steps = sum(s for _, s in phases)
     eval_window = eval_window or phases[-1][0]
+    if tokens_per_step:          # fail now, not hours in at the phase that cannot run (see phase_at)
+        bad = sorted({w for w, _ in phases if tokens_per_step < w * world * grad_accum})
+        if bad:
+            raise typer.BadParameter(
+                f"--tokens-per-step {tokens_per_step} is less than one window of {', '.join(f'{w:,}' for w in bad)} "
+                f"over {world} card(s) x --grad-accum {grad_accum}, so those curriculum phases can never run")
     if whole_contigs and (curriculum or rc or mito or bert_mask or grad_accum > 1):
         raise typer.BadParameter("--whole-contigs does not take --curriculum, --rc, --mito, --bert-mask or --grad-accum")
     if any(w % unit for w, _ in phases):
