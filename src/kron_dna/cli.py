@@ -650,6 +650,113 @@ def genome_labels(regulatory: Path = typer.Option(None, help="Ensembl Regulatory
     typer.echo(f"activity > 0 on {100 * float((act > 0).mean()):.2f} % of bases -> {out}")
 
 
+@app.command("genome-labels-extra")
+def genome_labels_extra(regulatory: Path = typer.Option(None, help="Ensembl Regulatory Build GFF3 (as genome-labels)"),
+                        activity: Path = typer.Option(None, help="its activity matrix TSV (as genome-labels)"),
+                        gtf: Path = typer.Option(None, help="GENCODE basic GTF (as genome-labels)"),
+                        name: str = typer.Option("hg38", help="prepared genome under data/interim/genome/")) -> None:
+    """The next tracks, beside ``genome-labels``' files: ``labels_extra.u8`` (bits of ``EXTRA_BITS``: 5' and 3' UTR,
+    start and stop codons, TSS, lncRNA exons, gene span on each strand) and the Regulatory Build per epigenome:
+    ``regfeat.i32`` (the row of the regulatory feature covering each base, -1 for none; the later feature where they
+    overlap; features without a row in the activity table, all CTCF sites in v116, are left out), ``regfeat_active.npy`` ([features, epigenomes] bool, ACTIVE) and ``regfeat_epigenomes.json``."""
+    import json
+
+    import numpy as np
+    import polars as pl
+    import polars_bio as pb
+
+    from kron_dna import genome as G
+
+    reg_dir = input_dir("regulation")
+    regulatory = regulatory or reg_dir / "ensembl116" / "Homo_sapiens.GRCh38.regulatory_features.v116.gff3.gz"
+    activity = activity or reg_dir / "ensembl116" / "Homo_sapiens.GRCh38.regulatory_activity.v116.tsv.gz"
+    gtf = gtf or reg_dir / "gencode" / "gencode.basic.gtf.gz"
+    out = interim_dir("genome", name)
+    index = pl.read_parquet(out / "contigs.parquet")
+    total = int((index["end"] - index["start"]).sum())
+
+    gt = (pb.scan_gtf(str(gtf), attr_fields=["transcript_id", "transcript_type"])
+          .filter(pl.col("type").is_in(["transcript", "exon", "CDS", "UTR", "start_codon", "stop_codon"]))
+          .select(["chrom", "start", "end", "type", "strand", "transcript_id", "transcript_type"]).collect())
+    labels = np.zeros(total, dtype=np.uint8)
+    for label, frame in G.gene_structure(gt).items():
+        n = sum(G.paint(index, chrom, part["start"].to_numpy(), part["end"].to_numpy(), labels, 1 << G.EXTRA_BITS[label])
+                for (chrom,), part in frame.group_by("chrom"))
+        typer.echo(f"{label:>12}: {n:>9} intervals, {100 * float(((labels >> G.EXTRA_BITS[label]) & 1).mean()):6.3f} % of bases")
+    labels.tofile(out / "labels_extra.u8")
+
+    acts = pl.read_csv(activity, separator="\t")
+    epis = acts.columns[2:]
+    reg = (pb.scan_gff(str(regulatory)).collect()
+           .with_columns(id=pl.col("attributes").list.eval(pl.element().struct.field("value")).list.first(),
+                         chrom="chr" + pl.col("chrom"), start=pl.col("start").cast(pl.Int64) - 1,
+                         end=pl.col("end").cast(pl.Int64))
+           .join(acts.select("feature_id", *epis).rename({"feature_id": "id"}), on="id", how="inner")
+           .sort("chrom", "start"))
+    active = reg.select([(pl.col(e) == "ACTIVE") for e in epis]).to_numpy()
+    feat = np.full(total, -1, dtype=np.int32)
+    rows = np.arange(reg.height, dtype=np.int32)
+    reg = reg.with_columns(row=pl.Series(rows))
+    n = sum(G.paint_ids(index, chrom, part["start"].to_numpy(), part["end"].to_numpy(), feat, part["row"].to_numpy())
+            for (chrom,), part in reg.group_by("chrom"))
+    feat.tofile(out / "regfeat.i32")
+    np.save(out / "regfeat_active.npy", active)
+    (out / "regfeat_epigenomes.json").write_text(json.dumps(list(epis)))
+    typer.echo(f"regulatory: {reg.height} features with activity over {len(epis)} epigenomes, {n} intervals painted, "
+               f"{100 * float((feat >= 0).mean()):.2f} % of bases covered; mean share active "
+               f"{float(active.mean()):.3f} -> {out}")
+
+
+@app.command("genome-prepare-mito")
+def genome_prepare_mito(gbff: Path = typer.Argument(..., help="RefSeq mitochondrion GenBank flat file (.gbff.gz)"),
+                        species: Path = typer.Option(None, help="MitoAge species table, for the held-out orders "
+                                                     "(default: data/input/mitoage/species.parquet)"),
+                        name: str = typer.Option("mito", help="output under data/interim/genome/"),
+                        held_out_mod: int = typer.Option(10, help="an order is held out when md5(order) % this == 0"),
+                        min_len: int = typer.Option(1000, help="drop records shorter than this")) -> None:
+    """Organelle genomes in genome-prepare's layout: ``bases.u8`` and ``contigs.parquet`` (chrom = accession, start,
+    end, offset, code = genetic code table, circular, organism, held_out). Whole orders of MitoAge's species table
+    are held out (Cetacea counted as Artiodactyla), and so is every record whose lineage names a held-out order;
+    ``held_out_orders.json`` lists them."""
+    import gzip
+    import hashlib
+    import json
+
+    import numpy as np
+    import polars as pl
+
+    from kron_dna import genome as G
+
+    sp = pl.read_parquet(species or input_dir("mitoage") / "species.parquet").filter(pl.col("record_status") != "retired")
+    orders = sorted({("Artiodactyla" if o == "Cetacea" else o) for o in sp["order"].drop_nulls().to_list()})
+    held = sorted(o for o in orders if int(hashlib.md5(o.encode()).hexdigest(), 16) % held_out_mod == 0)
+    held_set = set(held) | ({"Cetacea"} if "Artiodactyla" in held else set())
+    out = interim_dir("genome", name)
+    out.mkdir(parents=True, exist_ok=True)
+    rows, chunks, offset, skipped = [], [], 0, 0
+    with gzip.open(gbff, "rt") as fh:
+        for r in G.read_genbank(fh):
+            if len(r["sequence"]) < min_len:
+                skipped += 1
+                continue
+            codes = G.encode_bases(r["sequence"])
+            chunks.append(codes)
+            rows.append({"chrom": r["accession"], "start": 0, "end": len(codes), "offset": offset,
+                         "code": int(r["transl_table"]), "circular": bool(r["circular"]), "organism": r["organism"],
+                         "kingdom": r["lineage"][1] if len(r["lineage"]) > 1 else "",
+                         "held_out": bool(held_set & set(r["lineage"]))})
+            offset += len(codes)
+    np.concatenate(chunks).tofile(out / "bases.u8")
+    table = pl.DataFrame(rows)
+    table.write_parquet(out / "contigs.parquet")
+    (out / "held_out_orders.json").write_text(json.dumps(held, indent=1))
+    by = table.group_by("held_out").agg(pl.len(), pl.col("end").sum())
+    typer.echo(f"{table.height:,} genomes, {offset:,} bases ({skipped} shorter than {min_len} or without sequence "
+               f"skipped); held-out orders ({len(held)} of {len(orders)}): {', '.join(held)}")
+    typer.echo(f"{by}")
+    typer.echo(f"{table.group_by('code').len().sort('len', descending=True).head(10)}")
+
+
 @app.command("genome-train")
 def genome_train(out: Path = typer.Argument(..., help="run directory (resumes from its checkpoint.pt)"),
                  name: str = typer.Option("hg38", help="prepared genome under data/interim/genome/"),
@@ -670,9 +777,27 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                  train_chunks: int = typer.Option(4, help="with --whole-contigs: chunks decoded and scored per step"),
                  max_contig: int = typer.Option(0, help="with --whole-contigs: a longer contig gives a random stretch "
                                                 "of this many bases (0: none)"),
+                 arch: str = typer.Option("v1", help="v1, or v2: per-position RMS norm, two convs per block, scaled "
+                                          "projected decoder skips, MLP heads"),
+                 head_hidden: int = typer.Option(0, help="v2: hidden width of the MLP heads (0: 2 x stem channels)"),
+                 bert_mask: bool = typer.Option(False, help="of the masked bases 80 % MASK, 10 % random, 10 % kept"),
+                 rc: bool = typer.Option(False, help="train on the reverse complement of half the windows"),
+                 curriculum: str = typer.Option("", help="window:steps,... trained in order (e.g. 8192:6000,"
+                                                "131072:2000,1048576:2000); overrides --window and --steps"),
+                 tokens_per_step: int = typer.Option(0, help="with --curriculum: bases per optimizer step over all "
+                                                     "cards and micro-batches (0: --batch-size windows)"),
+                 grad_accum: int = typer.Option(1, help="micro-batches summed per optimizer step"),
+                 compile_convs: bool = typer.Option(False, help="torch.compile each conv block"),
+                 eval_window: int = typer.Option(0, help="held-out windows of this length (0: the curriculum's last)"),
+                 mito: str = typer.Option("", help="also train on this prepared organelle genome (genome-prepare-mito), "
+                                          "each sequence tagged with its genetic code table as context (nuclear: 0)"),
+                 mito_share: float = typer.Option(0.03, help="with --mito: share of training windows from it"),
                  seed: int = 0) -> None:
     """The multi-track model (KronGenome) over whole gap-free contigs: stage 1 masked-base prediction; with
-    ``--labels``, stage 2 adds the Ensembl and GENCODE tracks of ``genome-labels`` and writes ``tracks.csv``."""
+    ``--labels``, stage 2 adds the Ensembl and GENCODE tracks of ``genome-labels`` and writes ``tracks.csv``.
+    v2 (``--arch v2``) trains with a short-to-long ``--curriculum`` at a fixed ``--tokens-per-step``; held-out bits
+    are always read on windows of the curriculum's last length, from windows and masks drawn by ``seed`` and the
+    step alone, so two runs with one seed are scored on the same bases at the same step (paired evals)."""
     import numpy as np
     import polars as pl
 
@@ -689,8 +814,45 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
     held = set(val_chroms.split(","))
     train_idx = index.filter(~pl.col("chrom").is_in(list(held)))
     val_idx = index.filter(pl.col("chrom").is_in(list(held)))
-    rng = np.random.default_rng(seed)
+    import os
+
+    import torch.distributed as dist
+    world = int(os.environ.get("WORLD_SIZE", "1"))
+    rank = int(os.environ.get("RANK", "0"))
+    if world > 1:                                     # torchrun: one process per card, data-parallel
+        dist.init_process_group("nccl")
+        torch.cuda.set_device(int(os.environ.get("LOCAL_RANK", "0")))
+    main = rank == 0
+    say = typer.echo if main else (lambda *a, **k: None)
+    rng = np.random.default_rng([seed, rank])        # each card its own windows; rank 0 keeps the eval stream
     unit = 2 ** n_down
+    phases = [(int(w), int(s)) for w, s in (x.split(":") for x in curriculum.split(","))] if curriculum else \
+        [(window, steps)]
+    steps = sum(s for _, s in phases)
+    eval_window = eval_window or phases[-1][0]
+    if whole_contigs and (curriculum or rc or mito or bert_mask or grad_accum > 1):
+        raise typer.BadParameter("--whole-contigs does not take --curriculum, --rc, --mito, --bert-mask or --grad-accum")
+    if any(w % unit for w, _ in phases):
+        raise typer.BadParameter(f"curriculum windows must be multiples of {unit}")
+    if mito:
+        mito_src = interim_dir("genome", mito)
+        mito_bases = np.memmap(mito_src / "bases.u8", dtype=np.uint8, mode="r")
+        mito_idx = pl.read_parquet(mito_src / "contigs.parquet").with_columns((pl.col("end") - pl.col("start")).alias("len"))
+        mito_train, mito_val = mito_idx.filter(~pl.col("held_out")), mito_idx.filter(pl.col("held_out"))
+        say(f"mito: {mito_train.height} train / {mito_val.height} held-out genomes "
+                   f"({int(mito_train['len'].sum()):,} / {int(mito_val['len'].sum()):,} bases), share {mito_share}")
+
+    def phase_at(s: int) -> tuple[int, int]:
+        """(window, batch) at optimizer step s."""
+        acc = 0
+        for w, n in phases:
+            acc += n
+            if s < acc:
+                break
+        if tokens_per_step and tokens_per_step < w * world * grad_accum:
+            raise typer.BadParameter(f"--tokens-per-step {tokens_per_step} is less than one window of {w} per card "
+                                     f"and micro-batch")
+        return w, (tokens_per_step // w // world // grad_accum if tokens_per_step else batch_size)
 
     def sample_contig(table, longest: bool = False) -> tuple[torch.Tensor, ...]:
         """One whole contig (by length, so every base equally), padded with N to a multiple of 2**n_down."""
@@ -711,34 +873,64 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
             out += [torch.from_numpy(lab), torch.from_numpy(act), torch.from_numpy(np.arange(n) < r["len"])]
         return tuple(out)
 
-    def sample(table) -> tuple[torch.Tensor, ...]:
+    def sample(table, window=window, batch=None, gen=None, flip=False, mito_table=None, share=0.0
+               ) -> tuple[torch.Tensor, ...]:
+        """``batch`` windows: (seqs, segments, contexts[, labels, activity, valid]). With ``mito_table``, each row comes
+        from it with probability ``share``; a circular genome is read across its origin when the window is shorter.
+        Context 0 is nuclear; an organelle sequence's context is its genetic code table (1..33)."""
+        gen = gen or rng
+        batch = batch or batch_size
         p = table["len"].to_numpy() / table["len"].sum()                 # contigs by length: every base equally
-        seqs, segs, labs, acts, valid = [], [], [], [], []
-        for _ in range(batch_size):
-            r = table.row(int(rng.choice(table.height, p=p)), named=True)
-            take = min(window, r["len"])
-            at = r["offset"] + int(rng.integers(0, r["len"] - take + 1))
-            codes = np.full(window, 4, dtype=np.int64)
-            codes[:take] = bases[at:at + take]
+        seqs, segs, ctxs, labs, acts, valid = [], [], [], [], [], []
+        for _ in range(batch):
+            from_mito = mito_table is not None and gen.random() < share
+            if from_mito:
+                r = mito_table.row(int(gen.integers(0, mito_table.height)), named=True)   # each genome alike
+                take = min(window, r["len"])
+                if r["circular"]:                                         # read across the origin
+                    pos = (int(gen.integers(0, r["len"])) + np.arange(take)) % r["len"]
+                else:
+                    pos = int(gen.integers(0, r["len"] - take + 1)) + np.arange(take)
+                codes = np.full(window, 4, dtype=np.int64)
+                codes[:take] = mito_bases[r["offset"] + pos]
+                ctxs.append(int(r["code"]))                               # organelle: its genetic code table
+            else:
+                r = table.row(int(gen.choice(table.height, p=p)), named=True)
+                take = min(window, r["len"])
+                at = r["offset"] + int(gen.integers(0, r["len"] - take + 1))
+                codes = np.full(window, 4, dtype=np.int64)
+                codes[:take] = bases[at:at + take]
+                ctxs.append(0)                                            # nuclear (context 0)
+            flip_row = flip and gen.random() < 0.5
+            if flip_row:
+                codes[:take] = G.reverse_complement(codes[:take].astype(np.uint8))
             seg = np.zeros(window // unit, dtype=np.int64)
             seg[(take + unit - 1) // unit:] = 1                           # padding is its own segment
             seqs.append(codes)
             segs.append(seg)
             if labels:
                 lab, act = np.zeros(window, dtype=np.uint8), np.zeros(window, dtype=np.uint8)
-                lab[:take], act[:take] = lab_mm[at:at + take], act_mm[at:at + take]
+                if not from_mito:
+                    lab[:take], act[:take] = lab_mm[at:at + take], act_mm[at:at + take]
+                    if flip_row:                                          # the current tracks are not strand-specific
+                        lab[:take], act[:take] = lab[:take][::-1].copy(), act[:take][::-1].copy()
                 labs.append(lab)
                 acts.append(act)
-                valid.append(np.arange(window) < take)
-        batch = [torch.from_numpy(np.stack(seqs)), torch.from_numpy(np.stack(segs))]
+                valid.append((np.arange(window) < take) & (not from_mito))
+        out = [torch.from_numpy(np.stack(seqs)), torch.from_numpy(np.stack(segs)), torch.tensor(ctxs)]
         if labels:
-            batch += [torch.from_numpy(np.stack(x)) for x in (labs, acts, valid)]
-        return tuple(batch)
+            out += [torch.from_numpy(np.stack(x)) for x in (labs, acts, valid)]
+        return tuple(out)
 
-    dev = torch.device("cuda")
+    dev = torch.device("cuda", torch.cuda.current_device())
     config = G.KronGenomeConfig(d_model=d_model, n_layers=n_layers, stem_channels=stem_channels, n_down=n_down,
-                                n_tracks=len(G.TRACKS) if labels else 0)
+                                n_tracks=len(G.TRACKS) if labels else 0, arch=arch, head_hidden=head_hidden,
+                                n_contexts=34 if mito else 0)
     model = G.KronGenome(config).to(dev)
+    if compile_convs:
+        for blocks in [model.down, model.up] + ([model.up2] if arch == "v2" else []):
+            for i in range(len(blocks)):
+                blocks[i].compile(dynamic=True)                # in place: state-dict keys unchanged
     pos_weight = None
     train_mask = torch.tensor(G.track_mask(tracks), dtype=torch.float32, device=dev)
     if labels:                       # rare tracks (splice sites) weighted up by sqrt(neg/pos), from a sample of bases
@@ -746,9 +938,15 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
         share = np.array([((probe >> b) & 1).mean() for b in range(len(G.LABEL_BITS))] + [0.5])
         pos_weight = torch.tensor(np.clip(np.sqrt((1 - share) / np.maximum(share, 1e-9)), 1, 100),
                                   dtype=torch.float32, device=dev)
-        typer.echo("track positive weights: " + ", ".join(f"{t} {w:.1f}" for t, w in zip(G.TRACKS, pos_weight)))
-        typer.echo("tracks trained: " + ", ".join(t for t, m in zip(G.TRACKS, train_mask.tolist()) if m))
-    opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.1, betas=(0.9, 0.95))
+        say("track positive weights: " + ", ".join(f"{t} {w:.1f}" for t, w in zip(G.TRACKS, pos_weight)))
+        say("tracks trained: " + ", ".join(t for t, m in zip(G.TRACKS, train_mask.tolist()) if m))
+    if arch == "v2":   # no weight decay on norms, biases, scales and embeddings
+        decay = [p_ for n_, p_ in model.named_parameters() if p_.ndim >= 2 and "context" not in n_]
+        rest = [p_ for n_, p_ in model.named_parameters() if not (p_.ndim >= 2 and "context" not in n_)]
+        opt = torch.optim.AdamW([{"params": decay, "weight_decay": 0.1}, {"params": rest, "weight_decay": 0.0}],
+                                lr=lr, betas=(0.9, 0.95))
+    else:
+        opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.1, betas=(0.9, 0.95))
     out.mkdir(parents=True, exist_ok=True)
     ckpt = out / "checkpoint.pt"
     step, hours = 0, 0.0
@@ -757,16 +955,22 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
         model.load_state_dict(state["model"])
         opt.load_state_dict(state["optimizer"])
         step, hours = state["step"], state.get("hours", 0.0)
-        typer.echo(f"resumed at step {step}")
+        say(f"resumed at step {step}")
     elif init is not None and not bench:
         missing, unexpected = model.load_state_dict(torch.load(init, map_location="cpu")["model"], strict=False)
-        typer.echo(f"initialised from {init}; new: {missing}; dropped: {unexpected}")
-    typer.echo(f"KronGenome {model.n_parameters() / 1e6:.1f}M parameters, window {window:,} bases, "
+        say(f"initialised from {init}; new: {missing}; dropped: {unexpected}")
+    say(f"KronGenome {arch} {model.n_parameters() / 1e6:.1f}M parameters, curriculum "
+               f"{', '.join(f'{w:,} x {n:,} steps' for w, n in phases)}, eval window {eval_window:,}, "
                f"{train_idx.height} train / {val_idx.height} held-out contigs")
+    train_model = model
+    if world > 1:
+        train_model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[dev.index])
+        say(f"data-parallel over {world} cards: {tokens_per_step // world if tokens_per_step else batch_size} "
+            f"bases per card per micro-batch")
     autocast = torch.autocast("cuda", dtype=torch.bfloat16)
 
     def contig_loss(seq, lab=None, act=None, valid=None, keep=None):
-        inputs, targets = G.mask_bases(seq.to(dev), mask_prob)
+        inputs, targets = G.mask_bases(seq.to(dev), mask_prob, bert=bert_mask)
         n_chunks = -(-seq.numel() // window)
         picks = sorted(rng.choice(n_chunks, size=min(train_chunks, n_chunks), replace=False).tolist())
         with autocast:
@@ -786,40 +990,46 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                     keep.append((tracks.float()[0][ok], want[ok]))
         return mlm / max(count, 1), (track if lab is not None else None)
 
-    def loss_on(seq, seg, lab=None, act=None, valid=None, keep=None):
-        inputs, targets = G.mask_bases(seq.to(dev), mask_prob)
+    def loss_on(seq, seg, ctx, lab=None, act=None, valid=None, keep=None, mask_gen=None):
+        # held-out masks are always plain MASK (bert only in training), so runs with and without it compare
+        inputs, targets = G.mask_bases(seq.to(dev), mask_prob, generator=mask_gen, bert=bert_mask and model.training)
         with autocast:
-            logits, _, tracks = model(inputs, seg.to(dev))
+            logits, _, tracks = (train_model if model.training else model)(inputs, seg.to(dev),
+                                                                            ctx.to(dev) if mito else None)
         mlm = F.cross_entropy(logits.float().reshape(-1, 4), targets.reshape(-1), ignore_index=-100)
         if lab is None:
             return mlm, None
         want = G.track_targets(lab.to(dev), act.to(dev))
         ok = valid.to(dev)
         per = F.binary_cross_entropy_with_logits(tracks.float(), want, pos_weight=pos_weight, reduction="none")
-        track = (per * ok.unsqueeze(-1) * train_mask).sum() / (ok.sum() * train_mask.sum())
+        track = (per * ok.unsqueeze(-1) * train_mask).sum() / (ok.sum().clamp_min(1) * train_mask.sum())
         if keep is not None:                                      # held-out scores for tracks.csv
             keep.append((tracks.float()[ok], want[ok]))
         return mlm, track
 
     t0, started = time.time(), time.time()
     metrics = out / "metrics.csv"
-    if not metrics.exists():
+    if main and not metrics.exists():
         metrics.write_text("step,lr,train_loss,val_bits_per_base,hours" + (",train_track_loss,val_track_loss"
-                                                                           if labels else "") + "\n")
+                                                                           if labels else "")
+                           + (",val_mito_bits_per_base" if mito else "") + "\n")
     track_csv = out / "tracks.csv"
-    if labels and not track_csv.exists():
+    if main and labels and not track_csv.exists():
         track_csv.write_text("step,track,auroc,average_precision,prevalence\n")
     model.train()
     while step < steps:
         for g in opt.param_groups:
             g["lr"] = lr * min(1.0, (step + 1) / warmup) * 0.5 * (1 + math.cos(math.pi * min(step / steps, 1.0)))
         torch.cuda.reset_peak_memory_stats(dev)
-        if whole_contigs:
-            loss, track = contig_loss(*sample_contig(train_idx, longest=bench))
-        else:
-            loss, track = loss_on(*sample(train_idx))
         opt.zero_grad(set_to_none=True)
-        (loss + track_weight * track if track is not None else loss).backward()
+        win, bat = phase_at(step)
+        for _ in range(grad_accum):
+            if whole_contigs:
+                loss, track = contig_loss(*sample_contig(train_idx, longest=bench))
+            else:
+                loss, track = loss_on(*sample(train_idx, window=win, batch=bat, flip=rc,
+                                              mito_table=mito_train if mito else None, share=mito_share))
+            ((loss + track_weight * track if track is not None else loss) / grad_accum).backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         opt.step()
         step += 1
@@ -830,18 +1040,34 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
         if bench:
             torch.cuda.synchronize()
             what = f"longest contig {min(train_idx['len'].max(), max_contig or 1 << 62):,} bases in {window:,} chunks, {train_chunks} scored" \
-                if whole_contigs else f"window {window:,}, batch {batch_size}"
-            typer.echo(f"bench: {what}: {time.time() - t0:.1f} s for one step, "
+                if whole_contigs else f"window {win:,}, batch {bat} x {grad_accum} accumulated"
+            say(f"bench: {what}: {time.time() - t0:.1f} s for one step, "
                        f"peak {torch.cuda.max_memory_allocated(dev) / 2**30:.1f} GiB, loss {loss.item():.3f}")
             return
         out_of_time = max_hours > 0 and time.time() - started > max_hours * 3600
-        if step % eval_every == 0 or step == steps or out_of_time:
+        if world > 1:                                   # every card stops at the same step
+            flag = torch.tensor([float(out_of_time)], device=dev)
+            dist.broadcast(flag, 0)
+            out_of_time = bool(flag.item())
+        if (step % eval_every == 0 or step == steps or out_of_time) and not main:
+            dist.barrier()                              # rank 0 evaluates and saves
+        elif step % eval_every == 0 or step == steps or out_of_time:
             model.eval()
             keep: list = []
+            eval_rng = np.random.default_rng([seed, step])               # the same windows for every run with this seed
+            mask_gen = torch.Generator(device=dev).manual_seed(seed * 1_000_003 + step)
             with torch.no_grad():
                 pairs = ([contig_loss(*sample_contig(val_idx), keep=keep if labels else None) for _ in range(2)]
                          if whole_contigs else
-                         [loss_on(*sample(val_idx), keep=keep if labels else None) for _ in range(8)])
+                         [loss_on(*sample(val_idx, window=eval_window, batch=1 if arch == "v2" else batch_size,
+                                          gen=eval_rng),
+                                  keep=keep if labels else None, mask_gen=mask_gen) for _ in range(8)])
+                mito_bits = None
+                if mito:
+                    mw = -(-int(mito_val["len"].max()) // unit) * unit
+                    mito_bits = float(np.mean([loss_on(*sample(mito_val, window=mw, batch=4, gen=eval_rng,
+                                                               mito_table=mito_val, share=1.0), mask_gen=mask_gen)[0].item()
+                                               for _ in range(8)])) / math.log(2)
             model.train()
             h = hours + (time.time() - t0) / 3600
             bits = float(np.mean([m.item() for m, _ in pairs])) / math.log(2)
@@ -857,14 +1083,22 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                         auroc, ap = G.ranking_scores(scores[:, j], y)
                         fh.write(f"{step},{name_},{auroc:.4f},{ap:.4f},{float(y.float().mean()):.6f}\n")
                 del keep, scores, truth
+            tracks_note = extra
+            if mito_bits is not None:
+                extra += f",{mito_bits:.4f}"
             with metrics.open("a") as fh:
                 fh.write(f"{step},{opt.param_groups[0]['lr']:.3e},{loss.item():.4f},{bits:.4f},{h:.3f}{extra}\n")
-            typer.echo(f"step {step}: train {loss.item():.4f}, held-out {bits:.3f} bits/base, {h:.2f} h, "
-                       f"peak {torch.cuda.max_memory_allocated(dev) / 2**30:.1f} GiB" + (f", tracks {extra}" if extra else ""))
+            say(f"step {step} (window {win:,} x {bat}): train {loss.item():.4f}, held-out {bits:.3f} bits/base"
+                       + (f", mito {mito_bits:.3f}" if mito_bits is not None else "") + f", {h:.2f} h, "
+                       f"peak {torch.cuda.max_memory_allocated(dev) / 2**30:.1f} GiB" + (f", tracks {tracks_note}" if tracks_note else ""))
             _save_atomic({"model": model.state_dict(), "optimizer": opt.state_dict(), "config": config.to_dict(),
                           "step": step, "hours": h}, ckpt)
+            if world > 1:
+                dist.barrier()
         if out_of_time:
-            typer.echo("stopping at --max-hours; resubmit the same command to continue")
+            say("stopping at --max-hours; resubmit the same command to continue")
+            if world > 1:
+                dist.destroy_process_group()
             return
 
 

@@ -35,6 +35,11 @@ class KronGenomeConfig:
     stem_channels: int = 96     # channels at single-base resolution
     n_down: int = 7             # 2**7 = 128-bp bins
     n_tracks: int = 0           # stage 2: per-base track logits beside the masked-base head (TRACKS)
+    arch: str = "v1"            # "v2": per-position RMS norm, two convs per block, scaled projected decoder skips,
+                                # MLP heads (see ConvBlock2); "v1" checkpoints load unchanged
+    head_hidden: int = 0        # v2: hidden width of the MLP heads (0 = 2 x stem_channels)
+    n_contexts: int = 0         # v2: learned context embeddings added to the core's input bins: 0 nuclear, else
+                                # the organelle's NCBI genetic code table (2 vertebrate mito, 5 invertebrate, ...)
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -56,6 +61,45 @@ class ConvBlock(nn.Module):
         return self.skip(x) + self.conv(F.gelu(self.norm(x)))
 
 
+class ChannelRMSNorm(nn.Module):
+    """RMS norm over channels at each position of ``[B, C, L]``: unlike GroupNorm(1), no statistic depends on the
+    window's length or content elsewhere, so a 4 kb chunk, a 128 kb window and a 1 Mb window are normalised alike."""
+
+    def __init__(self, c: int, eps: float = 1e-6) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(c))
+        self.eps = eps
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x32 = x.float()
+        return (x32 * torch.rsqrt(x32.pow(2).mean(1, keepdim=True) + self.eps)).to(x.dtype) * self.weight[:, None]
+
+
+class ConvBlock2(nn.Module):
+    """v2: two pre-norm k=5 convolutions with GELU and one residual (NTv3's encoder block), per-position norm."""
+
+    def __init__(self, c_in: int, c_out: int, k: int = 5) -> None:
+        super().__init__()
+        self.norm1, self.conv1 = ChannelRMSNorm(c_in), nn.Conv1d(c_in, c_out, k, padding=k // 2)
+        self.norm2, self.conv2 = ChannelRMSNorm(c_out), nn.Conv1d(c_out, c_out, k, padding=k // 2)
+        self.skip = nn.Conv1d(c_in, c_out, 1) if c_in != c_out else nn.Identity()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h = self.conv1(F.gelu(self.norm1(x)))
+        return self.skip(x) + self.conv2(F.gelu(self.norm2(h)))
+
+
+class MLPHead(nn.Module):
+    """v2: per-position two-layer head (norm, 1x1, GELU, 1x1), one per task, so tasks do not share one linear map."""
+
+    def __init__(self, c_in: int, hidden: int, c_out: int) -> None:
+        super().__init__()
+        self.norm, self.fc1, self.fc2 = ChannelRMSNorm(c_in), nn.Conv1d(c_in, hidden, 1), nn.Conv1d(hidden, c_out, 1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.fc2(F.gelu(self.fc1(self.norm(x))))
+
+
 class KronGenome(nn.Module):
     """``[B, L]`` bases (L a multiple of ``2**n_down``) -> ``[B, L, 4]`` masked-base logits, the core states and, with
     ``n_tracks``, ``[B, L, n_tracks]`` track logits (else None).
@@ -67,16 +111,31 @@ class KronGenome(nn.Module):
         super().__init__()
         self.config = c = config
         widths = [c.stem_channels + (c.d_model - c.stem_channels) * i // c.n_down for i in range(c.n_down + 1)]
+        if c.arch not in ("v1", "v2"):
+            raise ValueError(f"unknown arch {c.arch!r}")
+        v2 = c.arch == "v2"
+        block = ConvBlock2 if v2 else ConvBlock
         self.stem = nn.Conv1d(N_IN, widths[0], 15, padding=7)
-        self.down = nn.ModuleList(ConvBlock(widths[i], widths[i + 1]) for i in range(c.n_down))
+        self.down = nn.ModuleList(block(widths[i], widths[i + 1]) for i in range(c.n_down))
         self.core = nn.ModuleList(BiKronLSTMBlock(c.d_model, c.n_heads, c.ff_units, c.dropout, i)
                                   for i in range(c.n_layers))
         self.core_norm = nn.RMSNorm(c.d_model, eps=1e-5)
-        self.up = nn.ModuleList(ConvBlock(widths[i + 1], widths[i]) for i in reversed(range(c.n_down)))
-        self.head = nn.Conv1d(widths[0], 4, 1)
-        self.tracks = nn.Conv1d(widths[0], c.n_tracks, 1) if c.n_tracks else None
+        self.up = nn.ModuleList(block(widths[i + 1], widths[i]) for i in reversed(range(c.n_down)))
+        if v2:   # NTv3's decoder: upsample, block, add a 1x1-projected skip times a learned scale, a second block
+            self.skip_proj = nn.ModuleList(nn.Conv1d(widths[i], widths[i], 1) for i in reversed(range(c.n_down)))
+            self.skip_scale = nn.Parameter(torch.ones(c.n_down))
+            self.up2 = nn.ModuleList(block(widths[i], widths[i]) for i in reversed(range(c.n_down)))
+            hidden = c.head_hidden or 2 * widths[0]
+            self.head = MLPHead(widths[0], hidden, 4)
+            self.tracks = MLPHead(widths[0], hidden, c.n_tracks) if c.n_tracks else None
+        else:
+            self.head = nn.Conv1d(widths[0], 4, 1)
+            self.tracks = nn.Conv1d(widths[0], c.n_tracks, 1) if c.n_tracks else None
+        self.context = nn.Embedding(c.n_contexts, c.d_model) if c.n_contexts else None
+        if self.context is not None:
+            nn.init.zeros_(self.context.weight)              # a new context starts as the nuclear model
 
-    def forward(self, seq: torch.Tensor, segments: torch.Tensor | None = None
+    def forward(self, seq: torch.Tensor, segments: torch.Tensor | None = None, context: torch.Tensor | None = None
                 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
         c = self.config
         b, length = seq.shape
@@ -84,6 +143,9 @@ class KronGenome(nn.Module):
             raise ValueError(f"length {length} is not a multiple of {2 ** c.n_down}")
         x, skips = self.encode(seq)
         h = x.transpose(1, 2)                                       # [B, bins, d_model]
+        if self.context is not None:                                # context: [B]; none given = nuclear (0)
+            ctx = context.long() if context is not None else torch.zeros(b, dtype=torch.long, device=seq.device)
+            h = h + self.context(ctx).unsqueeze(1).to(h.dtype)
         bins = h.shape[1]
         if segments is None:
             segments = torch.arange(b, device=seq.device).unsqueeze(1).expand(b, bins)
@@ -114,12 +176,17 @@ class KronGenome(nn.Module):
 
     def decode(self, x: torch.Tensor, skips: list[torch.Tensor]) -> torch.Tensor:
         """``[B, d_model, bins]`` -> ``[B, stem_channels, L]`` through the decoder and the encoder's skips."""
+        if self.config.arch == "v2":
+            for i, (block, skip) in enumerate(zip(self.up, reversed(skips))):
+                x = block(F.interpolate(x, scale_factor=2, mode="nearest"))
+                x = self.up2[i](x + self.skip_scale[i] * self.skip_proj[i](skip))
+            return x
         for block, skip in zip(self.up, reversed(skips)):
             x = block(F.interpolate(x, scale_factor=2, mode="nearest")) + skip
         return x
 
-    def forward_contig(self, seq: torch.Tensor, train_at: list[int], chunk: int = 1 << 20, halo: int = 4096
-                       ) -> list[tuple[torch.Tensor, torch.Tensor | None]]:
+    def forward_contig(self, seq: torch.Tensor, train_at: list[int], chunk: int = 1 << 20, halo: int = 4096,
+                       context: int | None = None) -> list[tuple[torch.Tensor, torch.Tensor | None]]:
         """A whole contig in one recurrence. ``seq`` is ``[L]`` (L a multiple of ``2**n_down``). The encoder runs
         chunk by chunk (each with ``halo`` bases of context on both sides; gradient only for scored chunks), the core over
         every bin of the contig at once (each layer recomputed in backward), and the decoder only on the chunks
@@ -145,6 +212,8 @@ class KronGenome(nn.Module):
             a = (s - lo) // unit
             bins.append(x[:, :, a:a + (min(s + chunk, length) - s) // unit])
         h = torch.cat(bins, 2).transpose(1, 2)
+        if self.context is not None:                                # none given = nuclear (0)
+            h = h + self.context.weight[int(context or 0)].to(h.dtype)
         cu = torch.tensor([0, h.shape[1]], dtype=torch.int32, device=seq.device)
         core = self.run_core(h, cu, checkpoint=grad).transpose(1, 2)    # [1, d_model, bins]
         def heads(bins_, piece, a, b):
@@ -167,14 +236,29 @@ class KronGenome(nn.Module):
         return sum(p.numel() for p in self.parameters())
 
 
-def mask_bases(seq: torch.Tensor, prob: float = 0.15, generator: torch.Generator | None = None
-               ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Mask ``prob`` of the known bases (A, C, G, T; never N): ``(inputs, labels)`` with labels -100 elsewhere."""
+def mask_bases(seq: torch.Tensor, prob: float = 0.15, generator: torch.Generator | None = None,
+               bert: bool = False) -> tuple[torch.Tensor, torch.Tensor]:
+    """Mask ``prob`` of the known bases (A, C, G, T; never N): ``(inputs, labels)`` with labels -100 elsewhere.
+    ``bert``: of the picked bases 80 % become MASK, 10 % a random base and 10 % stay, so the model must also check
+    bases it can see (BERT's and NTv3's scheme)."""
     known = seq < 4
     pick = (torch.rand(seq.shape, generator=generator, device=seq.device) < prob) & known
-    inputs = seq.masked_fill(pick, MASK_CHANNEL)
     labels = seq.masked_fill(~pick, -100)
+    if not bert:
+        return seq.masked_fill(pick, MASK_CHANNEL), labels
+    u = torch.rand(seq.shape, generator=generator, device=seq.device)
+    rand_base = torch.randint(0, 4, seq.shape, generator=generator, device=seq.device, dtype=seq.dtype)
+    inputs = torch.where(pick & (u < 0.8), torch.full_like(seq, MASK_CHANNEL), seq)
+    inputs = torch.where(pick & (u >= 0.8) & (u < 0.9), rand_base, inputs)
     return inputs, labels
+
+
+def reverse_complement(codes: np.ndarray) -> np.ndarray:
+    """Base codes (0..3 A, C, G, T; 4 N) of the other strand, read 5' to 3'."""
+    out = codes[::-1].copy()
+    known = out < 4
+    out[known] = 3 - out[known]
+    return out
 
 
 _CODE = bytes.maketrans(b"ACGTNacgtn", b"\x00\x01\x02\x03\x04\x00\x01\x02\x03\x04")
@@ -245,6 +329,86 @@ def splice_sites(exons):
     donors = pl.concat([head.filter(plus), tail.filter(minus)]).unique()
     acceptors = pl.concat([tail.filter(plus), head.filter(minus)]).unique()
     return donors, acceptors
+
+
+#: Finer gene structure of ``genome-labels-extra`` (``labels_extra.u8``), from GENCODE basic, strand-aware.
+EXTRA_BITS = {"utr5": 0, "utr3": 1, "start_codon": 2, "stop_codon": 3, "tss": 4, "lncRNA_exon": 5,
+              "gene_plus": 6, "gene_minus": 7}
+
+
+def gene_structure(gt):
+    """GENCODE features (polars: chrom, start, end 1-based closed, type, strand, transcript_id, transcript_type) ->
+    ``{EXTRA_BITS name: frame of 0-based half-open intervals (chrom, start, end)}``. A UTR before the transcript's
+    first CDS base in transcription order is 5', after its last is 3'; the TSS is the transcript's first base; genes
+    on each strand cover their transcripts' spans."""
+    import polars as pl
+    z = lambda f: f.select("chrom", start=pl.col("start").cast(pl.Int64) - 1, end=pl.col("end").cast(pl.Int64))
+    cds = gt.filter(pl.col("type") == "CDS").group_by("transcript_id").agg(c0=pl.col("start").min(), c1=pl.col("end").max())
+    utr = gt.filter(pl.col("type") == "UTR").join(cds, on="transcript_id", how="inner")
+    before = pl.col("end") < pl.col("c0")                     # left of the CDS on the genome
+    after = pl.col("start") > pl.col("c1")
+    plus = pl.col("strand") == "+"
+    five = utr.filter((plus & before) | (~plus & after))
+    three = utr.filter((plus & after) | (~plus & before))
+    tx = gt.filter(pl.col("type") == "transcript")
+    tss = tx.select("chrom", start=pl.when(plus).then(pl.col("start")).otherwise(pl.col("end")),
+                    end=pl.when(plus).then(pl.col("start")).otherwise(pl.col("end")))
+    exons = gt.filter((pl.col("type") == "exon") & (pl.col("transcript_type") == "lncRNA"))
+    return {"utr5": z(five), "utr3": z(three), "start_codon": z(gt.filter(pl.col("type") == "start_codon")),
+            "stop_codon": z(gt.filter(pl.col("type") == "stop_codon")), "tss": z(tss), "lncRNA_exon": z(exons),
+            "gene_plus": z(tx.filter(plus)), "gene_minus": z(tx.filter(~plus))}
+
+
+def paint_ids(index, chrom: str, starts: np.ndarray, ends: np.ndarray, out: np.ndarray, ids: np.ndarray) -> int:
+    """Like :func:`paint` for integer ids (any dtype of ``out``): write ``ids[i]`` over interval i, later intervals
+    over earlier ones. Returns how many intervals touched a contig."""
+    rows = index.filter(index["chrom"] == chrom).sort("start")
+    cs, ce, co = (rows[c].to_numpy() for c in ("start", "end", "offset"))
+    touched = 0
+    for s, e, v in zip(starts, ends, ids):
+        i = max(0, int(np.searchsorted(cs, s, side="right")) - 1)
+        while i < len(cs) and cs[i] < e:
+            lo, hi = max(s, cs[i]), min(e, ce[i])
+            if lo < hi:
+                out[co[i] + lo - cs[i]: co[i] + hi - cs[i]] = v
+                touched += 1
+            i += 1
+    return touched
+
+
+def read_genbank(lines):
+    """Records of a GenBank flat file (an iterable of lines): dicts of accession (VERSION), organism, lineage (list),
+    circular, transl_table (the most common /transl_table of its CDS, 1 if none) and sequence (upper case; empty for a
+    CON record, which has no ORIGIN)."""
+    from collections import Counter
+    rec, section, tables, seq = None, None, Counter(), []
+    for line in lines:
+        if line.startswith("LOCUS"):
+            rec = {"accession": line.split()[1], "organism": "", "lineage": [], "circular": " circular " in line}
+            section, tables, seq = None, Counter(), []
+        elif rec is None:
+            continue
+        elif line.startswith("VERSION"):
+            rec["accession"] = line.split()[1]
+        elif line.startswith("  ORGANISM"):
+            rec["organism"], section = line[12:].strip(), "lineage"
+        elif section == "lineage" and line.startswith(" " * 12):
+            rec["lineage"] += [x.strip().rstrip(".") for x in line.strip().split(";") if x.strip().rstrip(".")]
+        elif line.startswith("ORIGIN"):
+            section = "origin"
+        elif line.startswith("//"):
+            rec["transl_table"] = tables.most_common(1)[0][0] if tables else 1
+            rec["sequence"] = "".join(seq).upper()
+            yield rec
+            rec, section = None, None
+        elif section == "origin":
+            seq.append("".join(line.split()[1:]))
+        else:
+            if line[:1] != " ":
+                section = None
+            s = line.strip()
+            if s.startswith("/transl_table="):
+                tables[int(s.split("=")[1])] += 1
 
 
 #: Stage-2 track outputs: the label bits in order, then the activity share.

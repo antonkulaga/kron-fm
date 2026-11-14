@@ -129,3 +129,116 @@ def test_forward_contig_matches_forward():
     # several chunks: GroupNorm's statistics are per chunk, so close but not equal
     r = torch.corrcoef(torch.stack([parts[0][0].flatten(), full[:, 2048:4096].flatten()]))[0, 1]
     assert r > 0.99 and parts[1][1].shape == (1, 2048, 2)
+
+
+def test_gene_structure_splits_utrs_by_strand_and_marks_tss():
+    import polars as pl
+    rows = [  # + strand transcript t1: exon 1-100, CDS 21-80, UTRs 1-20 (5') and 81-100 (3')
+        ("chr1", 1, 100, "transcript", "+", "t1", "protein_coding"), ("chr1", 1, 100, "exon", "+", "t1", "protein_coding"),
+        ("chr1", 21, 80, "CDS", "+", "t1", "protein_coding"), ("chr1", 1, 20, "UTR", "+", "t1", "protein_coding"),
+        ("chr1", 81, 100, "UTR", "+", "t1", "protein_coding"), ("chr1", 21, 23, "start_codon", "+", "t1", "protein_coding"),
+        # - strand transcript t2: 201-300, CDS 221-280, so 281-300 is 5' and 201-220 is 3'
+        ("chr1", 201, 300, "transcript", "-", "t2", "protein_coding"), ("chr1", 221, 280, "CDS", "-", "t2", "protein_coding"),
+        ("chr1", 201, 220, "UTR", "-", "t2", "protein_coding"), ("chr1", 281, 300, "UTR", "-", "t2", "protein_coding"),
+        ("chr1", 401, 450, "transcript", "+", "t3", "lncRNA"), ("chr1", 401, 450, "exon", "+", "t3", "lncRNA")]
+    gt = pl.DataFrame(rows, schema=["chrom", "start", "end", "type", "strand", "transcript_id", "transcript_type"], orient="row")
+    s = G.gene_structure(gt)
+    span = lambda k: sorted(zip(s[k]["start"].to_list(), s[k]["end"].to_list()))
+    assert span("utr5") == [(0, 20), (280, 300)] and span("utr3") == [(80, 100), (200, 220)]
+    assert span("tss") == [(0, 1), (299, 300), (400, 401)]
+    assert span("lncRNA_exon") == [(400, 450)] and span("start_codon") == [(20, 23)]
+    assert span("gene_plus") == [(0, 100), (400, 450)] and span("gene_minus") == [(200, 300)]
+
+
+def test_paint_ids_writes_ids_across_contigs():
+    import numpy as np
+    import polars as pl
+    index = pl.DataFrame({"chrom": ["chr1", "chr1"], "start": [0, 100], "end": [50, 150], "offset": [0, 50]})
+    out = np.full(100, -1, dtype=np.int32)
+    n = G.paint_ids(index, "chr1", np.array([40, 120]), np.array([110, 130]), out, np.array([7, 9]))
+    assert n == 3 and (out[40:50] == 7).all() and (out[50:60] == 7).all() and (out[70:80] == 9).all()
+    assert (out[:40] == -1).all() and (out[60:70] == -1).all()
+
+
+def test_channel_rms_norm_is_per_position():
+    import torch
+    torch.manual_seed(0)
+    norm = G.ChannelRMSNorm(8)
+    x = torch.randn(2, 8, 300)
+    full, part = norm(x), norm(x[:, :, 100:200])
+    assert torch.allclose(full[:, :, 100:200], part, atol=1e-6)        # no statistic crosses positions
+    assert torch.allclose(full.pow(2).mean(1), torch.ones(2, 300), atol=1e-3)
+
+
+def test_conv_block2_and_mlp_head_shapes():
+    import torch
+    x = torch.randn(2, 16, 64)
+    assert G.ConvBlock2(16, 24)(x).shape == (2, 24, 64) and G.ConvBlock2(16, 16)(x).shape == (2, 16, 64)
+    assert G.MLPHead(16, 32, 4)(x).shape == (2, 4, 64)
+
+
+def test_bert_masking_proportions():
+    import torch
+    g = torch.Generator().manual_seed(0)
+    seq = torch.randint(0, 4, (1, 400_000))
+    seq[0, :1000] = 4                                                    # N is never picked
+    inputs, labels = G.mask_bases(seq, 0.15, generator=g, bert=True)
+    picked = labels != -100
+    assert not picked[0, :1000].any() and abs(picked.float().mean().item() - 0.15) < 0.005
+    masked = (inputs == G.MASK_CHANNEL) & picked
+    kept = (inputs == seq) & picked
+    assert abs(masked.sum().item() / picked.sum().item() - 0.8) < 0.01
+    assert abs(kept.sum().item() / picked.sum().item() - (0.1 + 0.1 / 4)) < 0.01   # 10 % kept + random hits own base
+    assert ((inputs != seq) == (masked | (picked & (inputs != seq)))).all()
+    plain, _ = G.mask_bases(seq, 0.15, generator=torch.Generator().manual_seed(0))
+    assert set(plain[labels != -100].unique().tolist()) == {G.MASK_CHANNEL}
+
+
+def test_reverse_complement():
+    import numpy as np
+    assert G.reverse_complement(np.array([0, 1, 2, 3, 4, 0], dtype=np.uint8)).tolist() == [3, 4, 0, 1, 2, 3]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="the KronLSTM core needs CUDA")
+def test_v2_forward_shapes_and_zero_context():
+    torch.manual_seed(0)
+    c = G.KronGenomeConfig(d_model=32, n_heads=2, n_layers=1, ff_units=64, stem_channels=16, n_down=3, dropout=0.0,
+                           n_tracks=5, arch="v2", n_contexts=34)
+    model = G.KronGenome(c).cuda().eval()
+    seq = torch.randint(0, 4, (2, 256), device="cuda")
+    with torch.no_grad():
+        logits, core, tracks = model(seq)
+        logits_c, _, _ = model(seq, context=torch.tensor([1, 2], device="cuda"))
+    assert logits.shape == (2, 256, 4) and tracks.shape == (2, 256, 5) and core.shape == (2, 32, 32)
+    assert torch.allclose(logits, logits_c)                             # zero-initialised contexts change nothing
+    out = model.forward_contig(seq[0], [0], chunk=128, halo=0, context=2)
+    assert out[0][0].shape == (1, 128, 4)
+
+
+def test_read_genbank_parses_records_and_code():
+    text = """LOCUS       NC_000001            20 bp    DNA     circular MAM 01-JAN-2020
+VERSION     NC_000001.1
+SOURCE      mitochondrion Homo sapiens
+  ORGANISM  Homo sapiens
+            Eukaryota; Metazoa; Chordata; Mammalia; Primates; Hominidae; Homo.
+FEATURES             Location/Qualifiers
+     CDS             1..9
+                     /transl_table=2
+     CDS             10..18
+                     /transl_table=2
+ORIGIN
+        1 acgtacgtac gtacgtacgt
+//
+LOCUS       NW_1            5999 bp    DNA     linear   CON 17-APR-2019
+VERSION     NW_1.1
+  ORGANISM  Plasmodium gonderi
+            Eukaryota; Sar.
+CONTIG      join(x)
+//
+"""
+    recs = list(G.read_genbank(text.splitlines(keepends=True)))
+    assert [r["accession"] for r in recs] == ["NC_000001.1", "NW_1.1"]
+    a, b = recs
+    assert a["circular"] and a["transl_table"] == 2 and a["sequence"] == "ACGTACGTACGTACGTACGT"
+    assert "Primates" in a["lineage"] and a["organism"] == "Homo sapiens"
+    assert not b["circular"] and b["sequence"] == "" and b["transl_table"] == 1
