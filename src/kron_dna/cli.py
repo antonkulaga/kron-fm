@@ -1141,6 +1141,8 @@ def genome_clinvar(runs: list[Path] = typer.Option([], "--run", help="genome-tra
                                                     "in a window this long centred on the variant (0: skip)"),
                    delta_batch: int = 8,
                    batch_size: int = 2, device: str = "cuda", seed: int = 0, n_boot: int = 1000,
+                   rc_average: bool = typer.Option(False, help="also score the reverse-complement strand and add "
+                                                   "strand-averaged scores (<run>@rc-avg...) and the strand agreement"),
                    out: Path | None = typer.Option(None, help="JSON summary (default: data/output/eval/clinvar/"
                                                    "genome.json; the scores go beside it as .parquet)")) -> None:
     """Zero-shot ClinVar for KronGenome by region (coding, splice site, near one, UTR exon, regulatory element,
@@ -1182,6 +1184,11 @@ def genome_clinvar(runs: list[Path] = typer.Option([], "--run", help="genome-tra
         scores[key] = GV.masked_marginals(model, bases, g, table["ref_code"].to_numpy(), table["alt_code"].to_numpy(),
                                           t_start, t_len, window, dev, batch_size)
         typer.echo(f"{key} (step {state.get('step')}): {len(np.unique(t_start))} tiles in {time.time() - t0:.0f} s")
+        if rc_average:
+            back = GV.masked_marginals(model, bases, g, table["ref_code"].to_numpy(), table["alt_code"].to_numpy(),
+                                       t_start, t_len, window, dev, batch_size, rc=True)
+            scores[f"{key}@rc-avg"] = (scores[key] + back) / 2
+            typer.echo(f"{key}: masked marginal, strand agreement (Pearson) {np.corrcoef(scores[key], back)[0, 1]:.3f}")
         if model.tracks is not None and delta_window:
             t0 = time.time()
             d = GV.track_deltas(model, bases, g, table["ref_code"].to_numpy(), table["alt_code"].to_numpy(),
@@ -1189,6 +1196,13 @@ def genome_clinvar(runs: list[Path] = typer.Option([], "--run", help="genome-tra
             splice = [G.TRACKS.index("donor"), G.TRACKS.index("acceptor")]
             scores[f"{key}:splice-delta"] = -d[:, splice].max(1)        # lower = more damaging, as the marginal
             scores[f"{key}:track-delta"] = -d.max(1)
+            if rc_average:
+                d2 = GV.track_deltas(model, bases, g, table["ref_code"].to_numpy(), table["alt_code"].to_numpy(),
+                                     c_off, c_len, delta_window, dev, delta_batch, rc=True)
+                scores[f"{key}:splice-delta@rc-avg"] = -(d[:, splice] + d2[:, splice]).max(1) / 2
+                scores[f"{key}:track-delta@rc-avg"] = -((d + d2) / 2).max(1)
+                typer.echo(f"{key}: splice delta, strand agreement (Pearson) "
+                           f"{np.corrcoef(d[:, splice].max(1), d2[:, splice].max(1))[0, 1]:.3f}")
             typer.echo(f"{key}: track deltas in {delta_window:,}-base windows, {time.time() - t0:.0f} s")
         del model
     rows = GV.summarize(table, scores, n_boot)

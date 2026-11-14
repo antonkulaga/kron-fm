@@ -80,7 +80,7 @@ def tile_of(g: np.ndarray, c_off: np.ndarray, c_len: np.ndarray, window: int) ->
 @torch.no_grad()
 def masked_marginals(model: G.KronGenome, bases: np.ndarray, g: np.ndarray, ref: np.ndarray, alt: np.ndarray,
                      tile_start: np.ndarray, tile_len: np.ndarray, window: int, device: torch.device,
-                     batch_size: int = 2) -> np.ndarray:
+                     batch_size: int = 2, rc: bool = False) -> np.ndarray:
     """``log p(alt) - log p(ref)`` at each variant (``ref``/``alt`` as base codes 0..3), all variants of a tile masked
     in one pass; tiles shorter than ``window`` are padded with N as a segment of their own."""
     unit = 2 ** model.config.n_down
@@ -100,6 +100,9 @@ def masked_marginals(model: G.KronGenome, bases: np.ndarray, g: np.ndarray, ref:
             codes[:take] = bases[start:start + take]
             members = order[bounds[t]:bounds[t + 1]]
             pos = g[members] - start
+            if rc:                                       # the other strand: the tile reversed and complemented
+                codes[:take] = G.reverse_complement(codes[:take].astype(np.uint8))
+                pos = take - 1 - pos
             codes[pos] = G.MASK_CHANNEL
             seg = np.zeros(window // unit, dtype=np.int64)
             seg[(take + unit - 1) // unit:] = 1
@@ -113,14 +116,18 @@ def masked_marginals(model: G.KronGenome, bases: np.ndarray, g: np.ndarray, ref:
         logp = torch.log_softmax(logits.float(), -1).cpu().numpy()
         members, which = np.concatenate(rows), np.concatenate(cols)
         at = g[members] - tiles[np.array(list(chunk))[which], 0]
-        out[members] = logp[which, at, alt[members]] - logp[which, at, ref[members]]
+        r, a = ref[members], alt[members]
+        if rc:
+            at = tiles[np.array(list(chunk))[which], 1] - 1 - at
+            r, a = 3 - r, 3 - a
+        out[members] = logp[which, at, a] - logp[which, at, r]
     return out
 
 
 @torch.no_grad()
 def track_deltas(model: G.KronGenome, bases: np.ndarray, g: np.ndarray, ref: np.ndarray, alt: np.ndarray,
                  c_off: np.ndarray, c_len: np.ndarray, window: int, device: torch.device, batch_size: int = 8,
-                 flank: int = 50) -> np.ndarray:
+                 flank: int = 50, rc: bool = False) -> np.ndarray:
     """``[n, n_tracks]``: for each variant, the largest ``|p(alt) - p(ref)|`` of each track within ``flank`` bases of
     it, from two unmasked passes (reference and alternative) over a ``window`` centred on it (clamped to its contig;
     a shorter contig is padded with N as a segment of its own)."""
@@ -140,6 +147,9 @@ def track_deltas(model: G.KronGenome, bases: np.ndarray, g: np.ndarray, ref: np.
             seg[(take[i] + unit - 1) // unit:] = 1
             mutant = codes.copy()
             mutant[local[i] - start[i]] = alt[i]
+            if rc:                                       # the other strand; the tracks are not strand-specific
+                codes[:take[i]] = G.reverse_complement(codes[:take[i]].astype(np.uint8))
+                mutant[:take[i]] = G.reverse_complement(mutant[:take[i]].astype(np.uint8))
             seqs += [codes, mutant]
             segs += [seg, seg]
         with autocast:
@@ -147,6 +157,8 @@ def track_deltas(model: G.KronGenome, bases: np.ndarray, g: np.ndarray, ref: np.
         prob = torch.sigmoid(tracks.float())
         for j, i in enumerate(idx):
             at = int(local[i] - start[i])
+            if rc:
+                at = int(take[i]) - 1 - at
             lo, hi = max(0, at - flank), min(int(take[i]), at + flank + 1)
             out[i] = (prob[2 * j + 1, lo:hi] - prob[2 * j, lo:hi]).abs().amax(0).cpu().numpy()
     return out

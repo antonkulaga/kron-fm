@@ -100,3 +100,25 @@ def test_track_deltas_zero_for_a_silent_change_and_shaped():
     same = GV.track_deltas(model, bases, g, ref, ref, off, length, 128, torch.device("cuda"), batch_size=2)
     moved = GV.track_deltas(model, bases, g, ref, (ref + 1) % 4, off, length, 128, torch.device("cuda"))
     assert same.shape == (3, 9) and np.abs(same).max() == 0 and (moved.max(1) > 0).all()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="the KronLSTM core needs CUDA")
+def test_rc_scoring_equals_scoring_the_reversed_genome():
+    torch.manual_seed(0)
+    c = G.KronGenomeConfig(d_model=32, n_heads=2, n_layers=1, ff_units=64, stem_channels=8, n_down=3, dropout=0.0,
+                           n_tracks=9)
+    model = G.KronGenome(c).cuda().eval()
+    n, window = 512, 256
+    bases = np.random.default_rng(1).integers(0, 4, n).astype(np.uint8)
+    flipped = G.reverse_complement(bases)
+    g = np.array([100, 300])
+    ref, alt = bases[g].astype(np.int64), (bases[g].astype(np.int64) + 1) % 4
+    gf, reff, altf = n - 1 - g, 3 - ref, 3 - alt
+    off, length = np.zeros(2, np.int64), np.full(2, n)
+    s, L = GV.tile_of(np.array([256, 256]), off, length, n)              # one tile: the whole contig
+    a = GV.masked_marginals(model, bases, g, ref, alt, s, L, n, torch.device("cuda"), rc=True)
+    b = GV.masked_marginals(model, flipped, gf, reff, altf, s, L, n, torch.device("cuda"))
+    assert np.allclose(a, b, atol=1e-5)
+    d1 = GV.track_deltas(model, bases, g, ref, alt, off, length, n, torch.device("cuda"), rc=True)   # one window: same bases
+    d2 = GV.track_deltas(model, flipped, gf, reff, altf, off, length, n, torch.device("cuda"))
+    assert np.allclose(d1, d2, atol=1e-4)
