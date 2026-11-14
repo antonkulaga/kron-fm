@@ -811,6 +811,17 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                  epigenome_weight: float = typer.Option(0.0, help="cell-type conditioning: also predict Regulatory Build "
                                                         "activity per 128-bp bin in each epigenome "
                                                         "(genome-labels-extra), at this loss weight"),
+                 epigenome_focus: float = typer.Option(1.0, help="with --epigenome-weight: the weight of bins that no "
+                                                       "Regulatory Build element covers in the cell-type loss. Only "
+                                                       "~6% of bins carry an element, and the rest are all-off for "
+                                                       "every epigenome whatever the cell type, so at 1.0 (all bins "
+                                                       "alike) ~94% of the loss asks 'is there an element here' "
+                                                       "rather than 'which cell types'; ~0.05 balances the two"),
+                 annot_oversample: float = typer.Option(0.0, help="share of training windows drawn so they contain an "
+                                                        "annotated block (--annot-bits) rather than uniformly over "
+                                                        "the training contigs by length (0: uniform, as before)"),
+                 annot_bits: str = typer.Option("CDS,exon,promoter,enhancer", help="with --annot-oversample: the "
+                                                "genome-labels bits that make a base count as annotated"),
                  mito: str = typer.Option("", help="also train on this prepared organelle genome (genome-prepare-mito), "
                                           "each sequence tagged with its genetic code table as context (nuclear: 0)"),
                  mito_share: float = typer.Option(0.03, help="with --mito: share of training windows from it"),
@@ -872,19 +883,55 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
     epi_batch: list = []                                                  # the last sample()'s bin targets
     epi_unit = 128 if arch == "v3" else unit                               # v3 pools its 1-bp states per 128 bp
 
-    def epi_targets(at: int, take: int, window: int, flip: bool) -> tuple[np.ndarray, np.ndarray]:
+    annot_pos = annot_coff = annot_clen = None
+    if annot_oversample > 0:                   # oversample annotated sequence (Enformer/Borzoi sample gene-rich loci)
+        want_bits = [b.strip() for b in annot_bits.split(",") if b.strip()]
+        unknown = sorted(set(want_bits) - set(G.LABEL_BITS))
+        if unknown or not want_bits:
+            raise typer.BadParameter(f"unknown label bits {unknown or annot_bits!r}; have {list(G.LABEL_BITS)}")
+        bit_mask = sum(1 << G.LABEL_BITS[b] for b in want_bits)
+        if not (src / "labels.u8").exists():
+            raise typer.BadParameter(f"--annot-oversample needs {src / 'labels.u8'} (run genome-labels first)")
+        block = 1024                           # a block counts as annotated when >= 1/8 of its bases carry a bit
+        cache = src / f"annot_blocks_m{bit_mask}_b{block}.npy"
+        if cache.exists():
+            blocks = np.load(cache)
+        else:
+            lab_all = np.memmap(src / "labels.u8", dtype=np.uint8, mode="r")
+            found, piece_n = [], (1 << 26) // block * block
+            for a in range(0, len(lab_all) // block * block, piece_n):
+                piece = np.asarray(lab_all[a:a + piece_n])
+                piece = piece[: len(piece) // block * block].reshape(-1, block)
+                found.append(a + np.flatnonzero(((piece & bit_mask) != 0).sum(1) >= block // 8) * block)
+            blocks = np.concatenate(found).astype(np.int64)
+            np.save(cache, blocks)
+        t_off = train_idx["offset"].to_numpy()
+        t_len = train_idx["len"].to_numpy()
+        order = np.argsort(t_off)                                          # searchsorted needs sorted offsets
+        t_off, t_len = t_off[order], t_len[order]
+        j = np.searchsorted(t_off, blocks, side="right") - 1
+        inside = (j >= 0) & (blocks < t_off[np.maximum(j, 0)] + t_len[np.maximum(j, 0)])
+        annot_pos, j = blocks[inside], j[inside]                           # training contigs only
+        annot_coff, annot_clen = t_off[j], t_len[j]
+        say(f"annotation oversampling: {annot_bits} marks {len(annot_pos):,} blocks of {block} bp on training contigs "
+            f"({100 * len(annot_pos) * block / max(float(t_len.sum()), 1):.1f}% of their bases), "
+            f"share {annot_oversample}")
+
+    def epi_targets(at: int, take: int, window: int, flip: bool) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """``[bins, E]`` bool: an epigenome is active in a 128-bp bin when an element active there covers a base of
-        it; and ``[bins]`` valid (inside the window's bases)."""
+        it; ``[bins]`` valid (inside the window's bases); and ``[bins]`` bool: a Regulatory Build element covers a
+        base of the bin at all, which is where the cell-type question is actually asked (--epigenome-focus)."""
         ids = np.full(window, -1, dtype=np.int64)
         ids[:take] = regfeat[at:at + take]
         if flip:
             ids[:take] = ids[:take][::-1]
         ids = ids.reshape(-1, epi_unit)
         hit = np.zeros((ids.shape[0], n_epi), dtype=bool)
-        rows, cols = np.nonzero(ids >= 0)
+        covered = ids >= 0
+        rows, cols = np.nonzero(covered)
         if len(rows):
             np.logical_or.at(hit, rows, reg_active[ids[rows, cols]])
-        return hit, np.arange(window // epi_unit) < (take + epi_unit - 1) // epi_unit
+        return hit, np.arange(window // epi_unit) < (take + epi_unit - 1) // epi_unit, covered.any(1)
 
     def phase_at(s: int) -> tuple[int, int]:
         """(window, batch) at optimizer step s."""
@@ -917,7 +964,7 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
             out += [torch.from_numpy(lab), torch.from_numpy(act), torch.from_numpy(np.arange(n) < r["len"])]
         return tuple(out)
 
-    def sample(table, window=window, batch=None, gen=None, flip=False, mito_table=None, share=0.0
+    def sample(table, window=window, batch=None, gen=None, flip=False, mito_table=None, share=0.0, annot=0.0
                ) -> tuple[torch.Tensor, ...]:
         """``batch`` windows: (seqs, segments, contexts[, labels, activity, valid]). With ``mito_table``, each row comes
         from it with probability ``share``; a circular genome is read across its origin when the window is shorter.
@@ -926,7 +973,7 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
         batch = batch or batch_size
         p = table["len"].to_numpy() / table["len"].sum()                 # contigs by length: every base equally
         seqs, segs, ctxs, labs, acts, valid = [], [], [], [], [], []
-        epi_t, epi_v = [], []
+        epi_t, epi_v, epi_e = [], [], []
         for _ in range(batch):
             from_mito = mito_table is not None and gen.random() < share
             if from_mito:
@@ -939,6 +986,16 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                 codes = np.full(window, 4, dtype=np.int64)
                 codes[:take] = mito_bases[r["offset"] + pos]
                 ctxs.append(int(r["code"]))                               # organelle: its genetic code table
+            elif annot and annot_pos is not None and gen.random() < annot:
+                k = int(gen.integers(0, len(annot_pos)))                  # a window that contains an annotated block
+                c_off, c_len = int(annot_coff[k]), int(annot_clen[k])
+                take = min(window, c_len)
+                lo = max(c_off, int(annot_pos[k]) - take + 1)             # the block stays inside the window,
+                hi = min(c_off + c_len - take, int(annot_pos[k]))         # the window inside its contig
+                at = int(gen.integers(lo, max(lo, hi) + 1))
+                codes = np.full(window, 4, dtype=np.int64)
+                codes[:take] = bases[at:at + take]
+                ctxs.append(0)                                            # nuclear (context 0)
             else:
                 r = table.row(int(gen.choice(table.height, p=p)), named=True)
                 take = min(window, r["len"])
@@ -953,10 +1010,12 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                 if from_mito:
                     epi_t.append(np.zeros((window // epi_unit, n_epi), dtype=bool))
                     epi_v.append(np.zeros(window // epi_unit, dtype=bool))
+                    epi_e.append(np.zeros(window // epi_unit, dtype=bool))
                 else:
-                    h_, v_ = epi_targets(at, take, window, flip_row)
+                    h_, v_, e_ = epi_targets(at, take, window, flip_row)
                     epi_t.append(h_)
                     epi_v.append(v_)
+                    epi_e.append(e_)
             seg = np.zeros(window // unit, dtype=np.int64)
             seg[(take + unit - 1) // unit:] = 1                           # padding is its own segment
             seqs.append(codes)
@@ -970,7 +1029,8 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                 labs.append(lab)
                 acts.append(act)
                 valid.append((np.arange(window) < take) & (not from_mito))
-        epi_batch[:] = [(torch.from_numpy(np.stack(epi_t)), torch.from_numpy(np.stack(epi_v)))] if epi_t else []
+        epi_batch[:] = [(torch.from_numpy(np.stack(epi_t)), torch.from_numpy(np.stack(epi_v)),
+                         torch.from_numpy(np.stack(epi_e)))] if epi_t else []
         out = [torch.from_numpy(np.stack(seqs)), torch.from_numpy(np.stack(segs)), torch.tensor(ctxs)]
         if labels:
             out += [torch.from_numpy(np.stack(x)) for x in (labs, acts, valid)]
@@ -1067,9 +1127,13 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
             mlm = mlm + ratio_weight * model.last_ratio_loss
             chunk_rates.append(model.last_chunks)
         if epigenome_weight > 0 and model.last_epi is not None and epi_batch:
-            want_e, ok_e = (x.to(dev) for x in epi_batch[0])
+            want_e, ok_e, has_e = (x.to(dev) for x in epi_batch[0])
             per_e = F.binary_cross_entropy_with_logits(model.last_epi.float(), want_e.float(), reduction="none")
-            loss_e = (per_e * ok_e.unsqueeze(-1)).sum() / (ok_e.sum().clamp_min(1) * per_e.shape[-1])
+            # --epigenome-focus: a bin no element covers is all-off for every epigenome whatever the cell type, and
+            # those are ~94% of bins, so down-weighting them puts the loss on the bins that carry the question.
+            w_e = ok_e.float() if epigenome_focus >= 1.0 else \
+                ok_e.float() * (has_e.float() + (~has_e).float() * epigenome_focus)
+            loss_e = (per_e * w_e.unsqueeze(-1)).sum() / (w_e.sum().clamp_min(1) * per_e.shape[-1])
             if model.training:
                 mlm = mlm + epigenome_weight * loss_e
             else:
@@ -1135,7 +1199,8 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                 loss, track = contig_loss(*sample_contig(train_idx, longest=bench))
             else:
                 loss, track = loss_on(*sample(train_idx, window=win, batch=bat, flip=rc,
-                                              mito_table=mito_train if mito else None, share=mito_share))
+                                              mito_table=mito_train if mito else None, share=mito_share,
+                                              annot=annot_oversample))
             ((loss + track_weight * track if track is not None else loss) / grad_accum).backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         opt.step()
