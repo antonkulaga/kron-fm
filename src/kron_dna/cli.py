@@ -796,6 +796,10 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                  jepa_weight: float = typer.Option(0.0, help="JEPA-DNA latent loss: predict an EMA target encoder's "
                                                    "core states of the unmasked window (cosine), at this weight"),
                  jepa_ema: float = typer.Option(0.996, help="with --jepa-weight: EMA decay of the target encoder"),
+                 jepa_reg: str = typer.Option("none", help="with --jepa-weight: anti-collapse term on the context's core "
+                                              "states: none, vicreg (variance hinge + covariance) or sigreg (LeJEPA: "
+                                              "random projections towards an isotropic Gaussian, Epps-Pulley)"),
+                 jepa_reg_weight: float = typer.Option(1.0, help="weight of --jepa-reg"),
                  start_step: int = typer.Option(0, help="with --init: continue the schedule (curriculum, LR, paired "
                                                 "evals) from this step, so the init run's own history is the control"),
                  stop_step: int = typer.Option(0, help="stop after this step (0: the end of the curriculum)"),
@@ -1056,8 +1060,8 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
         # held-out masks are always plain MASK (bert only in training), so runs with and without it compare
         inputs, targets = G.mask_bases(seq.to(dev), mask_prob, generator=mask_gen, bert=bert_mask and model.training)
         with autocast:
-            logits, _, tracks = (train_model if model.training else model)(inputs, seg.to(dev),
-                                                                            ctx.to(dev) if mito else None)
+            logits, ctx_core, tracks = (train_model if model.training else model)(inputs, seg.to(dev),
+                                                                                   ctx.to(dev) if mito else None)
         mlm = F.cross_entropy(logits.float().reshape(-1, 4), targets.reshape(-1), ignore_index=-100)
         if chunk_ratio and model.training and model.last_ratio_loss is not None:
             mlm = mlm + ratio_weight * model.last_ratio_loss
@@ -1077,6 +1081,25 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
             cos = F.cosine_similarity(model.last_jepa.float(), want_core.float(), dim=-1)
             jepa_losses.append(float((1 - cos)[keep_bins].mean().detach()))
             mlm = mlm + jepa_weight * (1 - cos)[keep_bins].mean()
+            z = ctx_core.float()[keep_bins]                             # [N, d] context core states, no padding
+            if z.shape[0] > 4096:                                       # a random subset keeps the terms cheap
+                z = z[torch.randperm(z.shape[0], device=z.device)[:4096]]
+            z = z - z.mean(0)
+            std = torch.sqrt(z.var(0) + 1e-4)
+            jepa_std.append(float(std.mean().detach()))
+            if jepa_reg == "vicreg":
+                cov = (z.T @ z) / (z.shape[0] - 1)
+                off = cov - torch.diag(torch.diag(cov))
+                mlm = mlm + jepa_reg_weight * (torch.relu(1 - std).mean() + off.pow(2).sum() / z.shape[1])
+            elif jepa_reg == "sigreg":
+                dirs = torch.randn(z.shape[1], 64, device=z.device)
+                proj = (z / std.mean()) @ (dirs / dirs.norm(dim=0))     # [N, 64] 1-D projections
+                tg = torch.linspace(-3, 3, 17, device=z.device)
+                arg = proj.unsqueeze(-1) * tg                           # [N, 64, 17]
+                ecf_re, ecf_im = torch.cos(arg).mean(0), torch.sin(arg).mean(0)
+                gauss = torch.exp(-tg.pow(2) / 2)                       # N(0, 1)'s characteristic function
+                ep = ((ecf_re - gauss).pow(2) + ecf_im.pow(2)) * gauss  # Epps-Pulley, Gaussian-weighted
+                mlm = mlm + jepa_reg_weight * ep.mean()
         if lab is None:
             return mlm, None
         want = G.track_targets(lab.to(dev), act.to(dev))
@@ -1088,6 +1111,7 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
         return mlm, track
 
     jepa_losses: list[float] = []
+    jepa_std: list[float] = []
     epi_keep: list = []
     chunk_rates: list[float] = []
     t0, started = time.time(), time.time()
@@ -1188,10 +1212,11 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                 fh.write(f"{step},{opt.param_groups[0]['lr']:.3e},{loss.item():.4f},{bits:.4f},{h:.3f}{extra}\n")
             say(f"step {step} (window {win:,} x {bat}): train {loss.item():.4f}, held-out {bits:.3f} bits/base"
                        + (f", mito {mito_bits:.3f}" if mito_bits is not None else "")
-                       + (f", jepa {np.mean(jepa_losses):.4f}" if jepa_losses else "")
+                       + (f", jepa {np.mean(jepa_losses):.4f} (core std {np.mean(jepa_std):.3f})" if jepa_losses else "")
                        + (f", chunk every {unit / np.mean(chunk_rates):.0f} bp" if chunk_rates else "") + f", {h:.2f} h, "
                        f"peak {torch.cuda.max_memory_allocated(dev) / 2**30:.1f} GiB" + (f", tracks {tracks_note}" if tracks_note else ""))
             jepa_losses.clear()
+            jepa_std.clear()
             chunk_rates.clear()
             _save_atomic({"model": model.state_dict(), "optimizer": opt.state_dict(), "config": config.to_dict(),
                           "step": step, "hours": h}, ckpt)
