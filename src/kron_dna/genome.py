@@ -49,6 +49,8 @@ class KronGenomeConfig:
     jepa: bool = False          # a predictor of an EMA target's core states from the masked input's (JEPA-DNA)
     n_contexts: int = 0         # v2: learned context embeddings added to the core's input bins: 0 nuclear, else
                                 # the organelle's NCBI genetic code table (2 vertebrate mito, 5 invertebrate, ...)
+    n_ntv3: int = 0             # quantitative per-base assay tracks (NTv3 bigwigs): one output per track, predicted
+                                # in the same log1p units the targets are stored in, beside the masked-base head
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -143,6 +145,9 @@ class KronGenome(nn.Module):
         else:
             self.head = nn.Conv1d(widths[0], 4, 1)
             self.tracks = nn.Conv1d(widths[0], c.n_tracks, 1) if c.n_tracks else None
+        self.ntv3 = (MLPHead(widths[0], c.head_hidden or 2 * widths[0], c.n_ntv3) if v2
+                     else nn.Conv1d(widths[0], c.n_ntv3, 1)) if c.n_ntv3 else None
+        self.last_ntv3 = None
         self.context = nn.Embedding(c.n_contexts, c.d_model) if c.n_contexts else None
         self.jepa_pred = nn.Sequential(nn.RMSNorm(c.d_model, eps=1e-5), nn.Linear(c.d_model, 2 * c.d_model), nn.GELU(),
                                        nn.Linear(2 * c.d_model, c.d_model)) if c.jepa else None
@@ -203,6 +208,8 @@ class KronGenome(nn.Module):
         hidden = c.head_hidden or 2 * w
         self.head = MLPHead(w, hidden, 4)
         self.tracks = MLPHead(w, hidden, c.n_tracks) if c.n_tracks else None
+        self.ntv3 = MLPHead(w, hidden, c.n_ntv3) if c.n_ntv3 else None
+        self.last_ntv3 = None
         self.context = nn.Embedding(c.n_contexts, c.d_model) if c.n_contexts else None
         if self.context is not None:
             nn.init.zeros_(self.context.weight)
@@ -266,6 +273,7 @@ class KronGenome(nn.Module):
             self.last_epi = self.epigenome_logits(up.reshape(b, length // 128, 128, -1).mean(2))
         fused = self.fuse_norm((local + self.from_core(up)).transpose(1, 2))           # [B, w, L]
         tracks = self.tracks(fused).transpose(1, 2) if self.tracks is not None else None
+        self.last_ntv3 = self.ntv3(fused).transpose(1, 2) if self.ntv3 is not None else None
         return self.head(fused).transpose(1, 2), up, tracks
 
     def forward(self, seq: torch.Tensor, segments: torch.Tensor | None = None, context: torch.Tensor | None = None
@@ -298,6 +306,7 @@ class KronGenome(nn.Module):
         self.last_epi = self.epigenome_logits(core) if self.config.n_epigenomes else None
         x = self.add_local(self.decode(core.transpose(1, 2), skips), skips)
         tracks = self.tracks(x).transpose(1, 2) if self.tracks is not None else None   # [B, L, n_tracks]
+        self.last_ntv3 = self.ntv3(x).transpose(1, 2) if self.ntv3 is not None else None
         return self.head(x).transpose(1, 2), core, tracks
 
     def _forward_chunked(self, h: torch.Tensor, skips: list[torch.Tensor], segments: torch.Tensor | None):
@@ -337,6 +346,7 @@ class KronGenome(nn.Module):
         self.last_epi = self.epigenome_logits(up) if self.config.n_epigenomes else None
         x = self.add_local(self.decode(up.transpose(1, 2), skips), skips)
         tracks = self.tracks(x).transpose(1, 2) if self.tracks is not None else None
+        self.last_ntv3 = self.ntv3(x).transpose(1, 2) if self.ntv3 is not None else None
         return self.head(x).transpose(1, 2), up, tracks
 
     def add_local(self, x: torch.Tensor, skips: list[torch.Tensor]) -> torch.Tensor:

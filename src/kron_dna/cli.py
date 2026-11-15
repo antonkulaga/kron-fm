@@ -822,6 +822,15 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                                                         "the training contigs by length (0: uniform, as before)"),
                  annot_bits: str = typer.Option("CDS,exon,promoter,enhancer", help="with --annot-oversample: the "
                                                 "genome-labels bits that make a base count as annotated"),
+                 ntv3_dir: str = typer.Option("", help="also predict quantitative per-base assay tracks prepared from "
+                                              "NTv3's bigwigs: this directory holds tracks/<file_id>.u8, split.u8 and "
+                                              "tracks.json laid out like bases.u8"),
+                 ntv3_weight: float = typer.Option(1.0, help="with --ntv3-dir: weight of the track loss"),
+                 ntv3_assays: str = typer.Option("ATAC-seq,Histone ChIP-seq,total RNA-seq,polyA plus RNA-seq",
+                                                 help="with --ntv3-dir: assays to train on, or 'all'. PRO-cap and "
+                                                 "eCLIP are ~0.1%% non-zero, so they are left out by default"),
+                 ntv3_focus: float = typer.Option(1.0, help="with --ntv3-dir: weight of positions where every selected "
+                                                  "track reads zero (1.0: all positions alike, as for --epigenome-focus)"),
                  mito: str = typer.Option("", help="also train on this prepared organelle genome (genome-prepare-mito), "
                                           "each sequence tagged with its genetic code table as context (nuclear: 0)"),
                  mito_share: float = typer.Option(0.03, help="with --mito: share of training windows from it"),
@@ -923,6 +932,49 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
             f"({100 * len(annot_pos) * block / max(float(t_len.sum()), 1):.1f}% of their bases), "
             f"share {annot_oversample}")
 
+    ntv3 = None
+    ntv3_batch: list = []
+    if ntv3_dir:
+        import json as _json
+        from pathlib import Path as _Path
+        nd = _Path(ntv3_dir)
+        want_assays = None if ntv3_assays.strip() == "all" else {a.strip() for a in ntv3_assays.split(",")}
+        sel = [t for t in _json.load(open(nd / "tracks.json"))["tracks"]
+               if want_assays is None or t["assay"] in want_assays]
+        if not sel:
+            raise typer.BadParameter(f"--ntv3-assays {ntv3_assays!r} selected no track")
+        ids = [t["file_id"] for t in sel]
+        at_pos = {i: k for k, i in enumerate(ids)}
+        # reverse complement must SWAP each _P track with its _M partner, not merely reverse it: these assays are
+        # strand-specific, unlike the Regulatory Build bits, so reversing alone teaches the wrong strand.
+        swap = np.arange(len(ids))
+        for k, i in enumerate(ids):
+            if i.endswith(("_P", "_M")):
+                other = i[:-1] + ("M" if i.endswith("_P") else "P")
+                if other in at_pos:
+                    swap[k] = at_pos[other]
+        paired = int((swap != np.arange(len(ids))).sum())
+        if rc and paired == 0 and any(i.endswith(("_P", "_M")) for i in ids):
+            raise typer.BadParameter("--rc with stranded NTv3 tracks whose _P/_M partners are not both selected")
+        # One base-major [TOTAL, T] array makes a training window a single contiguous read; per-track files
+        # cost 14 random 8 kB reads per window and measured 7.9 s/step against 0.7 s without tracks.
+        dense = None
+        if (nd / "dense.json").exists():
+            dj = _json.load(open(nd / "dense.json"))
+            if dj["ids"] == ids:
+                dense = np.memmap(nd / "dense.u8", dtype=np.uint8, mode="r",
+                                  shape=(int(dj["total_bases"]), int(dj["n_tracks"])))
+        ntv3 = dict(ids=ids, swap=swap, dense=dense,
+                    arrs=None if dense is not None else
+                         [np.memmap(nd / "tracks" / f"{i}.u8", dtype=np.uint8, mode="r") for i in ids],
+                    split=np.memmap(nd / "split.u8", dtype=np.uint8, mode="r"),
+                    scales=np.array([t["log1p_scale"] for t in sel], dtype=np.float32))
+        by_assay = {}
+        for t in sel:
+            by_assay[t["assay"]] = by_assay.get(t["assay"], 0) + 1
+        say(f"NTv3 tracks: {len(ids)} selected ({by_assay}), {paired // 2} stranded pairs swapped under --rc, "
+            f"loss on split==1 only" + (", base-major layout" if dense is not None else ", per-track files"))
+
     def epi_targets(at: int, take: int, window: int, flip: bool) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """``[bins, E]`` bool: an epigenome is active in a 128-bp bin when an element active there covers a base of
         it; ``[bins]`` valid (inside the window's bases); and ``[bins]`` bool: a Regulatory Build element covers a
@@ -980,6 +1032,7 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
         p = table["len"].to_numpy() / table["len"].sum()                 # contigs by length: every base equally
         seqs, segs, ctxs, labs, acts, valid = [], [], [], [], [], []
         epi_t, epi_v, epi_e = [], [], []
+        nt_t, nt_s = [], []
         for _ in range(batch):
             from_mito = mito_table is not None and gen.random() < share
             if from_mito:
@@ -1022,6 +1075,21 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                     epi_t.append(h_)
                     epi_v.append(v_)
                     epi_e.append(e_)
+            if ntv3 is not None:
+                nt = np.zeros((window, len(ntv3["ids"])), dtype=np.uint8)
+                sp_ = np.zeros(window, dtype=np.uint8)
+                if not from_mito:                                         # organelle windows have no nuclear tracks
+                    if ntv3["dense"] is not None:
+                        nt[:take] = ntv3["dense"][at:at + take]
+                    else:
+                        for k_, arr_ in enumerate(ntv3["arrs"]):
+                            nt[:take, k_] = arr_[at:at + take]
+                    sp_[:take] = ntv3["split"][at:at + take]
+                    if flip_row:                                          # reverse AND swap the strand partners
+                        nt[:take] = nt[:take][::-1][:, ntv3["swap"]]
+                        sp_[:take] = sp_[:take][::-1]
+                nt_t.append(nt)
+                nt_s.append(sp_)
             seg = np.zeros(window // unit, dtype=np.int64)
             seg[(take + unit - 1) // unit:] = 1                           # padding is its own segment
             seqs.append(codes)
@@ -1037,6 +1105,7 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                 valid.append((np.arange(window) < take) & (not from_mito))
         epi_batch[:] = [(torch.from_numpy(np.stack(epi_t)), torch.from_numpy(np.stack(epi_v)),
                          torch.from_numpy(np.stack(epi_e)))] if epi_t else []
+        ntv3_batch[:] = [(torch.from_numpy(np.stack(nt_t)), torch.from_numpy(np.stack(nt_s)))] if nt_t else []
         out = [torch.from_numpy(np.stack(seqs)), torch.from_numpy(np.stack(segs)), torch.tensor(ctxs)]
         if labels:
             out += [torch.from_numpy(np.stack(x)) for x in (labs, acts, valid)]
@@ -1047,6 +1116,7 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                                 n_tracks=len(G.TRACKS) if labels else 0, arch=arch, head_hidden=head_hidden,
                                 n_contexts=34 if mito else 0, jepa=jepa_weight > 0,
                                 n_epigenomes=n_epi if epigenome_weight > 0 else 0, chunk_ratio=chunk_ratio,
+                                n_ntv3=len(ntv3["ids"]) if ntv3 else 0,
                                 chunk_length_feature=chunk_length_feature,
                                 **(dict(zip(("local_width", "local_layers", "local_span"),
                                             map(int, local_track.split(",")))) if local_track else {}))
@@ -1144,6 +1214,28 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                 mlm = mlm + epigenome_weight * loss_e
             else:
                 epi_keep.append((model.last_epi.float()[ok_e].cpu(), want_e[ok_e].cpu()))
+        if ntv3 is not None and model.last_ntv3 is not None and ntv3_batch:
+            want_n, sp_n = (x.to(dev) for x in ntv3_batch[0])             # [B,L,T] uint8, [B,L] split code
+            # split.u8: 1 NTv3 train, 2 NTv3 val, 3 NTv3 test, 4 chr8/chr9 (KronGenome's held-out chromosomes)
+            tgt = want_n.float() / 255.0 * ntv3_scale                     # back into log1p units
+            pred = model.last_ntv3.float()
+            if model.training:                                            # NTv3's own train regions only, which is
+                ok_n = (sp_n == 1).float()                                # also what keeps chr8/chr9 out
+                if ntv3_focus < 1.0:                                      # all-zero positions are most of the genome
+                    sig = (want_n > 0).any(-1).float()
+                    ok_n = ok_n * (sig + (1 - sig) * ntv3_focus)
+                loss_n = ((pred - tgt).pow(2).mean(-1) * ok_n).sum() / ok_n.sum().clamp_min(1)
+                mlm = mlm + ntv3_weight * loss_n
+                ntv3_losses.append(float(loss_n.detach()))
+            else:                                                         # Pearson on NTv3's test regions, running
+                m_ = sp_n == 4                                            # 4 = chr8/chr9, held out for KronGenome
+
+                if m_.any():
+                    x_, y_ = pred[m_].double(), tgt[m_].double()
+                    ntv3_stats[0] += x_.shape[0]
+                    ntv3_stats[1] += x_.sum(0).cpu(); ntv3_stats[2] += y_.sum(0).cpu()
+                    ntv3_stats[3] += (x_ * y_).sum(0).cpu()
+                    ntv3_stats[4] += (x_ * x_).sum(0).cpu(); ntv3_stats[5] += (y_ * y_).sum(0).cpu()
         if target is not None and model.training and model.last_jepa is not None:
             with torch.no_grad(), autocast:
                 _, want_core, _ = target(seq.to(dev), seg.to(dev), ctx.to(dev) if mito else None)
@@ -1180,6 +1272,9 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
             keep.append((tracks.float()[ok], want[ok]))
         return mlm, track
 
+    ntv3_losses: list[float] = []
+    ntv3_scale = (torch.from_numpy(ntv3["scales"]).to(dev) if ntv3 else None)
+    ntv3_stats = [0] + [torch.zeros(len(ntv3["ids"]), dtype=torch.float64) for _ in range(5)] if ntv3 else None
     jepa_losses: list[float] = []
     jepa_std: list[float] = []
     epi_keep: list = []
@@ -1265,6 +1360,23 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                         auroc, ap = G.ranking_scores(scores[:, j], y)
                         fh.write(f"{step},{name_},{auroc:.4f},{ap:.4f},{float(y.float().mean()):.6f}\n")
                 del keep, scores, truth
+            if ntv3 is not None and ntv3_stats[0] > 0:
+                n_, sx, sy, sxy, sxx, syy = ntv3_stats
+                cov = sxy / n_ - (sx / n_) * (sy / n_)
+                sd = ((sxx / n_ - (sx / n_) ** 2).clamp_min(0).sqrt()
+                      * (syy / n_ - (sy / n_) ** 2).clamp_min(0).sqrt())
+                r_ = torch.where(sd > 0, cov / sd.clamp_min(1e-12), torch.zeros_like(cov))
+                say(f"NTv3 tracks: Pearson(log1p) mean {float(r_.mean()):.4f} "
+                    f"(min {float(r_.min()):.3f}, max {float(r_.max()):.3f}, {len(r_)} tracks, {n_:,} held-out bases)"
+                    + (f", train MSE {np.mean(ntv3_losses):.4f}" if ntv3_losses else ""))
+                if main:
+                    with (out / "ntv3_tracks.csv").open("a") as fh:
+                        fh.write(f"{step},{float(r_.mean()):.5f},{float(r_.min()):.5f},{float(r_.max()):.5f},"
+                                 + ",".join(f"{v:.5f}" for v in r_.tolist()) + "\n")
+                ntv3_stats[0] = 0
+                for t_ in ntv3_stats[1:]:
+                    t_.zero_()
+                ntv3_losses.clear()
             if epi_keep:
                 sc = torch.cat([k[0] for k in epi_keep])
                 tr = torch.cat([k[1] for k in epi_keep])
