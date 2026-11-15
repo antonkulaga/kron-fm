@@ -967,12 +967,16 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                 f"partner: {orphans[:6]}{'...' if len(orphans) > 6 else ''}. Widen --ntv3-assays or drop --rc.")
         # One base-major [TOTAL, T] array makes a training window a single contiguous read; per-track files
         # cost 14 random 8 kB reads per window and measured 7.9 s/step against 0.7 s without tracks.
-        dense = None
+        dense = dense_cols = None
         if (nd / "dense.json").exists():
             dj = _json.load(open(nd / "dense.json"))
-            if dj["ids"] == ids:
+            if set(ids) <= set(dj["ids"]):          # dense may hold a superset: take the columns we want
                 dense = np.memmap(nd / "dense.u8", dtype=np.uint8, mode="r",
                                   shape=(int(dj["total_bases"]), int(dj["n_tracks"])))
+                where = {i: k for k, i in enumerate(dj["ids"])}
+                dense_cols = np.array([where[i] for i in ids])
+                if "nonzero_mean" in dj:            # keep the stats aligned with the chosen columns
+                    dj = dict(dj, nonzero_mean=[dj["nonzero_mean"][k] for k in dense_cols])
         if ntv3_target not in ("log1p", "alphagenome"):
             raise typer.BadParameter("--ntv3-target must be 'log1p' or 'alphagenome'")
         nzmean = None
@@ -980,7 +984,7 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
             if dense is None or "nonzero_mean" not in dj:
                 raise typer.BadParameter("--ntv3-target alphagenome needs dense.json with 'nonzero_mean'")
             nzmean = np.array(dj["nonzero_mean"], dtype=np.float32)
-        ntv3 = dict(ids=ids, swap=swap, dense=dense, nzmean=nzmean,
+        ntv3 = dict(ids=ids, swap=swap, dense=dense, cols=dense_cols, nzmean=nzmean,
                     is_rna=np.array(["RNA-seq" in t["assay"] for t in sel], dtype=bool),
                     arrs=None if dense is not None else
                          [np.memmap(nd / "tracks" / f"{i}.u8", dtype=np.uint8, mode="r") for i in ids],
@@ -1098,7 +1102,7 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                 sp_ = np.zeros(window, dtype=np.uint8)
                 if not from_mito:                                         # organelle windows have no nuclear tracks
                     if ntv3["dense"] is not None:
-                        nt[:take] = ntv3["dense"][at:at + take]
+                        nt[:take] = ntv3["dense"][at:at + take][:, ntv3["cols"]]
                     else:
                         for k_, arr_ in enumerate(ntv3["arrs"]):
                             nt[:take, k_] = arr_[at:at + take]
