@@ -469,6 +469,27 @@ def mask_bases(seq: torch.Tensor, prob: float = 0.15, generator: torch.Generator
     return inputs, labels
 
 
+def poisson_multinomial_loss(pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor, scale_weight: float = 0.2,
+                             eps: float = 1e-7) -> torch.Tensor:
+    """NTv3's (and Borzoi's, AlphaGenome's) track objective for non-negative ``pred`` and ``target`` ``[B, L, T]``
+    under a 0/1 ``mask`` broadcastable to them (the supervised positions and track channels): a Poisson term on each
+    (window, track)'s total over its supervised positions, divided by their number and averaged over the pairs that
+    have any, plus the multinomial cross-entropy of the profile within them, averaged over supervised values;
+    ``shape + scale_weight * scale`` (NTv3 Methods 4.3.6, where the weight is 0.2)."""
+    mask = mask.to(pred.dtype).expand_as(pred)
+    pred, target = pred * mask, target * mask
+    n_pos = mask.sum(1)                                                  # [B, T]
+    tot_p, tot_t = pred.sum(1), target.sum(1)
+    scale = (tot_p - tot_t * torch.log(tot_p + eps)) / (n_pos + eps)
+    has = n_pos > 0
+    scale = scale[has].mean() if bool(has.any()) else pred.sum() * 0
+    counts, want = pred + eps * mask, target + eps * mask
+    p = counts / (counts.sum(1, keepdim=True) + eps)
+    log_p = torch.log(torch.where(mask > 0, p, torch.ones_like(p)))     # 0 outside the mask, and no 0/0 gradient
+    shape = -(want * log_p).sum() / mask.sum().clamp_min(1)
+    return shape + scale_weight * scale
+
+
 def reverse_complement(codes: np.ndarray) -> np.ndarray:
     """Base codes (0..3 A, C, G, T; 4 N) of the other strand, read 5' to 3'."""
     out = codes[::-1].copy()

@@ -836,6 +836,24 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                                                  "NTv3's scaling (divide by the track's non-zero mean, x**0.75 for "
                                                  "RNA-seq, soft sqrt clip above 10), which the metric inverts before "
                                                  "scoring so the two are comparable"),
+                 ntv3_loss: str = typer.Option("mse", help="with --ntv3-dir: 'mse' on the transformed targets, or "
+                                               "'poisson': a Poisson term on each track's total plus the multinomial "
+                                               "cross-entropy of its profile, on a softplus output (NTv3's and Borzoi's "
+                                               "objective; needs --ntv3-target alphagenome and --ntv3-focus 1)"),
+                 ntv3_center: float = typer.Option(1.0, help="with --ntv3-dir: train the tracks only on this central "
+                                                   "fraction of each window, so every supervised base has context on "
+                                                   "both sides (NTv3: 0.375; 1.0: the whole window, as before)"),
+                 ntv3_extra: str = typer.Option("", help="with --ntv3-dir: prepared genomes of further species "
+                                                "(comma-separated names under data/interim/genome/, each with bases.u8, "
+                                                "contigs.parquet and ntv3/ laid out like the human one). Each adds its "
+                                                "own track channels, and a window from it trains only those"),
+                 ntv3_extra_share: float = typer.Option(0.5, help="with --ntv3-extra: share of training windows drawn "
+                                                        "from the further species (among them by the square root of "
+                                                        "their bases, so small genomes are not swamped or drowned)"),
+                 mlm_weight: float = typer.Option(1.0, help="weight of the masked-base loss in training. 0 makes a "
+                                                  "track stage: the training input is left unmasked and only the "
+                                                  "other heads train; held-out bits/base are still read on masked "
+                                                  "input, and the track scores on unmasked input"),
                  mito: str = typer.Option("", help="also train on this prepared organelle genome (genome-prepare-mito), "
                                           "each sequence tagged with its genetic code table as context (nuclear: 0)"),
                  mito_share: float = typer.Option(0.03, help="with --mito: share of training windows from it"),
@@ -887,6 +905,13 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
         raise typer.BadParameter("--whole-contigs does not take --curriculum, --rc, --mito, --bert-mask or --grad-accum")
     if any(w % unit for w, _ in phases):
         raise typer.BadParameter(f"curriculum windows must be multiples of {unit}")
+    if ntv3_extra and not ntv3_dir:
+        raise typer.BadParameter("--ntv3-extra needs --ntv3-dir (the human tracks come first)")
+    if mlm_weight < 0 or not 0.0 <= ntv3_extra_share < 1.0:
+        raise typer.BadParameter("--mlm-weight must be >= 0 and --ntv3-extra-share in [0, 1)")
+    if mlm_weight == 0 and (whole_contigs or jepa_weight > 0 or labels):
+        raise typer.BadParameter("--mlm-weight 0 (a track stage on unmasked input) does not take --whole-contigs, "
+                                 "--jepa-weight or --labels")
     if mito:
         mito_src = interim_dir("genome", mito)
         mito_bases = np.memmap(mito_src / "bases.u8", dtype=np.uint8, mode="r")
@@ -979,6 +1004,13 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                     dj = dict(dj, nonzero_mean=[dj["nonzero_mean"][k] for k in dense_cols])
         if ntv3_target not in ("log1p", "alphagenome"):
             raise typer.BadParameter("--ntv3-target must be 'log1p' or 'alphagenome'")
+        if ntv3_loss not in ("mse", "poisson"):
+            raise typer.BadParameter("--ntv3-loss must be 'mse' or 'poisson'")
+        if ntv3_loss == "poisson" and (ntv3_target != "alphagenome" or ntv3_focus != 1.0):
+            raise typer.BadParameter("--ntv3-loss poisson needs --ntv3-target alphagenome (non-negative targets) and "
+                                     "--ntv3-focus 1 (its mask is 0/1; positions are not re-weighted)")
+        if not 0.0 < ntv3_center <= 1.0:
+            raise typer.BadParameter("--ntv3-center must be in (0, 1]")
         nzmean = None
         if ntv3_target == "alphagenome":
             if dense is None or "nonzero_mean" not in dj:
@@ -990,11 +1022,59 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                          [np.memmap(nd / "tracks" / f"{i}.u8", dtype=np.uint8, mode="r") for i in ids],
                     split=np.memmap(nd / "split.u8", dtype=np.uint8, mode="r"),
                     scales=np.array([t["log1p_scale"] for t in sel], dtype=np.float32))
+        ntv3["n_h"] = len(ids)                                  # the human channels come first
+        ntv3["extra"] = []
+        for xname in [x.strip() for x in ntv3_extra.split(",") if x.strip()]:
+            xsrc = interim_dir("genome", xname)
+            xj = _json.load(open(xsrc / "ntv3" / "dense.json"))
+            if ntv3_target == "alphagenome" and "nonzero_mean" not in xj:
+                raise typer.BadParameter(f"{xsrc / 'ntv3' / 'dense.json'} has no 'nonzero_mean'")
+            xids = list(xj["ids"])
+            xat = {i_: k_ for k_, i_ in enumerate(xids)}
+            xswap = np.arange(len(xids))
+            for k_, i_ in enumerate(xids):
+                if i_.endswith(("_P", "_M")):
+                    other = i_[:-1] + ("M" if i_.endswith("_P") else "P")
+                    if other not in xat and rc:
+                        raise typer.BadParameter(f"--rc: stranded track {i_} of {xname} has no partner")
+                    xswap[k_] = xat.get(other, k_)
+            xt = pl.read_parquet(xsrc / "contigs.parquet").with_columns((pl.col("end") - pl.col("start")).alias("len"))
+            xsplit = np.memmap(xsrc / "ntv3" / "split.u8", dtype=np.uint8, mode="r")
+            # held-out test positions, for evals that land on them: every 1,024th base of the test split, with the
+            # contig each lies in (windows are placed inside one contig, as everywhere else)
+            tpos = np.flatnonzero(np.asarray(xsplit[::1024]) == 3).astype(np.int64) * 1024
+            x_off, x_len = xt["offset"].to_numpy(), xt["len"].to_numpy()
+            order = np.argsort(x_off)
+            x_off, x_len = x_off[order], x_len[order]
+            jx = np.searchsorted(x_off, tpos, side="right") - 1
+            inside = (jx >= 0) & (tpos < x_off[np.maximum(jx, 0)] + x_len[np.maximum(jx, 0)])
+            lo_ = len(ntv3["ids"])
+            ntv3["extra"].append(dict(
+                name=xname, lo=lo_, hi=lo_ + len(xids), table=xt, p=x_len[np.argsort(order)] / x_len.sum(),
+                bases=np.memmap(xsrc / "bases.u8", dtype=np.uint8, mode="r"), split=xsplit,
+                dense=np.memmap(xsrc / "ntv3" / "dense.u8", dtype=np.uint8, mode="r",
+                                shape=(int(xj["total_bases"]), int(xj["n_tracks"]))),
+                test_pos=tpos[inside], test_off=x_off[jx[inside]], test_len=x_len[jx[inside]],
+                train_bases=float(x_len.sum())))
+            ntv3["ids"] = ntv3["ids"] + [f"{xname}:{i_}" for i_ in xids]
+            ntv3["swap"] = np.concatenate([ntv3["swap"], lo_ + xswap])
+            ntv3["scales"] = np.concatenate([ntv3["scales"], np.array(xj["scales"], dtype=np.float32)])
+            ntv3["is_rna"] = np.concatenate([ntv3["is_rna"], np.array(["RNA-seq" in a for a in xj["assays"]])])
+            if ntv3["nzmean"] is not None:
+                ntv3["nzmean"] = np.concatenate([ntv3["nzmean"], np.array(xj["nonzero_mean"], dtype=np.float32)])
+        if ntv3["extra"]:
+            w_ = np.sqrt(np.array([e["train_bases"] for e in ntv3["extra"]]))
+            ntv3["extra_p"] = w_ / w_.sum()
+            say("NTv3 tracks, further species: " + ", ".join(
+                f"{e['name']} {e['hi'] - e['lo']} tracks (window share {ntv3_extra_share * p_:.3f}, "
+                f"{len(e['test_pos']):,} test anchors)" for e, p_ in zip(ntv3["extra"], ntv3["extra_p"]))
+                + f"; {len(ntv3['ids'])} channels in all")
         by_assay = {}
         for t in sel:
             by_assay[t["assay"]] = by_assay.get(t["assay"], 0) + 1
         say(f"NTv3 tracks: {len(ids)} selected ({by_assay}), {paired // 2} stranded pairs swapped under --rc, "
-            f"loss on split==1 only, target {ntv3_target}"
+            f"loss {ntv3_loss} on split==1 only" + (f", central {ntv3_center:g} of each window" if ntv3_center < 1 else "")
+            + f", target {ntv3_target}"
             + (", base-major layout" if dense is not None else ", per-track files"))
 
     def epi_targets(at: int, take: int, window: int, flip: bool) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -1044,8 +1124,8 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
             out += [torch.from_numpy(lab), torch.from_numpy(act), torch.from_numpy(np.arange(n) < r["len"])]
         return tuple(out)
 
-    def sample(table, window=window, batch=None, gen=None, flip=False, mito_table=None, share=0.0, annot=0.0
-               ) -> tuple[torch.Tensor, ...]:
+    def sample(table, window=window, batch=None, gen=None, flip=False, mito_table=None, share=0.0, annot=0.0,
+               extra=0.0, extra_force=None) -> tuple[torch.Tensor, ...]:
         """``batch`` windows: (seqs, segments, contexts[, labels, activity, valid]). With ``mito_table``, each row comes
         from it with probability ``share``; a circular genome is read across its origin when the window is shorter.
         Context 0 is nuclear; an organelle sequence's context is its genetic code table (1..33)."""
@@ -1054,10 +1134,29 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
         p = table["len"].to_numpy() / table["len"].sum()                 # contigs by length: every base equally
         seqs, segs, ctxs, labs, acts, valid = [], [], [], [], [], []
         epi_t, epi_v, epi_e = [], [], []
-        nt_t, nt_s = [], []
+        nt_t, nt_s, nt_c, nt_x = [], [], [], []
         for _ in range(batch):
             from_mito = mito_table is not None and gen.random() < share
-            if from_mito:
+            xs = None                                # a further species' index (--ntv3-extra), else None
+            if extra_force is not None:
+                xs = extra_force
+            elif not from_mito and extra > 0 and gen.random() < extra:
+                xs = int(gen.choice(len(ntv3["extra"]), p=ntv3["extra_p"]))
+            if xs is not None:
+                e_ = ntv3["extra"][xs]
+                if extra_force is not None and len(e_["test_pos"]):       # an eval window around a test position
+                    k = int(gen.integers(0, len(e_["test_pos"])))
+                    c_off, c_len = int(e_["test_off"][k]), int(e_["test_len"][k])
+                    take = min(window, c_len)
+                    at = min(max(c_off, int(e_["test_pos"][k]) - take // 2), c_off + c_len - take)
+                else:
+                    r = e_["table"].row(int(gen.choice(e_["table"].height, p=e_["p"])), named=True)
+                    take = min(window, r["len"])
+                    at = r["offset"] + int(gen.integers(0, r["len"] - take + 1))
+                codes = np.full(window, 4, dtype=np.int64)
+                codes[:take] = e_["bases"][at:at + take]
+                ctxs.append(0)                                            # nuclear (context 0)
+            elif from_mito:
                 r = mito_table.row(int(gen.integers(0, mito_table.height)), named=True)   # each genome alike
                 take = min(window, r["len"])
                 if r["circular"]:                                         # read across the origin
@@ -1088,7 +1187,7 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
             if flip_row:
                 codes[:take] = G.reverse_complement(codes[:take].astype(np.uint8))
             if epigenome_weight > 0:
-                if from_mito:
+                if from_mito or xs is not None:                           # no human Regulatory Build there
                     epi_t.append(np.zeros((window // epi_unit, n_epi), dtype=bool))
                     epi_v.append(np.zeros(window // epi_unit, dtype=bool))
                     epi_e.append(np.zeros(window // epi_unit, dtype=bool))
@@ -1100,34 +1199,44 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
             if ntv3 is not None:
                 nt = np.zeros((window, len(ntv3["ids"])), dtype=np.uint8)
                 sp_ = np.zeros(window, dtype=np.uint8)
-                if not from_mito:                                         # organelle windows have no nuclear tracks
+                cm_ = np.zeros(len(ntv3["ids"]), dtype=bool)              # the channels this window can train
+                if xs is not None:
+                    nt[:take, e_["lo"]:e_["hi"]] = e_["dense"][at:at + take]
+                    sp_[:take] = e_["split"][at:at + take]
+                    cm_[e_["lo"]:e_["hi"]] = True
+                elif not from_mito:                                       # organelle windows have no nuclear tracks
+                    n_h = ntv3["n_h"]
                     if ntv3["dense"] is not None:
-                        nt[:take] = ntv3["dense"][at:at + take][:, ntv3["cols"]]
+                        nt[:take, :n_h] = ntv3["dense"][at:at + take][:, ntv3["cols"]]
                     else:
                         for k_, arr_ in enumerate(ntv3["arrs"]):
                             nt[:take, k_] = arr_[at:at + take]
                     sp_[:take] = ntv3["split"][at:at + take]
-                    if flip_row:                                          # reverse AND swap the strand partners
-                        nt[:take] = nt[:take][::-1][:, ntv3["swap"]]
-                        sp_[:take] = sp_[:take][::-1]
+                    cm_[:n_h] = True
+                if flip_row and (xs is not None or not from_mito):        # reverse AND swap the strand partners
+                    nt[:take] = nt[:take][::-1][:, ntv3["swap"]]
+                    sp_[:take] = sp_[:take][::-1]
                 nt_t.append(nt)
                 nt_s.append(sp_)
+                nt_c.append(cm_)
+                nt_x.append(-1 if xs is None else xs)
             seg = np.zeros(window // unit, dtype=np.int64)
             seg[(take + unit - 1) // unit:] = 1                           # padding is its own segment
             seqs.append(codes)
             segs.append(seg)
             if labels:
                 lab, act = np.zeros(window, dtype=np.uint8), np.zeros(window, dtype=np.uint8)
-                if not from_mito:
+                if not from_mito and xs is None:
                     lab[:take], act[:take] = lab_mm[at:at + take], act_mm[at:at + take]
                     if flip_row:                                          # the current tracks are not strand-specific
                         lab[:take], act[:take] = lab[:take][::-1].copy(), act[:take][::-1].copy()
                 labs.append(lab)
                 acts.append(act)
-                valid.append((np.arange(window) < take) & (not from_mito))
+                valid.append((np.arange(window) < take) & (not from_mito) & (xs is None))
         epi_batch[:] = [(torch.from_numpy(np.stack(epi_t)), torch.from_numpy(np.stack(epi_v)),
                          torch.from_numpy(np.stack(epi_e)))] if epi_t else []
-        ntv3_batch[:] = [(torch.from_numpy(np.stack(nt_t)), torch.from_numpy(np.stack(nt_s)))] if nt_t else []
+        ntv3_batch[:] = [(torch.from_numpy(np.stack(nt_t)), torch.from_numpy(np.stack(nt_s)),
+                          torch.from_numpy(np.stack(nt_c)), nt_x)] if nt_t else []
         out = [torch.from_numpy(np.stack(seqs)), torch.from_numpy(np.stack(segs)), torch.tensor(ctxs)]
         if labels:
             out += [torch.from_numpy(np.stack(x)) for x in (labs, acts, valid)]
@@ -1215,13 +1324,22 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
         return mlm / max(count, 1), (track if lab is not None else None)
 
     def loss_on(seq, seg, ctx, lab=None, act=None, valid=None, keep=None, mask_gen=None,
-                track_only=False):
-        # held-out masks are always plain MASK (bert only in training), so runs with and without it compare
-        inputs, targets = G.mask_bases(seq.to(dev), mask_prob, generator=mask_gen, bert=bert_mask and model.training)
+                track_only=False, clean=False, score_ntv3=True):
+        clean = clean or (mlm_weight == 0 and model.training)        # a track stage reads the sequence unmasked
+        if clean:
+            inputs, targets = seq.to(dev), None
+        else:   # held-out masks are always plain MASK (bert only in training), so runs with and without it compare
+            inputs, targets = G.mask_bases(seq.to(dev), mask_prob, generator=mask_gen,
+                                           bert=bert_mask and model.training)
         with autocast:
             logits, ctx_core, tracks = (train_model if model.training else model)(inputs, seg.to(dev),
                                                                                    ctx.to(dev) if mito else None)
-        mlm = F.cross_entropy(logits.float().reshape(-1, 4), targets.reshape(-1), ignore_index=-100)
+        if clean:
+            mlm = logits.float().sum() * 0.0                             # no masked base to score
+        else:
+            mlm = F.cross_entropy(logits.float().reshape(-1, 4), targets.reshape(-1), ignore_index=-100)
+            if model.training and mlm_weight != 1.0:
+                mlm = mlm * mlm_weight
         if chunk_ratio and model.training and model.last_ratio_loss is not None:
             mlm = mlm + ratio_weight * model.last_ratio_loss
             chunk_rates.append(model.last_chunks)
@@ -1238,34 +1356,51 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
             elif not track_only:
                 epi_keep.append((model.last_epi.float()[ok_e].cpu(), want_e[ok_e].cpu()))
         if ntv3 is not None and model.last_ntv3 is not None and ntv3_batch:
-            want_n, sp_n = (x.to(dev) for x in ntv3_batch[0])             # [B,L,T] uint8, [B,L] split code
+            want_n, sp_n, col_n = (x.to(dev) for x in ntv3_batch[0][:3])  # [B,L,T] uint8, [B,L] split, [B,T] bool
+            spc_n = ntv3_batch[0][3]                                      # per row: -1 human, else the species index
             # split.u8: 1 NTv3 train, 2 NTv3 val, 3 NTv3 test, 4 chr8/chr9 (KronGenome's held-out chromosomes)
             log1p_t = want_n.float() / 255.0 * ntv3_scale                 # the units the metric is defined in
             pred = model.last_ntv3.float()
+            if ntv3_loss == "poisson":
+                pred = F.softplus(pred)                                   # a non-negative rate, as the loss assumes
             tgt = log1p_t if ntv3_nz is None else ntv3_ag(torch.expm1(log1p_t))
             if model.training:                                            # NTv3's own train regions only, which is
                 ok_n = (sp_n == 1).float()                                # also what keeps chr8/chr9 out
+                if ntv3_center < 1.0:                                     # supervise the middle of the window only
+                    edge = int(round(ok_n.shape[1] * (1 - ntv3_center) / 2))
+                    if edge:
+                        ok_n[:, :edge] = 0
+                        ok_n[:, -edge:] = 0
                 if ntv3_focus < 1.0:                                      # all-zero positions are most of the genome
                     sig = (want_n > 0).any(-1).float()
                     ok_n = ok_n * (sig + (1 - sig) * ntv3_focus)
-                loss_n = ((pred - tgt).pow(2).mean(-1) * ok_n).sum() / ok_n.sum().clamp_min(1)
+                if ntv3_loss == "poisson":
+                    loss_n = G.poisson_multinomial_loss(pred, tgt, ok_n.unsqueeze(-1) * col_n.unsqueeze(1).float())
+                elif ntv3["extra"]:                                       # each window: its own species' channels
+                    sq = (pred - tgt).pow(2) * col_n.unsqueeze(1).float()
+                    per_pos = sq.sum(-1) / col_n.float().sum(-1, keepdim=True).clamp_min(1)
+                    loss_n = (per_pos * ok_n).sum() / ok_n.sum().clamp_min(1)
+                else:
+                    loss_n = ((pred - tgt).pow(2).mean(-1) * ok_n).sum() / ok_n.sum().clamp_min(1)
                 mlm = mlm + ntv3_weight * loss_n
                 ntv3_losses.append(float(loss_n.detach()))
-            else:
+            elif score_ntv3:
                 # score in log1p units whatever the head was trained in, so arms stay comparable and the number
                 # means the same thing the paper's does. 4 = chr8/chr9 (never seen at all), 3 = NTv3's own test
                 # split (on chromosomes the masked-LM trains on, as it is for NTv3 itself).
                 p_log = pred if ntv3_nz is None else torch.log1p(ntv3_ag_inv(pred).clamp_min(0))
                 for code_ in (3, 4):
-                    m_ = sp_n == code_
-                    if not m_.any():
-                        continue
-                    st_ = ntv3_stats[code_]
-                    x_, y_ = p_log[m_].double(), log1p_t[m_].double()
-                    st_[0] += x_.shape[0]
-                    st_[1] += x_.sum(0).cpu(); st_[2] += y_.sum(0).cpu()
-                    st_[3] += (x_ * y_).sum(0).cpu()
-                    st_[4] += (x_ * x_).sum(0).cpu(); st_[5] += (y_ * y_).sum(0).cpu()
+                    for b_ in range(sp_n.shape[0]):
+                        m_ = sp_n[b_] == code_
+                        st_ = ntv3_stats.get((code_, spc_n[b_]))
+                        if st_ is None or not m_.any():
+                            continue
+                        cols_ = col_n[b_]
+                        x_, y_ = p_log[b_][m_][:, cols_].double(), log1p_t[b_][m_][:, cols_].double()
+                        st_[0] += x_.shape[0]
+                        st_[1] += x_.sum(0).cpu(); st_[2] += y_.sum(0).cpu()
+                        st_[3] += (x_ * y_).sum(0).cpu()
+                        st_[4] += (x_ * x_).sum(0).cpu(); st_[5] += (y_ * y_).sum(0).cpu()
         if target is not None and model.training and model.last_jepa is not None:
             with torch.no_grad(), autocast:
                 _, want_core, _ = target(seq.to(dev), seg.to(dev), ctx.to(dev) if mito else None)
@@ -1310,8 +1445,11 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
         ntv3_rna = torch.from_numpy(ntv3["is_rna"]).to(dev)
         if ntv3["nzmean"] is not None:
             ntv3_nz = torch.from_numpy(ntv3["nzmean"]).to(dev)
-        ntv3_stats = {k: [0] + [torch.zeros(len(ntv3["ids"]), dtype=torch.float64) for _ in range(5)]
-                      for k in (3, 4)}
+        # running sums for Pearson per (split code, species): -1 is human (codes 3 and 4), then each further
+        # species' test split, each over its own channels
+        ntv3_stats = {(k, -1): [0] + [torch.zeros(ntv3["n_h"], dtype=torch.float64) for _ in range(5)] for k in (3, 4)}
+        for x_i, e_x in enumerate(ntv3["extra"]):
+            ntv3_stats[(3, x_i)] = [0] + [torch.zeros(e_x["hi"] - e_x["lo"], dtype=torch.float64) for _ in range(5)]
 
     def ntv3_ag(raw):
         """AlphaGenome/NTv3 scaling: /non-zero mean, **0.75 for RNA-seq, soft sqrt clip above 10."""
@@ -1350,7 +1488,8 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
             else:
                 loss, track = loss_on(*sample(train_idx, window=win, batch=bat, flip=rc,
                                               mito_table=mito_train if mito else None, share=mito_share,
-                                              annot=annot_oversample))
+                                              annot=annot_oversample,
+                                              extra=ntv3_extra_share if ntv3 and ntv3["extra"] else 0.0))
             ((loss + track_weight * track if track is not None else loss) / grad_accum).backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         opt.step()
@@ -1387,12 +1526,25 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                          if whole_contigs else
                          [loss_on(*sample(val_idx, window=eval_window, batch=1 if arch in ("v2", "v3") else batch_size,
                                           gen=eval_rng),
-                                  keep=keep if labels else None, mask_gen=mask_gen) for _ in range(8)])
+                                  keep=keep if labels else None, mask_gen=mask_gen,
+                                  score_ntv3=mlm_weight != 0) for _ in range(8)])
                 if ntv3 is not None and not whole_contigs:   # NTv3's test split lies on chromosomes the
                     for _ in range(24):                          # masked-LM trains on, so draw from there too;
                         # only ~1.6% of a random training window is split==3, so draw enough to cover regions
                         loss_on(*sample(train_idx, window=eval_window, batch=1, gen=eval_rng),
-                                mask_gen=mask_gen, track_only=True)   # scored only via the split==3 accumulator
+                                mask_gen=mask_gen, track_only=True,   # scored only via the split==3 accumulator
+                                clean=mlm_weight == 0)
+                    if mlm_weight == 0:      # a track stage is scored as it trains, on unmasked input: the same
+                        again = np.random.default_rng([seed, step])   # eight held-out windows once more, unmasked
+                        for _ in range(8):
+                            loss_on(*sample(val_idx, window=eval_window, batch=1, gen=again), track_only=True,
+                                    clean=True)
+                    x_rng = np.random.default_rng([seed, step, 7])    # its own stream: the paired draws above and
+                    x_gen = torch.Generator(device=dev).manual_seed(seed * 1_000_003 + step + 7)   # below stay put
+                    for x_i in range(len(ntv3["extra"])):             # each further species: windows on its test split
+                        for _ in range(8):
+                            loss_on(*sample(train_idx, window=min(eval_window, 262144), batch=1, gen=x_rng,
+                                            extra_force=x_i), mask_gen=x_gen, track_only=True, clean=mlm_weight == 0)
                 mito_bits = None
                 if mito:
                     mw = -(-int(mito_val["len"].max()) // max(unit, 128)) * max(unit, 128)
@@ -1415,24 +1567,31 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                         fh.write(f"{step},{name_},{auroc:.4f},{ap:.4f},{float(y.float().mean()):.6f}\n")
                 del keep, scores, truth
             if ntv3 is not None:
-                names = {3: "NTv3 test split", 4: "chr8/chr9 (never trained on)"}
+                names = {(3, -1): "NTv3 test split", (4, -1): "chr8/chr9 (never trained on)"}
+                for x_i, e_x in enumerate(ntv3["extra"]):
+                    names[(3, x_i)] = f"{e_x['name']} test split"
+                how = "unmasked input" if mlm_weight == 0 else "masked input"
                 cols = []
-                for code_ in (3, 4):
-                    n_, sx, sy, sxy, sxx, syy = ntv3_stats[code_]
+                for key_ in names:
+                    n_, sx, sy, sxy, sxx, syy = ntv3_stats[key_]
                     if n_ == 0:
                         continue
                     cov = sxy / n_ - (sx / n_) * (sy / n_)
                     sd = ((sxx / n_ - (sx / n_) ** 2).clamp_min(0).sqrt()
                           * (syy / n_ - (sy / n_) ** 2).clamp_min(0).sqrt())
                     r_ = torch.where(sd > 0, cov / sd.clamp_min(1e-12), torch.zeros_like(cov))
-                    say(f"NTv3 tracks [{names[code_]}]: Pearson(log1p) mean {float(r_.mean()):.4f} "
-                        f"(min {float(r_.min()):.3f}, max {float(r_.max()):.3f}, {len(r_)} tracks, {n_:,} bases)")
-                    cols.append((code_, r_))
-                    ntv3_stats[code_][0] = 0
-                    for t_ in ntv3_stats[code_][1:]:
+                    say(f"NTv3 tracks [{names[key_]}]: Pearson(log1p) mean {float(r_.mean()):.4f} "
+                        f"(min {float(r_.min()):.3f}, max {float(r_.max()):.3f}, {len(r_)} tracks, {n_:,} bases, {how})")
+                    cols.append((str(key_[0]) if key_[1] < 0 else f"3:{ntv3['extra'][key_[1]]['name']}", r_))
+                    ntv3_stats[key_][0] = 0
+                    for t_ in ntv3_stats[key_][1:]:
                         t_.zero_()
+                if ntv3["extra"] and len(cols) > 2:
+                    say(f"NTv3 tracks [further species]: mean of {len(cols) - 2} species means "
+                        f"{float(np.mean([float(r_.mean()) for _, r_ in cols[2:]])):.4f}")
                 if ntv3_losses:
-                    say(f"NTv3 tracks: train MSE {np.mean(ntv3_losses):.4f} ({ntv3_target} units)")
+                    say(f"NTv3 tracks: train {'MSE' if ntv3_loss == 'mse' else 'Poisson-multinomial'} "
+                        f"{np.mean(ntv3_losses):.4f} ({ntv3_target} units)")
                 if main and cols:
                     with (out / "ntv3_tracks.csv").open("a") as fh:
                         for code_, r_ in cols:
@@ -1464,7 +1623,10 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
             jepa_std.clear()
             chunk_rates.clear()
             _save_atomic({"model": model.state_dict(), "optimizer": opt.state_dict(), "config": config.to_dict(),
-                          "step": step, "hours": h}, ckpt)
+                          "step": step, "hours": h,
+                          **({"ntv3": {"ids": list(ntv3["ids"]), "loss": ntv3_loss, "target": ntv3_target,
+                                       "center": ntv3_center, "extra": [e_x["name"] for e_x in ntv3["extra"]],
+                                       "mlm_weight": mlm_weight}} if ntv3 else {})}, ckpt)
             if world > 1:
                 dist.barrier()
         if out_of_time:

@@ -242,3 +242,44 @@ CONTIG      join(x)
     assert a["circular"] and a["transl_table"] == 2 and a["sequence"] == "ACGTACGTACGTACGTACGT"
     assert "Primates" in a["lineage"] and a["organism"] == "Homo sapiens"
     assert not b["circular"] and b["sequence"] == "" and b["transl_table"] == 1
+
+
+def test_poisson_multinomial_loss_matches_reference_and_respects_mask():
+    """Against a direct transcription of NTv3's pseudocode (Methods 4.3.6), and: values outside the mask do not
+    matter, a channel with no supervised position adds nothing, and the profile term is lowest at the truth."""
+    import numpy as np
+    torch.manual_seed(0)
+    b, length, t = 3, 64, 5
+    pred = torch.rand(b, length, t) * 3 + 0.01
+    target = torch.rand(b, length, t) * 2
+    target[:, :, 1] = 0                                             # an all-zero track
+    mask = (torch.rand(b, length, 1) < 0.6).float() * torch.ones(1, 1, t)
+    mask[0, :, 2] = 0                                               # a (window, track) pair with nothing supervised
+    mask[2] = 0                                                     # a window with nothing supervised at all
+
+    def reference(y_hat, y, m, eps=1e-7):
+        y_hat, y, m = (x.double().numpy() for x in (y_hat, y, m))
+        y_hat, y = y_hat * m, y * m
+        n_pos = m.sum(1)
+        tot_p, tot_t = y_hat.sum(1), y.sum(1)
+        scale = (tot_p - tot_t * np.log(tot_p + eps)) / (n_pos + eps)
+        scale = scale[n_pos > 0].mean()
+        counts, want = y_hat + eps * m, y + eps * m
+        p = counts / (counts.sum(1, keepdims=True) + eps)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            term = np.where(m > 0, -want * np.log(p), 0.0)
+        return term.sum() / m.sum() + scale / 5.0
+
+    got = float(G.poisson_multinomial_loss(pred, target, mask))
+    assert got == pytest.approx(reference(pred, target, mask), rel=1e-4)
+    junk = torch.where(mask > 0, pred, torch.full_like(pred, 1e3))  # anything outside the mask is ignored
+    assert float(G.poisson_multinomial_loss(junk, target, mask)) == pytest.approx(got, rel=1e-5)
+    position_mask = mask[:, :, :1].clone()                         # a [B, L, 1] mask broadcasts over tracks
+    assert float(G.poisson_multinomial_loss(pred, target, position_mask)) == pytest.approx(
+        reference(pred, target, position_mask.expand_as(pred)), rel=1e-4)
+    at_truth = float(G.poisson_multinomial_loss(target + 1e-3, target, mask))
+    assert at_truth < got                                           # the truth scores better than a random profile
+    assert float(G.poisson_multinomial_loss(pred, target, torch.zeros_like(mask))) == 0.0
+    pred.requires_grad_(True)
+    G.poisson_multinomial_loss(pred, target, mask).backward()
+    assert torch.isfinite(pred.grad).all() and float(pred.grad[2].abs().sum()) == 0.0
