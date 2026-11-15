@@ -831,6 +831,11 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                                                  "eCLIP are ~0.1%% non-zero, so they are left out by default"),
                  ntv3_focus: float = typer.Option(1.0, help="with --ntv3-dir: weight of positions where every selected "
                                                   "track reads zero (1.0: all positions alike, as for --epigenome-focus)"),
+                 ntv3_target: str = typer.Option("log1p", help="with --ntv3-dir: the units the track head is trained in. "
+                                                 "'log1p' is the metric's own units; 'alphagenome' is AlphaGenome's and "
+                                                 "NTv3's scaling (divide by the track's non-zero mean, x**0.75 for "
+                                                 "RNA-seq, soft sqrt clip above 10), which the metric inverts before "
+                                                 "scoring so the two are comparable"),
                  mito: str = typer.Option("", help="also train on this prepared organelle genome (genome-prepare-mito), "
                                           "each sequence tagged with its genetic code table as context (nuclear: 0)"),
                  mito_share: float = typer.Option(0.03, help="with --mito: share of training windows from it"),
@@ -968,7 +973,15 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
             if dj["ids"] == ids:
                 dense = np.memmap(nd / "dense.u8", dtype=np.uint8, mode="r",
                                   shape=(int(dj["total_bases"]), int(dj["n_tracks"])))
-        ntv3 = dict(ids=ids, swap=swap, dense=dense,
+        if ntv3_target not in ("log1p", "alphagenome"):
+            raise typer.BadParameter("--ntv3-target must be 'log1p' or 'alphagenome'")
+        nzmean = None
+        if ntv3_target == "alphagenome":
+            if dense is None or "nonzero_mean" not in dj:
+                raise typer.BadParameter("--ntv3-target alphagenome needs dense.json with 'nonzero_mean'")
+            nzmean = np.array(dj["nonzero_mean"], dtype=np.float32)
+        ntv3 = dict(ids=ids, swap=swap, dense=dense, nzmean=nzmean,
+                    is_rna=np.array(["RNA-seq" in t["assay"] for t in sel], dtype=bool),
                     arrs=None if dense is not None else
                          [np.memmap(nd / "tracks" / f"{i}.u8", dtype=np.uint8, mode="r") for i in ids],
                     split=np.memmap(nd / "split.u8", dtype=np.uint8, mode="r"),
@@ -977,7 +990,8 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
         for t in sel:
             by_assay[t["assay"]] = by_assay.get(t["assay"], 0) + 1
         say(f"NTv3 tracks: {len(ids)} selected ({by_assay}), {paired // 2} stranded pairs swapped under --rc, "
-            f"loss on split==1 only" + (", base-major layout" if dense is not None else ", per-track files"))
+            f"loss on split==1 only, target {ntv3_target}"
+            + (", base-major layout" if dense is not None else ", per-track files"))
 
     def epi_targets(at: int, take: int, window: int, flip: bool) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """``[bins, E]`` bool: an epigenome is active in a 128-bp bin when an element active there covers a base of
@@ -1196,7 +1210,8 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                     keep.append((tracks.float()[0][ok], want[ok]))
         return mlm / max(count, 1), (track if lab is not None else None)
 
-    def loss_on(seq, seg, ctx, lab=None, act=None, valid=None, keep=None, mask_gen=None):
+    def loss_on(seq, seg, ctx, lab=None, act=None, valid=None, keep=None, mask_gen=None,
+                track_only=False):
         # held-out masks are always plain MASK (bert only in training), so runs with and without it compare
         inputs, targets = G.mask_bases(seq.to(dev), mask_prob, generator=mask_gen, bert=bert_mask and model.training)
         with autocast:
@@ -1216,13 +1231,14 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
             loss_e = (per_e * w_e.unsqueeze(-1)).sum() / (w_e.sum().clamp_min(1) * per_e.shape[-1])
             if model.training:
                 mlm = mlm + epigenome_weight * loss_e
-            else:
+            elif not track_only:
                 epi_keep.append((model.last_epi.float()[ok_e].cpu(), want_e[ok_e].cpu()))
         if ntv3 is not None and model.last_ntv3 is not None and ntv3_batch:
             want_n, sp_n = (x.to(dev) for x in ntv3_batch[0])             # [B,L,T] uint8, [B,L] split code
             # split.u8: 1 NTv3 train, 2 NTv3 val, 3 NTv3 test, 4 chr8/chr9 (KronGenome's held-out chromosomes)
-            tgt = want_n.float() / 255.0 * ntv3_scale                     # back into log1p units
+            log1p_t = want_n.float() / 255.0 * ntv3_scale                 # the units the metric is defined in
             pred = model.last_ntv3.float()
+            tgt = log1p_t if ntv3_nz is None else ntv3_ag(torch.expm1(log1p_t))
             if model.training:                                            # NTv3's own train regions only, which is
                 ok_n = (sp_n == 1).float()                                # also what keeps chr8/chr9 out
                 if ntv3_focus < 1.0:                                      # all-zero positions are most of the genome
@@ -1231,15 +1247,21 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                 loss_n = ((pred - tgt).pow(2).mean(-1) * ok_n).sum() / ok_n.sum().clamp_min(1)
                 mlm = mlm + ntv3_weight * loss_n
                 ntv3_losses.append(float(loss_n.detach()))
-            else:                                                         # Pearson on NTv3's test regions, running
-                m_ = sp_n == 4                                            # 4 = chr8/chr9, held out for KronGenome
-
-                if m_.any():
-                    x_, y_ = pred[m_].double(), tgt[m_].double()
-                    ntv3_stats[0] += x_.shape[0]
-                    ntv3_stats[1] += x_.sum(0).cpu(); ntv3_stats[2] += y_.sum(0).cpu()
-                    ntv3_stats[3] += (x_ * y_).sum(0).cpu()
-                    ntv3_stats[4] += (x_ * x_).sum(0).cpu(); ntv3_stats[5] += (y_ * y_).sum(0).cpu()
+            else:
+                # score in log1p units whatever the head was trained in, so arms stay comparable and the number
+                # means the same thing the paper's does. 4 = chr8/chr9 (never seen at all), 3 = NTv3's own test
+                # split (on chromosomes the masked-LM trains on, as it is for NTv3 itself).
+                p_log = pred if ntv3_nz is None else torch.log1p(ntv3_ag_inv(pred).clamp_min(0))
+                for code_ in (3, 4):
+                    m_ = sp_n == code_
+                    if not m_.any():
+                        continue
+                    st_ = ntv3_stats[code_]
+                    x_, y_ = p_log[m_].double(), log1p_t[m_].double()
+                    st_[0] += x_.shape[0]
+                    st_[1] += x_.sum(0).cpu(); st_[2] += y_.sum(0).cpu()
+                    st_[3] += (x_ * y_).sum(0).cpu()
+                    st_[4] += (x_ * x_).sum(0).cpu(); st_[5] += (y_ * y_).sum(0).cpu()
         if target is not None and model.training and model.last_jepa is not None:
             with torch.no_grad(), autocast:
                 _, want_core, _ = target(seq.to(dev), seg.to(dev), ctx.to(dev) if mito else None)
@@ -1277,8 +1299,27 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
         return mlm, track
 
     ntv3_losses: list[float] = []
-    ntv3_scale = (torch.from_numpy(ntv3["scales"]).to(dev) if ntv3 else None)
-    ntv3_stats = [0] + [torch.zeros(len(ntv3["ids"]), dtype=torch.float64) for _ in range(5)] if ntv3 else None
+    ntv3_scale = ntv3_nz = ntv3_rna = None
+    ntv3_stats = None
+    if ntv3:
+        ntv3_scale = torch.from_numpy(ntv3["scales"]).to(dev)
+        ntv3_rna = torch.from_numpy(ntv3["is_rna"]).to(dev)
+        if ntv3["nzmean"] is not None:
+            ntv3_nz = torch.from_numpy(ntv3["nzmean"]).to(dev)
+        ntv3_stats = {k: [0] + [torch.zeros(len(ntv3["ids"]), dtype=torch.float64) for _ in range(5)]
+                      for k in (3, 4)}
+
+    def ntv3_ag(raw):
+        """AlphaGenome/NTv3 scaling: /non-zero mean, **0.75 for RNA-seq, soft sqrt clip above 10."""
+        x = raw.clamp_min(0) / ntv3_nz
+        x = torch.where(ntv3_rna, x.clamp_min(1e-12).pow(0.75), x)
+        return torch.where(x > 10, 2 * torch.sqrt(10 * x) - 10, x)
+
+    def ntv3_ag_inv(y):
+        x = torch.where(y > 10, ((y + 10) / 2).pow(2) / 10, y)
+        x = torch.where(ntv3_rna, x.clamp_min(0).pow(1 / 0.75), x)
+        return x * ntv3_nz
+
     jepa_losses: list[float] = []
     jepa_std: list[float] = []
     epi_keep: list = []
@@ -1343,6 +1384,11 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                          [loss_on(*sample(val_idx, window=eval_window, batch=1 if arch in ("v2", "v3") else batch_size,
                                           gen=eval_rng),
                                   keep=keep if labels else None, mask_gen=mask_gen) for _ in range(8)])
+                if ntv3 is not None and not whole_contigs:   # NTv3's test split lies on chromosomes the
+                    for _ in range(24):                          # masked-LM trains on, so draw from there too;
+                        # only ~1.6% of a random training window is split==3, so draw enough to cover regions
+                        loss_on(*sample(train_idx, window=eval_window, batch=1, gen=eval_rng),
+                                mask_gen=mask_gen, track_only=True)   # scored only via the split==3 accumulator
                 mito_bits = None
                 if mito:
                     mw = -(-int(mito_val["len"].max()) // max(unit, 128)) * max(unit, 128)
@@ -1364,22 +1410,30 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                         auroc, ap = G.ranking_scores(scores[:, j], y)
                         fh.write(f"{step},{name_},{auroc:.4f},{ap:.4f},{float(y.float().mean()):.6f}\n")
                 del keep, scores, truth
-            if ntv3 is not None and ntv3_stats[0] > 0:
-                n_, sx, sy, sxy, sxx, syy = ntv3_stats
-                cov = sxy / n_ - (sx / n_) * (sy / n_)
-                sd = ((sxx / n_ - (sx / n_) ** 2).clamp_min(0).sqrt()
-                      * (syy / n_ - (sy / n_) ** 2).clamp_min(0).sqrt())
-                r_ = torch.where(sd > 0, cov / sd.clamp_min(1e-12), torch.zeros_like(cov))
-                say(f"NTv3 tracks: Pearson(log1p) mean {float(r_.mean()):.4f} "
-                    f"(min {float(r_.min()):.3f}, max {float(r_.max()):.3f}, {len(r_)} tracks, {n_:,} held-out bases)"
-                    + (f", train MSE {np.mean(ntv3_losses):.4f}" if ntv3_losses else ""))
-                if main:
+            if ntv3 is not None:
+                names = {3: "NTv3 test split", 4: "chr8/chr9 (never trained on)"}
+                cols = []
+                for code_ in (3, 4):
+                    n_, sx, sy, sxy, sxx, syy = ntv3_stats[code_]
+                    if n_ == 0:
+                        continue
+                    cov = sxy / n_ - (sx / n_) * (sy / n_)
+                    sd = ((sxx / n_ - (sx / n_) ** 2).clamp_min(0).sqrt()
+                          * (syy / n_ - (sy / n_) ** 2).clamp_min(0).sqrt())
+                    r_ = torch.where(sd > 0, cov / sd.clamp_min(1e-12), torch.zeros_like(cov))
+                    say(f"NTv3 tracks [{names[code_]}]: Pearson(log1p) mean {float(r_.mean()):.4f} "
+                        f"(min {float(r_.min()):.3f}, max {float(r_.max()):.3f}, {len(r_)} tracks, {n_:,} bases)")
+                    cols.append((code_, r_))
+                    ntv3_stats[code_][0] = 0
+                    for t_ in ntv3_stats[code_][1:]:
+                        t_.zero_()
+                if ntv3_losses:
+                    say(f"NTv3 tracks: train MSE {np.mean(ntv3_losses):.4f} ({ntv3_target} units)")
+                if main and cols:
                     with (out / "ntv3_tracks.csv").open("a") as fh:
-                        fh.write(f"{step},{float(r_.mean()):.5f},{float(r_.min()):.5f},{float(r_.max()):.5f},"
-                                 + ",".join(f"{v:.5f}" for v in r_.tolist()) + "\n")
-                ntv3_stats[0] = 0
-                for t_ in ntv3_stats[1:]:
-                    t_.zero_()
+                        for code_, r_ in cols:
+                            fh.write(f"{step},{code_},{float(r_.mean()):.5f},{float(r_.min()):.5f},"
+                                     f"{float(r_.max()):.5f}," + ",".join(f"{v:.5f}" for v in r_.tolist()) + "\n")
                 ntv3_losses.clear()
             if epi_keep:
                 sc = torch.cat([k[0] for k in epi_keep])
