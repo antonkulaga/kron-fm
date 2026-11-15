@@ -954,8 +954,12 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                 if other in at_pos:
                     swap[k] = at_pos[other]
         paired = int((swap != np.arange(len(ids))).sum())
-        if rc and paired == 0 and any(i.endswith(("_P", "_M")) for i in ids):
-            raise typer.BadParameter("--rc with stranded NTv3 tracks whose _P/_M partners are not both selected")
+        orphans = [i for i in ids if i.endswith(("_P", "_M"))
+                   and (i[:-1] + ("M" if i.endswith("_P") else "P")) not in at_pos]
+        if rc and orphans:      # reversing a stranded track without its partner puts minus signal on the plus strand
+            raise typer.BadParameter(
+                f"--rc needs both strands of every stranded NTv3 track, but {len(orphans)} have no selected "
+                f"partner: {orphans[:6]}{'...' if len(orphans) > 6 else ''}. Widen --ntv3-assays or drop --rc.")
         # One base-major [TOTAL, T] array makes a training window a single contiguous read; per-track files
         # cost 14 random 8 kB reads per window and measured 7.9 s/step against 0.7 s without tracks.
         dense = None
