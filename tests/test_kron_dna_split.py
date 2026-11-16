@@ -28,6 +28,48 @@ import test_kron_dna_multigenome as MGT
 from test_kron_dna_multigenome import cpu_only, genomes, run  # noqa: F401  (genomes is a fixture)
 
 REAL_GENOME = G.KronGenome
+REAL_MAX_POOL = F.max_pool1d
+
+
+class _SmoothRoutedPool(torch.autograd.Function):
+    """max_pool1d(x, 2) exactly in the forward pass; in the backward pass each pooled gradient is shared between the
+    pair by sigmoid((a - b) / tau), tau = 1e-3 of the pair's size, instead of going wholly to the larger element.
+
+    Why the gradient tests need it: max-pool's gradient is discontinuous where the two elements of a pair are
+    (near-)equal. Two computations that differ by fp32 round-off (any change of kernel shape does it, e.g. a batch
+    of 1 vs 2; measured: forward outputs within 5e-7) can then send one pair's gradient to the other base, and a
+    single such flip moves the stem's and first block's weight gradients by ~5e-3 of their maximum (found on the
+    cluster's torch 2.11 CPU: one flipped pair, no exact tie; see test_unsplit_max_pool_routing_is_discontinuous_at_near_ties). Both
+    routings are valid subgradients; the unsplit model alone flips the same way. Routing smoothly, identically in
+    both runs, keeps every comparison continuous, so round-off stays round-off and anything the split itself got
+    wrong would still show at full size."""
+
+    @staticmethod
+    def forward(ctx, x):
+        a, b = x[..., 0::2], x[..., 1::2]
+        ctx.save_for_backward(a, b)
+        return torch.maximum(a, b)
+
+    @staticmethod
+    def backward(ctx, g):
+        a, b = ctx.saved_tensors
+        tau = 1e-3 * torch.maximum(a.abs(), b.abs()) + 1e-12
+        w = torch.sigmoid((a - b) / tau)
+        out = g.new_empty(g.shape[:-1] + (2 * g.shape[-1],))
+        out[..., 0::2] = g * w
+        out[..., 1::2] = g * (1 - w)
+        return out
+
+
+def smooth_pool(x, kernel_size, *args, **kwargs):
+    if kernel_size == 2 and not args and not kwargs and x.shape[-1] % 2 == 0:
+        return _SmoothRoutedPool.apply(x)
+    return REAL_MAX_POOL(x, kernel_size, *args, **kwargs)
+
+
+def smooth_routing(monkeypatch):
+    """Gradient tests: the model's max-pools route their gradient continuously (see _SmoothRoutedPool)."""
+    monkeypatch.setattr(G.F, "max_pool1d", smooth_pool)
 
 
 @pytest.fixture(autouse=True)
@@ -168,8 +210,9 @@ def split_loss(m, out, targets, want, mask, epi_t, want_core):
 @pytest.mark.parametrize("b,length,by", CASES)
 def test_forward_split_gradients_equal_forward(device, monkeypatch, arch, b, length, by):
     """Train mode (dropout on, same seed): the loss and every parameter's gradient agree; a parameter that gets no
-    gradient unsplit (here the token head's... none: every head is in the loss) gets none split either."""
+    gradient unsplit gets none split either. Max-pool gradients are routed continuously (see _SmoothRoutedPool)."""
     forced_replicas(monkeypatch)
+    smooth_routing(monkeypatch)
     seq, seg, ctx, extra = batch_for(b, length, device)
     g = torch.Generator().manual_seed(9)
     targets = torch.where(torch.rand(b, length, generator=g) < 0.15, torch.randint(0, 4, (b, length), generator=g),
@@ -206,6 +249,27 @@ def cpu_mixer(monkeypatch):
     import kron_core.blocks
     from kron_core.testing import CausalMixer
     monkeypatch.setattr(kron_core.blocks, "kronlstm_mixer", CausalMixer)
+
+
+def test_smooth_routed_pool_forward_is_max_pool():
+    x = torch.randn(3, 5, 64, dtype=torch.float64, requires_grad=True)
+    y = smooth_pool(x, 2)
+    assert torch.equal(y, F.max_pool1d(x, 2))
+    y.sum().backward()                                   # every pooled gradient is shared out in full
+    assert torch.allclose(x.grad[..., 0::2] + x.grad[..., 1::2], torch.ones(3, 5, 32, dtype=torch.float64))
+    far = torch.tensor([[[1.0, 2.0, 5.0, -1.0]]], requires_grad=True)
+    smooth_pool(far, 2).sum().backward()                 # away from ties it is max-pool's own routing
+    assert torch.allclose(far.grad, torch.tensor([[[0.0, 1.0, 1.0, 0.0]]]))
+
+
+def test_unsplit_max_pool_routing_is_discontinuous_at_near_ties():
+    """The effect the gradient tests guard against, without any split: a pair within round-off of a tie sends its
+    whole gradient to whichever element is larger by one ulp."""
+    a = torch.tensor([[[1.0, 1.0 + 2 ** -23]]], requires_grad=True)
+    b = torch.tensor([[[1.0 + 2 ** -23, 1.0]]], requires_grad=True)
+    F.max_pool1d(a, 2).sum().backward()
+    F.max_pool1d(b, 2).sum().backward()
+    assert torch.equal(a.grad, torch.tensor([[[0.0, 1.0]]])) and torch.equal(b.grad, torch.tensor([[[1.0, 0.0]]]))
 
 
 def test_unused_head_gets_no_gradient_split_either(monkeypatch):
@@ -345,6 +409,7 @@ def test_cli_split_first_step_loss_and_gradients(genomes, tmp_path, monkeypatch,
     and unsplit, with the long runs' options; batch 1 (by length), 4 (by rows), 3 (by length), and 2 x 2 accumulated."""
     nd = make_recipe_data(genomes)
     real_model_cpu(monkeypatch)
+    smooth_routing(monkeypatch)
     from kron_dna import cli
     args = recipe(nd, arch) + ["--curriculum", f"{window}:10", "--tokens-per-step", str(tokens),
                                "--grad-accum", str(accum), "--bench", "--checkpoint-core"]
@@ -375,6 +440,7 @@ def test_cli_split_mse_track_losses(genomes, tmp_path, monkeypatch, loss_args):
     loss and gradients split (batch 1 by length, batch 3 by length) as unsplit."""
     nd = make_recipe_data(genomes)
     real_model_cpu(monkeypatch)
+    smooth_routing(monkeypatch)
     from kron_dna import cli
     args = recipe(nd, "v2")
     i = args.index("--ntv3-loss")
