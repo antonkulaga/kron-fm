@@ -778,8 +778,14 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                  max_contig: int = typer.Option(0, help="with --whole-contigs: a longer contig gives a random stretch "
                                                 "of this many bases (0: none)"),
                  arch: str = typer.Option("v1", help="v1, or v2: per-position RMS norm, two convs per block, scaled "
-                                          "projected decoder skips, MLP heads"),
+                                          "projected decoder skips, MLP heads; v2l: v2 with NTv3's lighter conv "
+                                          "layout (pool right after the stem, one conv per decoder step)"),
                  head_hidden: int = typer.Option(0, help="v2: hidden width of the MLP heads (0: 2 x stem channels)"),
+                 n_in_extra: int = typer.Option(0, help="reserved per-base input channels beside the 6 base channels, "
+                                                "zero-initialised and fed zeros until a later run supplies them"),
+                 n_contexts: int = typer.Option(-1, help="context embedding slots (genome.CONTEXT_RANGES; 256 "
+                                                "provisions species, assemblies and cell states); -1: 34 with "
+                                                "--mito, else 0, as before"),
                  bert_mask: bool = typer.Option(False, help="of the masked bases 80 % MASK, 10 % random, 10 % kept"),
                  rc: bool = typer.Option(False, help="train on the reverse complement of half the windows"),
                  curriculum: str = typer.Option("", help="window:steps,... trained in order (e.g. 8192:6000,"
@@ -1134,9 +1140,14 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
         return tuple(out)
 
     dev = torch.device("cuda", torch.cuda.current_device())
+    if n_contexts < 0:
+        n_contexts = G.N_CONTEXTS_ORGANELLE if mito else 0
+    elif mito and n_contexts < G.N_CONTEXTS_ORGANELLE:
+        raise typer.BadParameter(f"--mito tags windows with genetic-code ids up to 33: --n-contexts must be at least "
+                                 f"{G.N_CONTEXTS_ORGANELLE}")
     config = G.KronGenomeConfig(d_model=d_model, n_layers=n_layers, stem_channels=stem_channels, n_down=n_down,
                                 n_tracks=len(G.TRACKS) if labels else 0, arch=arch, head_hidden=head_hidden,
-                                n_contexts=34 if mito else 0, jepa=jepa_weight > 0,
+                                n_contexts=n_contexts, n_in_extra=n_in_extra, jepa=jepa_weight > 0,
                                 n_epigenomes=n_epi if epigenome_weight > 0 else 0, chunk_ratio=chunk_ratio,
                                 n_ntv3=len(ntv3["ids"]) if ntv3 else 0,
                                 chunk_length_feature=chunk_length_feature,
@@ -1145,7 +1156,7 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
     model = G.KronGenome(config).to(dev)
     model.checkpoint_core = checkpoint_core
     if compile_convs:
-        for blocks in [model.down, model.up] + ([model.up2] if arch == "v2" else []):
+        for blocks in [model.down, model.up] + ([model.up2] if arch in ("v2", "v2l") else []):
             for i in range(len(blocks)):
                 blocks[i].compile(dynamic=True)                # in place: state-dict keys unchanged
     pos_weight = None
@@ -1157,7 +1168,7 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                                   dtype=torch.float32, device=dev)
         say("track positive weights: " + ", ".join(f"{t} {w:.1f}" for t, w in zip(G.TRACKS, pos_weight)))
         say("tracks trained: " + ", ".join(t for t, m in zip(G.TRACKS, train_mask.tolist()) if m))
-    if arch in ("v2", "v3"):   # no weight decay on norms, biases, scales and embeddings
+    if arch in ("v2", "v2l", "v3"):   # no weight decay on norms, biases, scales and embeddings
         decay = [p_ for n_, p_ in model.named_parameters() if p_.ndim >= 2 and "context" not in n_]
         rest = [p_ for n_, p_ in model.named_parameters() if not (p_.ndim >= 2 and "context" not in n_)]
         opt = torch.optim.AdamW([{"params": decay, "weight_decay": 0.1}, {"params": rest, "weight_decay": 0.0}],
@@ -1174,8 +1185,11 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
         step, hours = state["step"], state.get("hours", 0.0)
         say(f"resumed at step {step}")
     elif init is not None and not bench:
-        missing, unexpected = model.load_state_dict(torch.load(init, map_location="cpu")["model"], strict=False)
-        say(f"initialised from {init}; new: {missing}; dropped: {unexpected}")
+        # reserved room (stem input channels, context rows) is zero-padded explicitly, function-preserving; new
+        # heads stay missing (strict=False) as before, and any other shape mismatch still raises
+        grown, notes = G.expand_state_dict(torch.load(init, map_location="cpu")["model"], model)
+        missing, unexpected = model.load_state_dict(grown, strict=False)
+        say(f"initialised from {init}; new: {missing}; dropped: {unexpected}; padded: {notes or 'nothing'}")
         step = start_step
     say(f"KronGenome {arch} {model.n_parameters() / 1e6:.1f}M parameters, curriculum "
                f"{', '.join(f'{w:,} x {n:,} steps' for w, n in phases)}, eval window {eval_window:,}, "
@@ -1385,8 +1399,8 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
             with torch.no_grad():
                 pairs = ([contig_loss(*sample_contig(val_idx), keep=keep if labels else None) for _ in range(2)]
                          if whole_contigs else
-                         [loss_on(*sample(val_idx, window=eval_window, batch=1 if arch in ("v2", "v3") else batch_size,
-                                          gen=eval_rng),
+                         [loss_on(*sample(val_idx, window=eval_window,
+                                          batch=1 if arch in ("v2", "v2l", "v3") else batch_size, gen=eval_rng),
                                   keep=keep if labels else None, mask_gen=mask_gen) for _ in range(8)])
                 if ntv3 is not None and not whole_contigs:   # NTv3's test split lies on chromosomes the
                     for _ in range(24):                          # masked-LM trains on, so draw from there too;

@@ -242,3 +242,259 @@ CONTIG      join(x)
     assert a["circular"] and a["transl_table"] == 2 and a["sequence"] == "ACGTACGTACGTACGTACGT"
     assert "Primates" in a["lineage"] and a["organism"] == "Homo sapiens"
     assert not b["circular"] and b["sequence"] == "" and b["transl_table"] == 1
+
+
+
+# ---- backbone provisions: reserved input channels, context slots, fractional bases, arch v2l ------------------------
+
+def _small(arch="v2", **kw):
+    base = dict(d_model=32, n_heads=2, n_layers=2, ff_units=64, stem_channels=16, n_down=3, dropout=0.0, arch=arch)
+    base.update(kw)
+    return G.KronGenomeConfig(**base)
+
+
+def _randomise_tables(model):
+    """Zero-initialised tables (contexts, FiLM) given values, so that tests see them act."""
+    with torch.no_grad():
+        if model.context is not None:
+            model.context.weight.normal_(0, 0.5)
+        if getattr(model, "epi_film", None) is not None:
+            model.epi_film.weight.normal_(0, 0.5)
+    return model
+
+
+@pytest.fixture
+def cpu_mixer(monkeypatch):
+    import kron_core.blocks
+    from kron_core.testing import CausalMixer
+    monkeypatch.setattr(kron_core.blocks, "kronlstm_mixer", CausalMixer)
+
+
+#: Outputs of commit 8a80be5 (before the provisions) for these configs, seed 0 weights and seed 1 input, on the CPU
+#: with the CausalMixer stand-in (scratch/kron-dna/backbone/golden.py). The defaults must reproduce them: the same
+#: random stream builds the same weights and the same forward gives the same numbers.
+GOLDEN_CFGS = {
+    "v1": dict(d_model=32, n_heads=2, n_layers=1, ff_units=64, stem_channels=8, n_down=3, dropout=0.0, n_tracks=9),
+    "v2": dict(d_model=32, n_heads=2, n_layers=2, ff_units=64, stem_channels=16, n_down=3, dropout=0.0, n_tracks=5,
+               arch="v2", n_contexts=34, n_epigenomes=3, n_ntv3=2),
+}
+GOLDEN = {'v1': {'core_abs': 1554.5560054053203,
+        'logits_abs': 994.7197516183369,
+        'logits_head': [-0.3032422959804535,
+                        0.02806808426976204,
+                        -0.15837764739990234,
+                        0.4649541974067688,
+                        -0.4005945920944214,
+                        0.25408974289894104,
+                        -0.28745192289352417,
+                        0.4258002042770386,
+                        -0.20468977093696594,
+                        0.3037533164024353,
+                        -0.24919384717941284,
+                        0.3533632457256317],
+        'logits_sum': 15.977408195612952,
+        'n_params': 27153,
+        'tracks_abs': 1492.520589391701},
+ 'v2': {'core_abs': 1717.0197192159249,
+        'epi_abs': 26.02404550369829,
+        'logits_abs': 307.6422423522163,
+        'logits_head': [-0.1683914214372635,
+                        0.023607470095157623,
+                        -0.04750204086303711,
+                        0.15604957938194275,
+                        -0.2543136477470398,
+                        0.18396134674549103,
+                        -0.1812310665845871,
+                        0.08690069615840912,
+                        -0.3135009706020355,
+                        0.25763410329818726,
+                        -0.10668600350618362,
+                        -0.03259327635169029],
+        'logits_sum': -67.8983548959659,
+        'n_params': 90033,
+        'ntv3_abs': 309.14976120367646,
+        'tracks_abs': 417.4388992031563}}
+
+
+@pytest.mark.parametrize("name", ["v1", "v2"])
+def test_defaults_reproduce_pre_provision_outputs(cpu_mixer, name):
+    torch.manual_seed(0)
+    model = _randomise_tables(G.KronGenome(G.KronGenomeConfig(**GOLDEN_CFGS[name])).eval())
+    seq = torch.randint(0, 6, (2, 256), generator=torch.Generator().manual_seed(1))
+    ctx = torch.tensor([3, 0]) if model.context is not None else None
+    with torch.no_grad():
+        logits, core, tracks = model(seq, None, ctx)
+    want = GOLDEN[name]
+    assert model.n_parameters() == want["n_params"]
+    assert torch.allclose(logits[0, :3].flatten(), torch.tensor(want["logits_head"]), atol=1e-5)
+    for key, got in [("logits_abs", logits), ("core_abs", core), ("tracks_abs", tracks),
+                     ("epi_abs", model.last_epi), ("ntv3_abs", model.last_ntv3)]:
+        if key in want and want[key] is not None:
+            assert abs(float(got.double().abs().sum()) - want[key]) <= 1e-5 * abs(want[key]), key
+
+
+@pytest.mark.parametrize("arch", ["v1", "v2", "v2l"])
+def test_zero_padded_stem_and_context_loading_is_function_preserving(cpu_mixer, arch):
+    torch.manual_seed(0)
+    old = _randomise_tables(G.KronGenome(_small(arch, n_contexts=34, n_epigenomes=3, n_tracks=2)).eval())
+    big = G.KronGenome(_small(arch, n_contexts=256, n_epigenomes=3, n_tracks=2, n_in_extra=8)).eval()
+    notes, res = G.load_expanded(big, old.state_dict())
+    assert not res.missing_keys and not res.unexpected_keys and len(notes) == 2
+    assert big.stem.weight.shape[1] == G.N_IN + 8 and (big.stem.weight[:, G.N_IN:] == 0).all()
+    assert (big.context.weight[34:] == 0).all()
+    seq = torch.randint(0, 6, (2, 128))
+    ctx = torch.tensor([5, 0])
+    with torch.no_grad():
+        a = old(seq, None, ctx)
+        b = big(seq, None, ctx)
+        a_epi, b_epi = old.last_epi, big.last_epi
+        c = big(seq, None, ctx, torch.randn(2, 8, 128))                   # reserved channels: zero weights
+    for x, y in zip(a, b):
+        if x is not None:
+            assert torch.allclose(x, y, atol=1e-6, rtol=0)
+    assert torch.allclose(a_epi, b_epi, atol=1e-6, rtol=0)
+    assert torch.allclose(a[0], c[0], atol=1e-5)
+    # no context table in the checkpoint at all -> zero rows; "nuclear" rows copy id 0
+    plain = G.KronGenome(_small(arch)).eval()
+    with_ctx = G.KronGenome(_small(arch, n_contexts=256)).eval()
+    G.load_expanded(with_ctx, plain.state_dict())
+    with torch.no_grad():
+        assert torch.allclose(plain(seq)[0], with_ctx(seq, None, torch.tensor([70, 200]))[0], atol=1e-6, rtol=0)
+    nuc = G.KronGenome(_small(arch, n_contexts=256, n_epigenomes=3, n_tracks=2)).eval()
+    G.load_expanded(nuc, old.state_dict(), new_contexts="nuclear")
+    with torch.no_grad():
+        assert torch.allclose(nuc(seq, None, torch.tensor([70, 0]))[0], old(seq, None, torch.tensor([0, 0]))[0],
+                              atol=1e-6, rtol=0)
+    with pytest.raises(ValueError):                                        # shrinking is not function-preserving
+        G.expand_state_dict(big.state_dict(), old)
+    with pytest.raises(RuntimeError):                                      # strict: nothing dropped silently
+        old.load_state_dict(big.state_dict())
+
+
+@pytest.mark.parametrize("arch", ["v1", "v2", "v2l"])
+def test_integer_and_one_hot_float_inputs_agree(device, arch):
+    torch.manual_seed(0)
+    model = G.KronGenome(_small(arch, n_tracks=2)).to(device).eval()
+    seq = torch.randint(0, 6, (2, 256), device=device)
+    with torch.no_grad():
+        a = model(seq)
+        b = model(G.one_hot(seq))
+        ca = model.forward_contig(seq[0], [0, 128], chunk=128, halo=64)
+        cb = model.forward_contig(G.one_hot(seq)[0], [0, 128], chunk=128, halo=64)
+    assert torch.equal(a[0], b[0]) and torch.equal(a[2], b[2])
+    assert all(torch.equal(x[0], y[0]) for x, y in zip(ca, cb))
+    with pytest.raises(ValueError):
+        model(G.one_hot(seq)[:, :5])                                       # float input needs all 6 channels
+
+
+def test_fractional_base_helpers():
+    import numpy as np
+    h1 = np.array([0, 1, 2, 3, 4, 0], dtype=np.uint8)
+    h2 = np.array([0, 1, 2, 3, 4, 2], dtype=np.uint8)
+    x = G.haplotype_channels(h1, h2)
+    assert x.shape == (6, 6) and x.dtype == torch.float32
+    assert torch.equal(x[:, :5], G.one_hot(torch.tensor(h1[None, :5]))[0])          # homozygous sites: one-hot
+    assert x[:, 5].tolist() == [0.5, 0, 0.5, 0, 0, 0]                               # A/G heterozygote
+    assert G.haplotype_channels(torch.tensor(np.stack([h1, h1])), torch.tensor(np.stack([h2, h2]))).shape == (2, 6, 6)
+    y = G.iupac_channels("ACGTNacgtnRyBu-")
+    assert torch.equal(y[:, :10], G.one_hot(torch.from_numpy(G.encode_bases("ACGTNacgtn")[None]).long())[0])
+    assert y[:, 10].tolist() == [0.5, 0, 0.5, 0, 0, 0]                              # R = A/G
+    assert y[:, 11].tolist() == [0, 0.5, 0, 0.5, 0, 0]                              # y = C/T
+    assert torch.allclose(y[:, 12], torch.tensor([0, 1 / 3, 1 / 3, 1 / 3, 0, 0]))   # B = C/G/T
+    assert y[:, 13].tolist() == [0, 0, 0, 1, 0, 0] and y[:, 14].tolist() == [0, 0, 0, 0, 1, 0]   # U = T, gap = N
+    assert torch.allclose(y.sum(0), torch.ones(15))
+    with pytest.raises(ValueError):
+        G.haplotype_channels(h1, h2[:3])
+
+
+@pytest.mark.parametrize("arch", ["v2", "v2l"])
+def test_reserved_channels_at_zero_change_nothing(device, arch):
+    torch.manual_seed(0)
+    plain = G.KronGenome(_small(arch, n_tracks=2)).to(device).eval()
+    torch.manual_seed(0)
+    model = G.KronGenome(_small(arch, n_tracks=2, n_in_extra=4)).to(device).eval()
+    # the reserved columns are appended without drawing random numbers: the same seed builds the same model
+    assert all(torch.equal(p, q) for (n, p), (m, q) in zip(plain.state_dict().items(), model.state_dict().items())
+               if n != "stem.weight")
+    assert torch.equal(plain.stem.weight, model.stem.weight[:, :G.N_IN])
+    seq = torch.randint(0, 6, (2, 256), device=device)
+    zeros = torch.zeros(2, 4, 256, device=device)
+    with torch.no_grad():
+        a, b, z = plain(seq), model(seq), model(seq, extra=zeros)
+        r = model(seq, extra=torch.randn(2, 4, 256, device=device))       # any values: their weights are zero
+        model.stem.weight[:, G.N_IN:].normal_()
+        moved = model(seq, extra=torch.randn(2, 4, 256, device=device))
+    assert torch.equal(a[0], b[0])
+    assert torch.allclose(a[0], z[0], atol=1e-5) and torch.allclose(a[0], r[0], atol=1e-5)
+    assert not torch.allclose(a[0], moved[0], atol=1e-3)                  # the channels are wired in
+    with pytest.raises(ValueError):
+        plain(seq, extra=zeros)                                            # no reserved channels to take them
+    with pytest.raises(ValueError):
+        model(seq, extra=zeros[:, :3])
+
+
+@pytest.mark.parametrize("length", [8, 64, 200, 1024])
+def test_v2l_shapes_at_several_lengths(device, length):
+    torch.manual_seed(0)
+    c = _small("v2l", n_tracks=3, n_contexts=G.N_CONTEXTS_ALL, n_epigenomes=4, n_ntv3=2, n_in_extra=2)
+    model = G.KronGenome(c).to(device).eval()
+    seq = torch.randint(0, 6, (2, length), device=device)
+    seg = torch.zeros(2, length // 8, dtype=torch.long, device=device)
+    seg[:, length // 16:] = 1
+    with torch.no_grad():
+        logits, core, tracks = model(seq, seg, torch.tensor([[G.context_id("species", 3), -1], [0, 2]], device=device))
+        x, skips = model.encode(seq)
+    assert logits.shape == (2, length, 4) and core.shape == (2, length // 8, 32) and tracks.shape == (2, length, 3)
+    assert model.last_epi.shape == (2, length // 8, 4) and model.last_ntv3.shape == (2, length, 2)
+    assert x.shape == (2, 32, length // 8)
+    assert [s.shape[-1] for s in skips] == [length, length // 2, length // 4]       # skips at 1, 2, 4 bp
+    assert [s.shape[1] for s in skips] == [16, 16, 24]                              # stem width at 1 and 2 bp
+
+
+def test_v2l_layout_and_unsupported_combinations():
+    c = _small("v2l", stem_channels=256, d_model=384, n_down=7)
+    assert G.KronGenome._v2l_widths(None, c) == [256, 256, 277, 298, 320, 341, 362, 384]
+    model = G.KronGenome(c)
+    assert len(model.down) == 6 and len(model.up) == 7 and len(model.up2) == 7
+    assert model.skip_scale.shape == (7,) and torch.equal(model.skip_scale.detach(), torch.ones(7))
+    for bad in (dict(chunk_ratio=4.0), dict(local_width=32), dict(n_down=1)):
+        with pytest.raises(ValueError):
+            G.KronGenome(_small("v2l", **bad))
+    with pytest.raises(ValueError):
+        G.KronGenome(_small("v4"))
+
+
+def test_v2l_forward_contig_matches_forward(device):
+    torch.manual_seed(0)
+    model = G.KronGenome(_small("v2l", n_tracks=2, n_contexts=34)).to(device).eval()
+    _randomise_tables(model)
+    seq = torch.randint(0, 4, (1, 2048), device=device)
+    atol = 1e-4 if device.type == "cpu" else 2e-3
+    with torch.no_grad():
+        full, _, tracks = model(seq, None, torch.tensor([2], device=device))
+        one = model.forward_contig(seq[0], train_at=[0], chunk=2048, halo=0, context=2)
+        parts = model.forward_contig(seq[0], train_at=[0, 512, 1536], chunk=512, halo=256, context=2)
+    assert torch.allclose(one[0][0], full, atol=atol) and torch.allclose(one[0][1], tracks, atol=atol)
+    # per-position norms: with a halo wider than the convolutions' reach, chunks match the full window too
+    for (lg, tr), s in zip(parts, [0, 512, 1536]):
+        assert torch.allclose(lg, full[:, s:s + 512], atol=atol) and torch.allclose(tr, tracks[:, s:s + 512], atol=atol)
+
+
+def test_context_ids_and_summed_contexts(device):
+    assert G.context_id("nuclear") == 0 and G.context_id("organelle", 2) == 2
+    assert G.context_id("species", 0) == 64 and G.context_id("assembly", 1) == 193
+    assert G.context_id("cell_state", 31) == 255
+    for kind, idx in (("organelle", 0), ("species", 128), ("cell_state", 32)):
+        with pytest.raises(ValueError):
+            G.context_id(kind, idx)
+    torch.manual_seed(0)
+    model = _randomise_tables(G.KronGenome(_small("v2l", n_contexts=256))).to(device).eval()
+    seq = torch.randint(0, 4, (2, 64), device=device)
+    with torch.no_grad():
+        one = model(seq, None, torch.tensor([3, 70], device=device))[0]
+        padded = model(seq, None, torch.tensor([[3, -1], [-1, 70]], device=device))[0]
+        both = model(seq, None, torch.tensor([[3, 70], [3, 70]], device=device))[0]
+        contig = model.forward_contig(seq[0], [0], chunk=64, halo=0, context=[3, 70])[0][0]
+    assert torch.allclose(one, padded, atol=1e-5)
+    assert not torch.allclose(one[0], both[0], atol=1e-3)
+    assert torch.allclose(contig, both[:1], atol=1e-4 if device.type == "cpu" else 2e-3)
