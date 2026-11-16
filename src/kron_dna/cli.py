@@ -2157,7 +2157,9 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                         score_ntv3=False)[0].item() for _ in range(8)])) / math.log(2))
             guard_note = None
             if jepa_guard != "off":         # collapse measures on the fixed windows, then the guard's decision
+                t_guard = time.time()
                 gm_ = guard_measure()
+                t_guard = time.time() - t_guard
                 gi_ = G.jepa_guard_update(guard, gm_["entropy_rank"], gm_["std_min"], act=jepa_guard == "on",
                                           rank_frac=jepa_guard_rank, std_frac=jepa_guard_std, cap=jepa_guard_cap)
                 reg_now = jepa_reg_weight * guard["mult"] if jepa_reg != "none" else 0.0
@@ -2177,7 +2179,7 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                               f"{gm_['std_mean']:.4f}; JEPA hidden {gm_['jepa_hidden']:.4f}, visible "
                               f"{gm_['jepa_visible']:.4f}, copy hidden {gm_['copy_hidden']:.4f}; top-1 hidden "
                               f"{gm_['top1_hidden']:.4f} (chance {gm_['top1_chance']:.4f}); --jepa-reg weight "
-                              f"{reg_now:g} (x{guard['mult']:g}); {gi_['action']}")
+                              f"{reg_now:g} (x{guard['mult']:g}); {gi_['action']}; {t_guard:.1f} s")
                 if gi_["action"] != "ok":
                     why_ = " and ".join(w_ for w_, t_ in (
                         (f"entropy rank {gm_['entropy_rank']:.2f} < {jepa_guard_rank:g} x running max "
