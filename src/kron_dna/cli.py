@@ -1134,7 +1134,8 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
             w_ = np.sqrt(np.array([e["train_bases"] for e in ntv3["extra"]]))
             ntv3["extra_p"] = w_ / w_.sum()
             say("NTv3 tracks, further species: " + ", ".join(
-                f"{e['name']} {e['hi'] - e['lo']} tracks (window share {ntv3_extra_share * p_:.3f}, "
+                f"{e['name']} {e['hi'] - e['lo']} tracks (share of all training windows "
+                f"{(1.0 - genome_total - (mito_share if mito else 0.0)) * ntv3_extra_share * p_:.4f}, "
                 f"{len(e['test_pos']):,} test anchors)" for e, p_ in zip(ntv3["extra"], ntv3["extra_p"]))
                 + f"; {len(ntv3['ids'])} channels in all")
         by_assay = {}
