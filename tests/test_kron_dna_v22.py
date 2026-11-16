@@ -60,3 +60,32 @@ def test_block_jepa_with_short_sources_pack(jgenomes, tmp_path, monkeypatch):
     assert [r["step"] for r in rows] == list(range(1, 11))
     assert all(math.isfinite(r["jepa_hidden"]) and math.isfinite(r["train_total"]) and 0.1 < r["hidden_share"] < 0.35
                for r in rows)
+
+
+
+def test_jepa_guard_with_short_sources_pack(jgenomes, tmp_path, monkeypatch):
+    """v2.2 + --jepa-guard: with packed micro-batches and block JEPA, the guard on but never triggered leaves every
+    training input and loss as without it; a forced trigger (an injected collapsed core) still raises the weight
+    and stops with exit code 42."""
+    import test_kron_dna_jepa_guard as GT
+    from test_kron_dna_multigenome import metric_rows
+    root = jgenomes["root"]
+    stub_jepa(monkeypatch)
+    from kron_dna import cli as new
+    args = SMALLJ + JEPA + ["--bert-mask", "--mito", "mt", "--mito-share", "0.5", "--n-contexts", "64", "--steps", "8",
+                            "--eval-every", "1", "--batch-size", "4", "--short-sources", "pack",
+                            "--jepa-block-share", "0.25", "--jepa-block-len", "256:1024"]
+    res0, ev0 = run(new, monkeypatch, root, tmp_path / "off", args)
+    assert res0.exit_code == 0, res0.output + repr(res0.exception)
+    res1, ev1 = run(new, monkeypatch, root, tmp_path / "on", args + GT.GUARD + [
+        "--jepa-guard", "on", "--jepa-guard-rank", "0.001", "--jepa-guard-std", "0.0001"])
+    assert res1.exit_code == 0, res1.output + repr(res1.exception)
+    tr0 = [e for e in ev0 if e[0] == "forward" and e[1]]
+    tr1 = [e for e in ev1 if e[0] == "forward" and e[1]]
+    assert len(tr1) > 8 and GT.same_events(tr1, tr0)                   # some micro-batches came as several parts
+    assert metric_rows(tmp_path / "on" / "metrics.csv") == metric_rows(tmp_path / "off" / "metrics.csv")
+    assert [r["g_action"] for r in GT.guard_rows(tmp_path / "on" / "jepa.csv")] == ["ok"] * 8
+    GT.inject_collapse(monkeypatch, 2)
+    res2, _ = run(new, monkeypatch, root, tmp_path / "trig", args + GT.GUARD + ["--jepa-guard", "on"])
+    assert res2.exit_code == 42, res2.output + repr(res2.exception)
+    assert [float(r["g_mult"]) for r in GT.guard_rows(tmp_path / "trig" / "jepa.csv")] == [1, 1, 2, 4, 8, 8]
