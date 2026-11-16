@@ -109,6 +109,42 @@ def base_channels(seq: torch.Tensor) -> torch.Tensor:
     return one_hot(seq)
 
 
+#: Names of the stem's input channels, in order: the 6 base channels, then the ``n_in_extra`` reserved ones. A
+#: reserved channel genome-train actually feeds gets a name here (its index into ``extra`` is the value); the others
+#: are recorded as ``reserved<i>`` in a run's record (``genome-train`` writes the registry into every checkpoint).
+BASE_INPUT_CHANNELS = ("A", "C", "G", "T", "N", "MASK")
+EXTRA_INPUT_CHANNELS = {"repeat": 0}    # --repeat-channel: 1 = lower-case (soft-masked) base in the source FASTA
+
+
+def input_channel_registry(n_in_extra: int, fed: tuple[str, ...] = ()) -> dict[str, int]:
+    """Name -> stem input column: the base channels 0..5, then ``n_in_extra`` reserved columns, named after
+    ``EXTRA_INPUT_CHANNELS`` when listed in ``fed`` and ``reserved<i>`` otherwise."""
+    reg = {n: i for i, n in enumerate(BASE_INPUT_CHANNELS)}
+    names = {EXTRA_INPUT_CHANNELS[f]: f for f in fed}
+    for i in range(n_in_extra):
+        reg[names.get(i, f"reserved{i}")] = N_IN + i
+    return reg
+
+
+def soft_base_channels(inputs: torch.Tensor, targets: torch.Tensor | None, rate: float,
+                       generator: torch.Generator | None = None) -> torch.Tensor:
+    """Training-time fractional bases (``genome-train --soft-base-rate``): integer ``inputs`` ``[B, L]`` (after
+    masking) -> ``[B, 6, L]`` float32. Of the positions that show a base (A, C, G, T) and are not masked-LM targets
+    (``targets == -100``; ``None``: no targets), each is mixed with probability ``rate``: 0.5 of its base and 0.5 of
+    one of the other three, drawn uniformly, i.e. what :func:`haplotype_channels` gives at a heterozygous site.
+    N, MASK and every target position keep their one-hot, so the loss and its targets are unchanged. Draws two
+    ``[B, L]`` random tensors from ``generator`` (``None``: the global one); call it only when ``rate > 0``."""
+    x = one_hot(inputs)
+    free = inputs < 4
+    if targets is not None:
+        free = free & (targets == -100)
+    pick = (torch.rand(inputs.shape, generator=generator, device=inputs.device) < rate) & free
+    shift = torch.randint(1, 4, inputs.shape, generator=generator, device=inputs.device)
+    other = (inputs.long().clamp(max=3) + shift) % 4                            # one of the other three bases
+    mixed = 0.5 * x + 0.5 * F.one_hot(other, N_IN).transpose(1, 2).float()
+    return torch.where(pick.unsqueeze(1), mixed, x)
+
+
 def haplotype_channels(hap1, hap2) -> torch.Tensor:
     """Two aligned haplotypes of base codes (0..4 A, C, G, T, N; 5 MASK; numpy or torch, ``[..., L]``) ->
     ``[..., 6, L]`` float32 weights, the mean of their one-hots: 1.0 where they agree, 0.5 + 0.5 at a heterozygous

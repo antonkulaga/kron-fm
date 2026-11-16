@@ -786,6 +786,11 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                  n_contexts: int = typer.Option(-1, help="context embedding slots (genome.CONTEXT_RANGES; 256 "
                                                 "provisions species, assemblies and cell states); -1: 34 with "
                                                 "--mito, else 0, as before"),
+                 new_contexts: str = typer.Option("zero", help="with --init, when the model has more context rows than "
+                                                  "the checkpoint: 'zero' (new rows add nothing, as before: the "
+                                                  "checkpoint WITHOUT a context vector, which is not the trained "
+                                                  "nuclear model, whose row 0 is non-zero) or 'nuclear' (new rows "
+                                                  "copy row 0, so a new id starts exactly as the nuclear model)"),
                  bert_mask: bool = typer.Option(False, help="of the masked bases 80 % MASK, 10 % random, 10 % kept"),
                  rc: bool = typer.Option(False, help="train on the reverse complement of half the windows"),
                  curriculum: str = typer.Option("", help="window:steps,... trained in order (e.g. 8192:6000,"
@@ -869,12 +874,28 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                                                   "contigs joined by '+' or 'none' (default: its contigs.parquet "
                                                   "'held_out' column). Its windows train masked bases only; "
                                                   "held-out bits/base are reported per genome (see multigenome.py)"),
+                 soft_base_rate: float = typer.Option(0.0, help="training only: at this fraction of the positions "
+                                                      "that show a base and are not masked-LM targets, feed 0.5 of "
+                                                      "the base and 0.5 of one other base (drawn uniformly) through "
+                                                      "the fractional-input path, so the model has seen "
+                                                      "heterozygous-like input; targets, loss and evaluation (hard "
+                                                      "input) are unchanged. 0: off, no random number drawn"),
+                 repeat_channel: bool = typer.Option(False, help="feed repeat.u8 (1 = lower-case, soft-masked base "
+                                                     "in the source FASTA; laid out like bases.u8) of each genome "
+                                                     "as reserved input channel 0 (needs --n-in-extra >= 1); a "
+                                                     "genome without the file feeds zeros. Training only: held-out "
+                                                     "numbers are read with the channel zeroed, comparable with "
+                                                     "runs that lack it"),
+                 repeat_channel_drop: float = typer.Option(0.5, help="with --repeat-channel: fraction of training "
+                                                           "windows whose repeat channel is zeroed, so the model "
+                                                           "also works without it"),
                  seed: int = 0) -> None:
     """The multi-track model (KronGenome) over whole gap-free contigs: stage 1 masked-base prediction; with
     ``--labels``, stage 2 adds the Ensembl and GENCODE tracks of ``genome-labels`` and writes ``tracks.csv``.
     v2 (``--arch v2``) trains with a short-to-long ``--curriculum`` at a fixed ``--tokens-per-step``; held-out bits
     are always read on windows of the curriculum's last length, from windows and masks drawn by ``seed`` and the
     step alone, so two runs with one seed are scored on the same bases at the same step (paired evals)."""
+    run_options = dict(locals())                      # every option as given (the run record; nothing else reads it)
     import numpy as np
     import polars as pl
 
@@ -924,6 +945,17 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
     if mlm_weight == 0 and (whole_contigs or jepa_weight > 0 or labels):
         raise typer.BadParameter("--mlm-weight 0 (a track stage on unmasked input) does not take --whole-contigs, "
                                  "--jepa-weight or --labels")
+    if not (0.0 <= soft_base_rate <= 1.0 and 0.0 <= repeat_channel_drop <= 1.0):
+        raise typer.BadParameter("--soft-base-rate and --repeat-channel-drop must lie in [0, 1]")
+    if whole_contigs and (soft_base_rate > 0 or repeat_channel):
+        raise typer.BadParameter("--whole-contigs does not take --soft-base-rate or --repeat-channel")
+    if repeat_channel and n_in_extra < 1:
+        raise typer.BadParameter("--repeat-channel feeds reserved input channel 0: it needs --n-in-extra >= 1")
+    if new_contexts not in ("zero", "nuclear"):
+        raise typer.BadParameter("--new-contexts must be 'zero' or 'nuclear'")
+    if new_contexts != "zero" and init is None:
+        raise typer.BadParameter("--new-contexts applies to --init only: from scratch every context row starts at "
+                                 "zero, as row 0 (nuclear) does")
     if mito:
         mito_src = interim_dir("genome", mito)
         mito_bases = np.memmap(mito_src / "bases.u8", dtype=np.uint8, mode="r")
@@ -1121,6 +1153,36 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                     f"masked bases only) + {rest_ * ntv3_extra_share * ntv3['extra_p'][k_x]:.4f} (--ntv3-extra, "
                     f"masked bases and its tracks), context {g_x.context} for both, its held-out contigs in neither")
 
+    # --repeat-channel: per-base repeat.u8 (1 = soft-masked) beside each genome's bases.u8, read only for training
+    # windows; a genome without the file feeds zeros. The per-window drop draws from a stream of its own, so the
+    # windows (and everything else drawn from rng) are the ones a run without --repeat-channel draws.
+    rep_main = rep_mito = None
+    rep_genome: list = [None] * len(genomes)
+    rep_batch: list = []
+    rep_rng = np.random.default_rng([seed, rank, 2027])
+    if repeat_channel:
+        def open_repeat(d, n_bases: int, label: str):
+            f_ = d / "repeat.u8"
+            if not f_.is_file():
+                say(f"repeat channel: {label} has no {f_.name}: its windows feed zeros")
+                return None
+            mm_ = np.memmap(f_, dtype=np.uint8, mode="r")
+            if len(mm_) != n_bases:
+                raise typer.BadParameter(f"{f_} holds {len(mm_):,} values but bases.u8 {n_bases:,}")
+            probe_ = np.asarray(mm_[:: max(1, len(mm_) // 2_000_000)])
+            say(f"repeat channel: {label} repeat.u8, ~{100 * float((probe_ > 0).mean()):.1f}% soft-masked")
+            return mm_
+        rep_main = open_repeat(src, len(bases), name)
+        if mito:
+            rep_mito = open_repeat(mito_src, len(mito_bases), mito)
+        rep_genome = [open_repeat(interim_dir("genome", g_.name), len(g_.bases), g_.name) for g_ in genomes]
+        for e_x in (ntv3["extra"] if ntv3 else []):
+            g_k = next((k_ for k_, g_ in enumerate(genomes) if g_.name == e_x["name"]), None)
+            e_x["rep"] = rep_genome[g_k] if g_k is not None else open_repeat(
+                interim_dir("genome", e_x["name"]), len(e_x["bases"]), e_x["name"])
+        say(f"repeat channel: extra input channel 0, zeroed in {repeat_channel_drop:g} of training windows; "
+            f"held-out evaluation with the channel zeroed")
+
     def epi_targets(at: int, take: int, window: int, flip: bool) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """``[bins, E]`` bool: an epigenome is active in a 128-bp bin when an element active there covers a base of
         it; ``[bins]`` valid (inside the window's bases); and ``[bins]`` bool: a Regulatory Build element covers a
@@ -1169,20 +1231,23 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
         return tuple(out)
 
     def sample(table, window=window, batch=None, gen=None, flip=False, mito_table=None, share=0.0, annot=0.0,
-               extra=0.0, extra_force=None, genomes=(), force_genome=None) -> tuple[torch.Tensor, ...]:
+               extra=0.0, extra_force=None, genomes=(), force_genome=None, rep=False) -> tuple[torch.Tensor, ...]:
         """``batch`` windows: (seqs, segments, contexts[, labels, activity, valid]). With ``mito_table``, each row comes
         from it with probability ``share``; a circular genome is read across its origin when the window is shorter.
         Context 0 is nuclear; an organelle sequence's context is its genetic code table (1..33). With ``genomes``
         (--genome), one uniform draw first sends a row to further genome k with probability its share (its training
         contigs, by length, masked bases only, its context id); ``force_genome`` k draws every row from ``table``
-        (that genome's held-out contigs) instead."""
+        (that genome's held-out contigs) instead. ``rep`` (--repeat-channel, training only) also reads each row's
+        repeat.u8 (zeros where a genome has none, or for a dropped window) into ``rep_batch``."""
         gen = gen or rng
         batch = batch or batch_size
         p = table["len"].to_numpy() / table["len"].sum()                 # contigs by length: every base equally
         seqs, segs, ctxs, labs, acts, valid = [], [], [], [], [], []
         epi_t, epi_v, epi_e = [], [], []
         nt_t, nt_s, nt_c, nt_x = [], [], [], []
+        rep_rows = []
         for _ in range(batch):
+            rsrc = None                              # --repeat-channel: this row's repeat.u8, read at rsel
             fg = force_genome                        # a further genome's index (--genome), else None
             if fg is None and genomes:               # no draw at all without --genome: the default stream is unchanged
                 fg = MG.pick_genome(gen.random(), genome_cum)
@@ -1201,6 +1266,7 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                 codes = np.full(window, 4, dtype=np.int64)
                 codes[:take] = g_.bases[at:at + take]
                 ctxs.append(int(g_.context))
+                rsrc, rsel = rep_genome[fg], slice(at, at + take)
             elif xs is not None:
                 e_ = ntv3["extra"][xs]
                 if extra_force is not None and len(e_["test_pos"]):       # an eval window around a test position
@@ -1215,6 +1281,7 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                 codes = np.full(window, 4, dtype=np.int64)
                 codes[:take] = e_["bases"][at:at + take]
                 ctxs.append(int(e_.get("context", 0)))                    # nuclear (0) unless --genome gave one
+                rsrc, rsel = e_.get("rep"), slice(at, at + take)
             elif from_mito:
                 r = mito_table.row(int(gen.integers(0, mito_table.height)), named=True)   # each genome alike
                 take = min(window, r["len"])
@@ -1225,6 +1292,7 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                 codes = np.full(window, 4, dtype=np.int64)
                 codes[:take] = mito_bases[r["offset"] + pos]
                 ctxs.append(int(r["code"]))                               # organelle: its genetic code table
+                rsrc, rsel = rep_mito, r["offset"] + pos
             elif annot and annot_pos is not None and gen.random() < annot:
                 k = int(gen.integers(0, len(annot_pos)))                  # a window that contains an annotated block
                 c_off, c_len = int(annot_coff[k]), int(annot_clen[k])
@@ -1235,6 +1303,7 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                 codes = np.full(window, 4, dtype=np.int64)
                 codes[:take] = bases[at:at + take]
                 ctxs.append(0)                                            # nuclear (context 0)
+                rsrc, rsel = rep_main, slice(at, at + take)
             else:
                 r = table.row(int(gen.choice(table.height, p=p)), named=True)
                 take = min(window, r["len"])
@@ -1242,9 +1311,17 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                 codes = np.full(window, 4, dtype=np.int64)
                 codes[:take] = bases[at:at + take]
                 ctxs.append(0)                                            # nuclear (context 0)
+                rsrc, rsel = rep_main, slice(at, at + take)
             flip_row = flip and gen.random() < 0.5
             if flip_row:
                 codes[:take] = G.reverse_complement(codes[:take].astype(np.uint8))
+            if rep:                                  # a repeat is a repeat on either strand: reversed, not swapped
+                r_ = np.zeros(window, dtype=np.uint8)
+                if rep_rng.random() >= repeat_channel_drop and rsrc is not None:
+                    r_[:take] = rsrc[rsel]
+                    if flip_row:
+                        r_[:take] = r_[:take][::-1].copy()
+                rep_rows.append(r_)
             if epigenome_weight > 0:
                 if from_mito or xs is not None or fg is not None:         # no human Regulatory Build there
                     epi_t.append(np.zeros((window // epi_unit, n_epi), dtype=bool))
@@ -1296,6 +1373,7 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                          torch.from_numpy(np.stack(epi_e)))] if epi_t else []
         ntv3_batch[:] = [(torch.from_numpy(np.stack(nt_t)), torch.from_numpy(np.stack(nt_s)),
                           torch.from_numpy(np.stack(nt_c)), nt_x)] if nt_t else []
+        rep_batch[:] = [torch.from_numpy(np.stack(rep_rows))] if rep_rows else []
         out = [torch.from_numpy(np.stack(seqs)), torch.from_numpy(np.stack(segs)), torch.tensor(ctxs)]
         if labels:
             out += [torch.from_numpy(np.stack(x)) for x in (labs, acts, valid)]
@@ -1319,7 +1397,7 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
         MG.check_contexts(genomes, config.n_contexts, mito_codes)
     except MG.GenomeSpecError as err:
         raise typer.BadParameter(str(err)) from None
-    ctx_on = config.n_contexts > 0                    # the model reads context ids (today: exactly when --mito)
+    ctx_on = config.n_contexts > 0                    # the model reads context ids whenever it has a table
     model = G.KronGenome(config).to(dev)
     model.checkpoint_core = checkpoint_core
     if compile_convs:
@@ -1344,9 +1422,55 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
         opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.1, betas=(0.9, 0.95))
     out.mkdir(parents=True, exist_ok=True)
     ckpt = out / "checkpoint.pt"
+    # The run record (runrecord.py): written at startup, stored in every checkpoint, checked on resume.
+    from kron_dna import runrecord as RR
+    x_list = ntv3["extra"] if ntv3 else []
+    shares_ = MG.window_shares([g_.share for g_ in genomes], mito_share if mito else 0.0,
+                               ntv3_extra_share if x_list else 0.0, [float(p_) for p_ in ntv3["extra_p"]] if x_list else None)
+    rec_genomes = [RR.genome_entry("primary", name, shares_["primary"], 0,
+                                   val_idx["chrom"].unique(maintain_order=True).to_list(), src / "contigs.parquet",
+                                   annot_oversample=annot_oversample)]
+    rec_genomes += [RR.genome_entry("genome", g_.name, g_.share, g_.context,
+                                    g_.val["chrom"].unique(maintain_order=True).to_list(),
+                                    interim_dir("genome", g_.name) / "contigs.parquet") for g_ in genomes]
+    if mito:
+        rec_genomes.append(RR.genome_entry("mito", mito, mito_share, "per sequence: its genetic code table",
+                                           mito_val["chrom"].to_list(), mito_src / "contigs.parquet",
+                                           codes=sorted(mito_codes)))
+    for k_x, e_x in enumerate(x_list):
+        g_x = next((g_ for g_ in genomes if g_.name == e_x["name"]), None)
+        rec_genomes.append(RR.genome_entry("ntv3_extra", e_x["name"], shares_.get(f"extra{k_x}"),
+                                           int(e_x.get("context", 0)),
+                                           g_x.val["chrom"].unique(maintain_order=True).to_list() if g_x else [],
+                                           interim_dir("genome", e_x["name"]) / "contigs.parquet"))
+    ctx_rows = {}
+    if ctx_on:
+        ctx_rows["nuclear"] = 0
+        for c_ in sorted(mito_codes):
+            ctx_rows[f"organelle:genetic_code_{c_}"] = int(c_)
+        for e_ in rec_genomes:
+            if e_["role"] in ("primary", "genome", "ntv3_extra") and isinstance(e_["context"], int):
+                ctx_rows[f"{e_['role']}:{e_['name']}"] = e_["context"]
+    record = RR.make_record(
+        options=run_options, source=RR.source_info(Path(G.__file__).parent), genomes=rec_genomes,
+        input_channels=G.input_channel_registry(config.n_in_extra, ("repeat",) if repeat_channel else ()),
+        context_rows=ctx_rows,
+        resolved=dict(n_contexts=config.n_contexts, n_in_extra=config.n_in_extra, ctx_on=ctx_on, arch=arch,
+                      curriculum=phases, steps=steps, eval_window=eval_window, world_size=world,
+                      held_out_chroms_requested=sorted(held), window_shares=shares_, config=config.to_dict(),
+                      n_parameters=model.n_parameters(), torch=torch.__version__))
     step, hours = 0, 0.0
     if ckpt.exists() and not bench:
         state = torch.load(ckpt, map_location="cpu")
+        if state.get("run_record") is not None:
+            diffs = RR.identity_differences(state["run_record"], record)
+        else:                         # older code: the multi-genome branch stored only the further genomes
+            diffs = RR.legacy_differences(state.get("genomes", []), record)
+            say("note: the checkpoint has no run record (older code); only its --genome list can be checked")
+        if diffs:
+            raise typer.BadParameter(f"refusing to resume {ckpt}: this run's genomes, held-out sets or context ids "
+                                     f"differ from the checkpoint's record: " + "; ".join(diffs)
+                                     + ". Start a new run directory instead (with --init to keep the weights).")
         model.load_state_dict(state["model"])
         opt.load_state_dict(state["optimizer"])
         step, hours = state["step"], state.get("hours", 0.0)
@@ -1354,10 +1478,30 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
     elif init is not None and not bench:
         # reserved room (stem input channels, context rows) is zero-padded explicitly, function-preserving; new
         # heads stay missing (strict=False) as before, and any other shape mismatch still raises
-        grown, notes = G.expand_state_dict(torch.load(init, map_location="cpu")["model"], model)
+        init_state = torch.load(init, map_location="cpu")
+        grown, notes = G.expand_state_dict(init_state["model"], model, new_contexts=new_contexts)
         missing, unexpected = model.load_state_dict(grown, strict=False)
         say(f"initialised from {init}; new: {missing}; dropped: {unexpected}; padded: {notes or 'nothing'}")
+        old_rows = int(init_state["model"]["context.weight"].shape[0]) if "context.weight" in init_state["model"] else 0
+        fresh = sorted({g_.context for g_ in genomes if g_.context >= old_rows})
+        if fresh:
+            say(f"context ids {fresh} are new rows of this model: they start as "
+                + ("copies of the checkpoint's nuclear row 0" if new_contexts == "nuclear" else
+                   "zero (the checkpoint without a context vector, not its nuclear row; --new-contexts nuclear "
+                   "copies row 0)"))
+        record["init_from"] = dict(path=str(init), step=init_state.get("step"), new_contexts=new_contexts,
+                                   padded=notes, commit=(init_state.get("run_record") or {}).get("source", {})
+                                   .get("commit"))
+        del init_state
         step = start_step
+    if main and not bench:
+        record["started_at_step"] = step
+        rec_path = out / "run_record.json"
+        if rec_path.exists():                                    # a resumption keeps the original record
+            rec_path = out / f"run_record.step{step}.json"
+        RR.write_json(rec_path, record)
+        say(f"run record: {rec_path} (commit {record['source'].get('commit')}, "
+            f"{len(record['genomes'])} genomes, input channels {record['input_channels']})")
     say(f"KronGenome {arch} {model.n_parameters() / 1e6:.1f}M parameters, curriculum "
                f"{', '.join(f'{w:,} x {n:,} steps' for w, n in phases)}, eval window {eval_window:,}, "
                f"{train_idx.height} train / {val_idx.height} held-out contigs")
@@ -1403,9 +1547,17 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
         else:   # held-out masks are always plain MASK (bert only in training), so runs with and without it compare
             inputs, targets = G.mask_bases(seq.to(dev), mask_prob, generator=mask_gen,
                                            bert=bert_mask and model.training)
+        fwd_kw = {}                     # training-only inputs; evaluation always reads hard bases, no repeat channel
+        if model.training and soft_base_rate > 0:                       # [B, 6, L] fractional bases (heterozygous-like)
+            inputs = G.soft_base_channels(inputs, targets, soft_base_rate)
+        if model.training and repeat_channel and rep_batch:
+            extra_in = torch.zeros(seq.shape[0], n_in_extra, seq.shape[-1], device=dev)
+            extra_in[:, G.EXTRA_INPUT_CHANNELS["repeat"]] = rep_batch[0].to(dev).float()
+            fwd_kw["extra"] = extra_in
         with autocast:
             logits, ctx_core, tracks = (train_model if model.training else model)(inputs, seg.to(dev),
-                                                                                   ctx.to(dev) if ctx_on else None)
+                                                                                   ctx.to(dev) if ctx_on else None,
+                                                                                   **fwd_kw)
         if clean:
             mlm = logits.float().sum() * 0.0                             # no masked base to score
         else:
@@ -1475,7 +1627,7 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                         st_[4] += (x_ * x_).sum(0).cpu(); st_[5] += (y_ * y_).sum(0).cpu()
         if target is not None and model.training and model.last_jepa is not None:
             with torch.no_grad(), autocast:
-                _, want_core, _ = target(seq.to(dev), seg.to(dev), ctx.to(dev) if ctx_on else None)
+                _, want_core, _ = target(seq.to(dev), seg.to(dev), ctx.to(dev) if ctx_on else None, **fwd_kw)
             keep_bins = seg.to(dev) == 0                                # not padding
             cos = F.cosine_similarity(model.last_jepa.float(), want_core.float(), dim=-1)
             jepa_losses.append(float((1 - cos)[keep_bins].mean().detach()))
@@ -1567,7 +1719,7 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                                               share=mito_share / (1.0 - genome_total),   # absolute (x / 1.0 == x)
                                               annot=annot_oversample,
                                               extra=ntv3_extra_share if ntv3 and ntv3["extra"] else 0.0,
-                                              genomes=genomes))
+                                              genomes=genomes, rep=repeat_channel))
             ((loss + track_weight * track if track is not None else loss) / grad_accum).backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         opt.step()
@@ -1715,6 +1867,7 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                           **({"ntv3": {"ids": list(ntv3["ids"]), "loss": ntv3_loss, "target": ntv3_target,
                                        "center": ntv3_center, "extra": [e_x["name"] for e_x in ntv3["extra"]],
                                        "mlm_weight": mlm_weight}} if ntv3 else {}),
+                          "run_record": record,
                           **({"genomes": [dict(name=g_.name, share=g_.share, context=g_.context,
                                                held_out=g_.val["chrom"].unique(maintain_order=True).to_list())
                                           for g_ in genomes]} if genomes else {})}, ckpt)

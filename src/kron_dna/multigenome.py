@@ -184,7 +184,7 @@ def check_contexts(genomes: list[FurtherGenome], n_contexts: int, mito_codes: se
             continue
         if n_contexts <= 0:
             raise GenomeSpecError(f"--genome {g.name}: context {c} needs a context table, but this model has none "
-                                  f"(it gets one with --mito, 34 entries, or with --n-contexts once merged)")
+                                  f"(it gets one with --mito, 34 entries, or with --n-contexts N; ids in genome.CONTEXT_RANGES)")
         if c >= n_contexts:
             raise GenomeSpecError(f"--genome {g.name}: context {c} is beyond the model's context table "
                                   f"({n_contexts} entries, ids 0..{n_contexts - 1})")
