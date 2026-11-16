@@ -1513,6 +1513,7 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
     model = G.KronGenome(config).to(dev)
     model.checkpoint_core = checkpoint_core
     split_devs = None                                 # --split-cards: the cards one window is divided over
+    split_by = "balanced" if pack_short else None     # packs may hold an odd number of short rows (genome.split_plan)
     if split_cards > 1:
         if dev.type == "cuda" and torch.cuda.device_count() < (dev.index or 0) + split_cards:
             raise typer.BadParameter(f"--split-cards {split_cards} needs {split_cards} visible cards from "
@@ -1747,7 +1748,8 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
         with autocast:
             if split_now:
                 pieces, ctx_core = model.forward_split(inputs, seg.to(dev), ctx.to(dev) if ctx_on else None,
-                                                       devices=split_devs, halo=split_halo or None, **fwd_kw)
+                                                       devices=split_devs, halo=split_halo or None, by=split_by,
+                                                       **fwd_kw)
                 logits = tracks = None
             else:
                 logits, ctx_core, tracks = (train_model if model.training else model)(inputs, seg.to(dev),
@@ -1830,7 +1832,7 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
             with torch.no_grad(), autocast:
                 if split_now:           # the target's core states only: encoder pieces + core, no decoder
                     _, want_core = target.forward_split(seq.to(dev), seg.to(dev), ctx.to(dev) if ctx_on else None,
-                                                        devices=split_devs, halo=split_halo or None,
+                                                        devices=split_devs, halo=split_halo or None, by=split_by,
                                                         core_only=True, **fwd_kw)
                 else:
                     _, want_core, _ = target(seq.to(dev), seg.to(dev), ctx.to(dev) if ctx_on else None, **fwd_kw)

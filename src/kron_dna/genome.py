@@ -952,11 +952,26 @@ def split_plan(batch: int, length: int, n: int, unit: int, halo: int, by: str | 
     """``n`` pieces of a ``[batch, length]`` window: ``(by, rows, start, end, lo, hi)`` each, where the piece owns
     bases ``start:end`` of ``rows`` and is encoded over ``lo:hi`` (its stretch plus ``halo`` each side, clipped
     to the window). ``by``: "rows" (whole windows, no halo; needs ``batch % n == 0``), "length" (contiguous
-    stretches on ``unit`` boundaries), or None: rows when the batch divides evenly, else length."""
+    stretches on ``unit`` boundaries), None: rows when the batch divides evenly, else length; or "balanced"
+    (--short-sources pack, whose packs may hold an odd number of short rows): rows when the batch divides
+    evenly, else whichever of uneven whole rows (``ceil(batch / n)`` rows on the busiest piece, no halo) and
+    length pieces (with their halo) puts fewer encoded bases on the busiest piece; ties go to length."""
     if n < 1:
         raise ValueError("split over at least one device")
     if length % unit or halo % unit or halo < 0:
         raise ValueError(f"length and halo must be non-negative multiples of {unit}")
+    if by == "balanced":
+        if batch % n == 0:
+            by = "rows"
+        else:
+            bins_ = length // unit
+            cuts_ = [round(i * bins_ / n) * unit for i in range(n + 1)]
+            by_len = max(min(length, e + halo) - max(0, s - halo) for s, e in zip(cuts_[:-1], cuts_[1:])) * batch
+            by_row = -(-batch // n) * length if batch >= n else None
+            if by_row is not None and by_row < by_len:
+                edges = [round(i * batch / n) for i in range(n + 1)]        # uneven: sizes differ by at most one
+                return [("rows", slice(a, b), 0, length, 0, length) for a, b in zip(edges[:-1], edges[1:])]
+            by = "length"
     by = by or ("rows" if batch % n == 0 else "length")
     if by == "rows":
         if batch % n:
