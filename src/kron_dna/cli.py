@@ -811,6 +811,22 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                                               "states: none, vicreg (variance hinge + covariance) or sigreg (LeJEPA: "
                                               "random projections towards an isotropic Gaussian, Epps-Pulley)"),
                  jepa_reg_weight: float = typer.Option(1.0, help="weight of --jepa-reg"),
+                 jepa_block_share: float = typer.Option(0.0, help="with --jepa-weight, block JEPA: hide this fraction "
+                                                        "of each training row's bins in contiguous blocks (MASK in "
+                                                        "the online input, the repeat channel zeroed, no soft bases "
+                                                        "there; the target reads the clean row) and train the "
+                                                        "predictor on the hidden bins. 0: off, as before"),
+                 jepa_block_len: str = typer.Option("1024:8192", help="with --jepa-block-share: LO:HI block lengths "
+                                                    "in bases (multiples of 2**n_down), drawn log-uniformly"),
+                 jepa_on: str = typer.Option("hidden", help="with --jepa-block-share: the bins the JEPA loss is a mean "
+                                             "over: hidden (the blocks) or all (every non-padding bin)"),
+                 jepa_block_heads: str = typer.Option("exclude", help="with --jepa-block-share: exclude (default) "
+                                                      "keeps positions inside blocks out of the masked-base, NTv3 "
+                                                      "track, epigenome and --labels track losses; include scores "
+                                                      "them there as elsewhere"),
+                 jepa_log_every: int = typer.Option(0, help="with --jepa-weight: also write a jepa.csv row (and print "
+                                                    "it) every this many steps; 0: only at evaluations, and only "
+                                                    "with --jepa-block-share"),
                  start_step: int = typer.Option(0, help="with --init: continue the schedule (curriculum, LR, paired "
                                                 "evals) from this step, so the init run's own history is the control"),
                  stop_step: int = typer.Option(0, help="stop after this step (0: the end of the curriculum)"),
@@ -950,6 +966,21 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
     if mlm_weight == 0 and (whole_contigs or jepa_weight > 0 or labels):
         raise typer.BadParameter("--mlm-weight 0 (a track stage on unmasked input) does not take --whole-contigs, "
                                  "--jepa-weight or --labels")
+    if not 0.0 <= jepa_block_share <= 0.9:
+        raise typer.BadParameter("--jepa-block-share must lie in [0, 0.9]")
+    if jepa_block_share > 0 and (jepa_weight <= 0 or whole_contigs or arch == "v3"):
+        raise typer.BadParameter("--jepa-block-share needs --jepa-weight > 0 and does not take --whole-contigs or "
+                                 "--arch v3")
+    if jepa_on not in ("hidden", "all") or jepa_block_heads not in ("exclude", "include"):
+        raise typer.BadParameter("--jepa-on must be hidden or all, --jepa-block-heads exclude or include")
+    if jepa_log_every < 0 or (jepa_log_every > 0 and jepa_weight <= 0):
+        raise typer.BadParameter("--jepa-log-every must be >= 0 and needs --jepa-weight > 0")
+    if jepa_block_share > 0:
+        try:
+            block_lo, block_hi = G.parse_block_len(jepa_block_len, unit)
+        except ValueError as err:
+            raise typer.BadParameter(f"--jepa-block-len: {err}") from None
+    jepa_log = main and jepa_weight > 0 and (jepa_block_share > 0 or jepa_log_every > 0)   # jepa.csv (rank 0 writes)
     if not (0.0 <= soft_base_rate <= 1.0 and 0.0 <= repeat_channel_drop <= 1.0):
         raise typer.BadParameter("--soft-base-rate and --repeat-channel-drop must lie in [0, 1]")
     if whole_contigs and (soft_base_rate > 0 or repeat_channel):
@@ -1633,12 +1664,27 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
             inputs, targets = G.mask_bases(seq.to(dev), mask_prob, generator=mask_gen,
                                            bert=bert_mask and model.training)
         fwd_kw = {}                     # training-only inputs; evaluation always reads hard bases, no repeat channel
+        # --jepa-block-share: hidden bins [B, bins] and bases [B, L] of this training batch (None: no blocks). The
+        # blocks come from a stream of their own, so the masks and everything else drawn are those of a run without
+        # them; inside a block the online input is MASK only, drawn before the soft bases so none lands there.
+        blk_bins = blk_at = None
+        tgt_kw = fwd_kw                 # what the JEPA target reads beside the clean sequence
+        if jepa_block_share > 0 and model.training and not clean:
+            blk_bins = torch.from_numpy(G.block_mask(seg.numpy(), seq.numpy(), unit, jepa_block_share, block_lo,
+                                                     block_hi, block_rng)).to(dev)
+            inputs, targets, _, blk_at = G.hide_blocks(inputs, targets, blk_bins, unit,
+                                                       exclude=jepa_block_heads == "exclude")
         if model.training and soft_base_rate > 0:                       # [B, 6, L] fractional bases (heterozygous-like)
             inputs = G.soft_base_channels(inputs, targets, soft_base_rate)
         if model.training and repeat_channel and rep_batch:
             extra_in = torch.zeros(seq.shape[0], n_in_extra, seq.shape[-1], device=dev)
             extra_in[:, G.EXTRA_INPUT_CHANNELS["repeat"]] = rep_batch[0].to(dev).float()
             fwd_kw["extra"] = extra_in
+            if blk_at is not None:      # the target keeps the repeat channel; the online input loses it in blocks
+                tgt_kw = {"extra": extra_in}
+                fwd_kw = {"extra": extra_in.masked_fill(blk_at.unsqueeze(1), 0.0)}
+        skip_at = blk_at if jepa_block_heads == "exclude" else None    # [B, L] bases the other heads do not score
+        parts_log = {} if jepa_log and model.training else None        # this micro-batch's loss terms, for jepa.csv
         with autocast:
             logits, ctx_core, tracks = (train_model if model.training else model)(inputs, seg.to(dev),
                                                                                    ctx.to(dev) if ctx_on else None,
@@ -1647,6 +1693,8 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
             mlm = logits.float().sum() * 0.0                             # no masked base to score
         else:
             mlm = F.cross_entropy(logits.float().reshape(-1, 4), targets.reshape(-1), ignore_index=-100)
+            if parts_log is not None:
+                parts_log["mlm"] = float(mlm.detach())
             if model.training and mlm_weight != 1.0:
                 mlm = mlm * mlm_weight
         if chunk_ratio and model.training and model.last_ratio_loss is not None:
@@ -1659,7 +1707,11 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
             # those are ~94% of bins, so down-weighting them puts the loss on the bins that carry the question.
             w_e = ok_e.float() if epigenome_focus >= 1.0 else \
                 ok_e.float() * (has_e.float() + (~has_e).float() * epigenome_focus)
+            if skip_at is not None:                                      # a weighted mean over the visible bins
+                w_e = w_e * (~blk_bins).float()
             loss_e = (per_e * w_e.unsqueeze(-1)).sum() / (w_e.sum().clamp_min(1) * per_e.shape[-1])
+            if parts_log is not None:
+                parts_log["epi"] = float(loss_e.detach())
             if model.training:
                 mlm = mlm + epigenome_weight * loss_e
             elif not track_only:
@@ -1683,6 +1735,8 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                 if ntv3_focus < 1.0:                                      # all-zero positions are most of the genome
                     sig = (want_n > 0).any(-1).float()
                     ok_n = ok_n * (sig + (1 - sig) * ntv3_focus)
+                if skip_at is not None:                                   # supervise visible positions only
+                    ok_n = ok_n * (~skip_at).float()
                 if ntv3_loss == "poisson":
                     loss_n = G.poisson_multinomial_loss(pred, tgt, ok_n.unsqueeze(-1) * col_n.unsqueeze(1).float())
                 elif ntv3["extra"]:                                       # each window: its own species' channels
@@ -1693,6 +1747,8 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                     loss_n = ((pred - tgt).pow(2).mean(-1) * ok_n).sum() / ok_n.sum().clamp_min(1)
                 mlm = mlm + ntv3_weight * loss_n
                 ntv3_losses.append(float(loss_n.detach()))
+                if parts_log is not None:
+                    parts_log["ntv3"] = ntv3_losses[-1]
             elif score_ntv3:
                 # score in log1p units whatever the head was trained in, so arms stay comparable and the number
                 # means the same thing the paper's does. 4 = chr8/chr9 (never seen at all), 3 = NTv3's own test
@@ -1712,12 +1768,42 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                         st_[4] += (x_ * x_).sum(0).cpu(); st_[5] += (y_ * y_).sum(0).cpu()
         if target is not None and model.training and model.last_jepa is not None:
             with torch.no_grad(), autocast:
-                _, want_core, _ = target(seq.to(dev), seg.to(dev), ctx.to(dev) if ctx_on else None, **fwd_kw)
+                _, want_core, _ = target(seq.to(dev), seg.to(dev), ctx.to(dev) if ctx_on else None, **tgt_kw)
             keep_bins = seg.to(dev) == 0                                # not padding
             cos = F.cosine_similarity(model.last_jepa.float(), want_core.float(), dim=-1)
-            jepa_losses.append(float((1 - cos)[keep_bins].mean().detach()))
-            mlm = mlm + jepa_weight * (1 - cos)[keep_bins].mean()
-            z = ctx_core.float()[keep_bins]                             # [N, d] context core states, no padding
+            if blk_bins is None:
+                jepa_losses.append(float((1 - cos)[keep_bins].mean().detach()))
+                mlm = mlm + jepa_weight * (1 - cos)[keep_bins].mean()
+                z = ctx_core.float()[keep_bins]                         # [N, d] context core states, no padding
+            else:
+                # block JEPA: the loss is a mean over the hidden bins (--jepa-on all: over every non-padding bin).
+                # The anti-collapse term below reads the online states of the VISIBLE bins only: those are the
+                # states of real sequence (what the target produces), while a hidden bin's online state is the
+                # model's summary of a blanked stretch and need not follow the same distribution.
+                vis_bins = keep_bins & ~blk_bins
+                on_bins = blk_bins if jepa_on == "hidden" else keep_bins
+                jepa_term = (1 - cos)[on_bins].mean() if bool(on_bins.any()) else cos.sum() * 0.0
+                jepa_losses.append(float(jepa_term.detach()))
+                mlm = mlm + jepa_weight * jepa_term
+                z = ctx_core.float()[vis_bins]
+            if parts_log is not None:                                   # jepa.csv: no gradient, no random numbers
+                with torch.no_grad():
+                    hid_ = blk_bins if blk_bins is not None else torch.zeros_like(keep_bins)
+                    vis_ = keep_bins & ~hid_
+                    d_pred = 1 - cos.detach()
+                    d_copy = 1 - F.cosine_similarity(ctx_core.detach().float(), want_core.float(), dim=-1)
+                    nan_ = float("nan")
+
+                    def mean_on(x, m):
+                        return float(x[m].mean()) if bool(m.any()) else nan_
+
+                    def std_on(m):
+                        zz = ctx_core.detach().float()[m]
+                        return float(torch.sqrt(zz.var(0) + 1e-4).mean()) if zz.shape[0] > 1 else nan_
+                    parts_log.update(jepa_hidden=mean_on(d_pred, hid_), jepa_visible=mean_on(d_pred, vis_),
+                                     copy_hidden=mean_on(d_copy, hid_), copy_visible=mean_on(d_copy, vis_),
+                                     hidden_share=float(hid_.sum()) / max(float(keep_bins.sum()), 1.0),
+                                     core_std_hidden=std_on(hid_), core_std_visible=std_on(vis_))
             if z.shape[0] > 4096:                                       # a random subset keeps the terms cheap
                 z = z[torch.randperm(z.shape[0], device=z.device)[:4096]]
             z = z - z.mean(0)
@@ -1736,10 +1822,16 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                 gauss = torch.exp(-tg.pow(2) / 2)                       # N(0, 1)'s characteristic function
                 ep = ((ecf_re - gauss).pow(2) + ecf_im.pow(2)) * gauss  # Epps-Pulley, Gaussian-weighted
                 mlm = mlm + jepa_reg_weight * ep.mean()
+        if parts_log is not None:
+            parts_log["core_std"] = jepa_std[-1] if target is not None and model.last_jepa is not None else float("nan")
+            parts_log["total"] = float(mlm.detach())
+            jepa_rows.append(parts_log)
         if lab is None:
             return mlm, None
         want = G.track_targets(lab.to(dev), act.to(dev))
         ok = valid.to(dev)
+        if skip_at is not None:                                   # a mean over the visible positions
+            ok = ok & ~skip_at
         per = F.binary_cross_entropy_with_logits(tracks.float(), want, pos_weight=pos_weight, reduction="none")
         track = (per * ok.unsqueeze(-1) * train_mask).sum() / (ok.sum().clamp_min(1) * train_mask.sum())
         if keep is not None:                                      # held-out scores for tracks.csv
@@ -1805,8 +1897,49 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
     track_csv = out / "tracks.csv"
     if main and labels and not track_csv.exists():
         track_csv.write_text("step,track,auroc,average_precision,prevalence\n")
+    # block JEPA (--jepa-block-share) and jepa.csv. The blocks have a random stream of their own (per card, and per
+    # start step so a resumed run does not replay its first blocks); metrics.csv is not touched.
+    block_rng = np.random.default_rng([seed, rank, 2029, step]) if jepa_block_share > 0 else None
+    jepa_rows: list[dict] = []                        # each training micro-batch's terms since the last jepa.csv row
+    jepa_secs, jepa_peak, jepa_steps = 0.0, 0.0, 0
+    jepa_csv = out / "jepa.csv"
+    jepa_cols = ("jepa_hidden", "jepa_visible", "copy_hidden", "copy_visible", "hidden_share", "core_std",
+                 "core_std_visible", "core_std_hidden", "train_mlm", "train_epigenome", "train_ntv3", "train_total")
+    jepa_keys = ("jepa_hidden", "jepa_visible", "copy_hidden", "copy_visible", "hidden_share", "core_std",
+                 "core_std_visible", "core_std_hidden", "mlm", "epi", "ntv3", "total")
+    if jepa_block_share > 0:
+        say(f"block JEPA: {jepa_block_share:g} of each row's bins hidden in blocks of {block_lo * unit:,}-"
+            f"{block_hi * unit:,} bases (log-uniform, {unit}-base bins); JEPA loss on {jepa_on} bins; other heads "
+            f"{jepa_block_heads} block positions; {jepa_reg} on visible bins")
+    if jepa_log and not jepa_csv.exists():
+        jepa_csv.write_text("step," + ",".join(jepa_cols) + ",sec_per_step,peak_gib,window,steps\n")
+
+    def jepa_row(step_: int, win_: int) -> None:
+        """One jepa.csv row and log line: means over the training micro-batches since the last row (nan: no bin of
+        that kind, or the term is off)."""
+        nonlocal jepa_secs, jepa_peak, jepa_steps
+        if not jepa_rows:
+            return
+        avg = []
+        for k_ in jepa_keys:
+            v_ = [r_[k_] for r_ in jepa_rows if k_ in r_ and not math.isnan(r_[k_])]
+            avg.append(float(np.mean(v_)) if v_ else float("nan"))
+        a_ = dict(zip(jepa_keys, avg))
+        sec_ = jepa_secs / max(jepa_steps, 1)
+        with jepa_csv.open("a") as fh:
+            fh.write(f"{step_}," + ",".join(f"{v_:.5f}" for v_ in avg)
+                     + f",{sec_:.3f},{jepa_peak:.2f},{win_},{jepa_steps}\n")
+        say(f"jepa step {step_}: hidden bins {a_['jepa_hidden']:.4f}, visible bins {a_['jepa_visible']:.4f}; copy "
+            f"baseline hidden {a_['copy_hidden']:.4f}, visible {a_['copy_visible']:.4f}; hidden share "
+            f"{a_['hidden_share']:.4f}; core std {a_['core_std']:.3f} (hidden bins {a_['core_std_hidden']:.3f}); "
+            f"masked-base {a_['mlm']:.4f}, epigenome {a_['epi']:.4f}, NTv3 {a_['ntv3']:.4f}, total {a_['total']:.4f}; "
+            f"{sec_:.2f} s/step, peak {jepa_peak:.1f} GiB, mean of {jepa_steps} steps")
+        jepa_rows.clear()
+        jepa_secs, jepa_peak, jepa_steps = 0.0, 0.0, 0
+
     model.train()
     while step < (stop_step or steps):
+        t_step = time.time()
         for g in opt.param_groups:
             g["lr"] = lr * min(1.0, (step + 1) / warmup) * 0.5 * (1 + math.cos(math.pi * min(step / steps, 1.0)))
         torch.cuda.reset_peak_memory_stats(dev)
@@ -1846,6 +1979,13 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
             flag = torch.tensor([float(out_of_time)], device=dev)
             dist.broadcast(flag, 0)
             out_of_time = bool(flag.item())
+        if jepa_log:
+            jepa_secs += time.time() - t_step
+            jepa_steps += 1
+            jepa_peak = max(jepa_peak, torch.cuda.max_memory_allocated(dev) / 2**30)
+            if (step % eval_every == 0 or step == steps or out_of_time
+                    or (jepa_log_every > 0 and step % jepa_log_every == 0)):
+                jepa_row(step, win)
         if (step % eval_every == 0 or step == steps or out_of_time) and not main:
             dist.barrier()                              # rank 0 evaluates and saves
         elif step % eval_every == 0 or step == steps or out_of_time:

@@ -9,6 +9,7 @@ Stage 1 trains masked-base prediction (no tracks needed); stage 2 adds track hea
 """
 from __future__ import annotations
 
+import math
 from dataclasses import asdict, dataclass
 
 import numpy as np
@@ -768,6 +769,106 @@ def mask_bases(seq: torch.Tensor, prob: float = 0.15, generator: torch.Generator
     inputs = torch.where(pick & (u < 0.8), torch.full_like(seq, MASK_CHANNEL), seq)
     inputs = torch.where(pick & (u >= 0.8) & (u < 0.9), rand_base, inputs)
     return inputs, labels
+
+
+def parse_block_len(spec: str, unit: int) -> tuple[int, int]:
+    """``genome-train --jepa-block-len LO:HI`` (bases) -> ``(lo, hi)`` in bins of ``unit`` bases. Both must be
+    positive multiples of ``unit`` with ``LO <= HI``; a single number means ``LO = HI``."""
+    parts = spec.split(":")
+    try:
+        lo, hi = (int(parts[0]), int(parts[-1])) if len(parts) in (1, 2) else (0, 0)
+    except ValueError:
+        lo = hi = 0
+    if lo <= 0 or hi < lo or lo % unit or hi % unit:
+        raise ValueError(f"block lengths must be LO:HI in bases, positive multiples of {unit} with LO <= HI, "
+                         f"got {spec!r}")
+    return lo // unit, hi // unit
+
+
+def place_blocks(n: int, share: float, lo: int, hi: int, rng: np.random.Generator) -> list[tuple[int, int]]:
+    """Contiguous blocks to hide in a run of ``n`` bins: ``[(start, length), ...]`` in bins, sorted, non-overlapping.
+
+    The run's quota is ``k = round(share * n)`` bins (at most ``n - 1``, so something stays visible), and the blocks'
+    lengths sum to ``k`` exactly: the realised share is within half a bin (``0.5 / n``) of ``share``. Lengths are
+    drawn log-uniformly from the integers ``lo..hi`` (``P(l) ~ log((l + 1) / l)``) until the quota is filled; the
+    last draw is cut to what is left, and if that leaves it shorter than ``lo`` the bins are moved between it and the
+    block before it so that both stay inside ``lo..hi`` (always possible when ``hi >= 2 * lo - 1``; otherwise the two
+    are merged into one block of at most ``hi + lo - 1``). So every block lies in ``lo..hi`` except that a run whose
+    whole quota is below ``lo`` gets one block of ``k`` bins, and at most two blocks per run are not plain
+    log-uniform draws. The blocks are put in random order and placed uniformly at random among all placements that
+    leave at least one visible bin between neighbours (two blocks never touch; if the run is too full for that,
+    touching is allowed)."""
+    k = min(int(math.floor(share * n + 0.5)), n - 1)
+    if k <= 0:
+        return []
+    lo_, hi_ = min(lo, k), min(hi, k)
+    lens, left = [], k
+    while left > 0:
+        l_ = min(max(int(math.exp(rng.uniform(math.log(lo_), math.log(hi_ + 1)))), lo_), hi_, left)
+        lens.append(l_)
+        left -= l_
+    if len(lens) > 1 and lens[-1] < lo_:                       # the cut-off last block is too short
+        r_ = lens[-1]
+        if lens[-2] + r_ > hi_ and lens[-2] - (lo_ - r_) >= lo_:
+            lens[-2] -= lo_ - r_
+            lens[-1] = lo_
+        else:
+            lens.pop()
+            lens[-1] += r_
+    m = len(lens)
+    lens = [lens[i] for i in rng.permutation(m)]
+    free = n - k
+    gap = 1 if free >= m - 1 else 0                            # visible bins kept between neighbouring blocks
+    spare = free - gap * (m - 1)
+    cuts = np.sort(rng.choice(spare + m, size=m, replace=False))   # stars and bars: spare bins before each block
+    out, done = [], 0
+    for i in range(m):
+        start = int(cuts[i]) - i + gap * i + done
+        out.append((start, lens[i]))
+        done += lens[i]
+    return out
+
+
+def block_mask(segments: np.ndarray, seq: np.ndarray | None, unit: int, share: float, lo: int, hi: int,
+               rng: np.random.Generator) -> np.ndarray:
+    """Hidden bins for block JEPA (``genome-train --jepa-block-share``): ``segments`` ``[B, bins]`` (0 = sequence,
+    anything else = padding), ``seq`` ``[B, bins * unit]`` base codes -> ``[B, bins]`` bool. Each row is treated on
+    its own, and within a row each maximal run of sequence bins gets :func:`place_blocks` with its own quota, so any
+    number of rows of any length works. Padding bins are never hidden, and neither is a sequence bin that carries
+    padding itself: one that ends in N and is followed by padding or by the end of the row (the last bin of a source
+    whose length is not a multiple of ``unit``)."""
+    segments = np.asarray(segments)
+    ok = segments == 0
+    if seq is not None:
+        ends_n = np.asarray(seq)[:, unit - 1::unit] == 4
+        before_pad = np.ones_like(ok)
+        before_pad[:, :-1] = ~ok[:, 1:]
+        ok = ok & ~(ends_n & before_pad)
+    out = np.zeros(ok.shape, dtype=bool)
+    for b in range(ok.shape[0]):
+        edges = np.flatnonzero(np.diff(np.concatenate([[False], ok[b], [False]]).astype(np.int8)))
+        for a, z in zip(edges[::2], edges[1::2]):               # each run [a, z) of sequence bins
+            for start, length in place_blocks(int(z - a), share, lo, hi, rng):
+                out[b, a + start:a + start + length] = True
+    return out
+
+
+def hide_blocks(inputs: torch.Tensor, targets: torch.Tensor | None, blocks: torch.Tensor, unit: int,
+                extra: torch.Tensor | None = None, exclude: bool = True):
+    """The online (context) input of block JEPA. ``inputs`` ``[B, L]`` integer base codes (after
+    :func:`mask_bases`), ``blocks`` ``[B, L / unit]`` bool hidden bins: every base of a hidden bin becomes MASK,
+    whatever it was (a base, N, a BERT replacement). ``exclude``: the masked-LM ``targets`` inside blocks become
+    -100, so the head is not scored on blanked input. ``extra`` ``[B, C, L]`` per-base side channels (the repeat
+    mask) are zeroed inside blocks, the value a window without that channel has. Returns ``(inputs, targets, extra,
+    at)`` with ``at`` ``[B, L]`` bool, the hidden bases. Apply it before :func:`soft_base_channels`, which only mixes
+    positions that still show a base, so no fractional base is drawn inside a block."""
+    at = blocks.repeat_interleave(unit, dim=1)
+    inputs = inputs.masked_fill(at, MASK_CHANNEL)
+    if exclude and targets is not None:
+        targets = targets.masked_fill(at, -100)
+    if extra is not None:
+        extra = extra.masked_fill(at.unsqueeze(1), 0.0)
+    return inputs, targets, extra, at
 
 
 def poisson_multinomial_loss(pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor, scale_weight: float = 0.2,
