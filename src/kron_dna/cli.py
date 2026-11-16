@@ -857,6 +857,12 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                  mito: str = typer.Option("", help="also train on this prepared organelle genome (genome-prepare-mito), "
                                           "each sequence tagged with its genetic code table as context (nuclear: 0)"),
                  mito_share: float = typer.Option(0.03, help="with --mito: share of training windows from it"),
+                 genome: list[str] = typer.Option([], "--genome", help="repeatable: a further prepared genome for the "
+                                                  "masked-base loss, NAME:SHARE[:CONTEXT[:HELD]] - SHARE of all "
+                                                  "training windows, CONTEXT id (0 nuclear), HELD its held-out "
+                                                  "contigs joined by '+' or 'none' (default: its contigs.parquet "
+                                                  "'held_out' column). Its windows train masked bases only; "
+                                                  "held-out bits/base are reported per genome (see multigenome.py)"),
                  seed: int = 0) -> None:
     """The multi-track model (KronGenome) over whole gap-free contigs: stage 1 masked-base prediction; with
     ``--labels``, stage 2 adds the Ensembl and GENCODE tracks of ``genome-labels`` and writes ``tracks.csv``.
@@ -919,6 +925,30 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
         mito_train, mito_val = mito_idx.filter(~pl.col("held_out")), mito_idx.filter(pl.col("held_out"))
         say(f"mito: {mito_train.height} train / {mito_val.height} held-out genomes "
                    f"({int(mito_train['len'].sum()):,} / {int(mito_val['len'].sum()):,} bases), share {mito_share}")
+
+    # --genome: further genomes for the masked-base loss, each with its share, context id and held-out contigs.
+    # Their shares are fractions of ALL training windows, and so is --mito's once they are given (it is then drawn
+    # with mito_share / (1 - their sum) among the rest); without --genome no extra draw is made, so the default
+    # window stream is the one before this option existed.
+    from kron_dna import multigenome as MG
+    try:
+        if genome and whole_contigs:
+            raise MG.GenomeSpecError("--whole-contigs does not take --genome")
+        genome_specs = MG.parse_genome_specs(genome, primary=name, other_share=mito_share if mito else 0.0)
+        genomes = MG.load_further_genomes(genome_specs, lambda n_: interim_dir("genome", n_))
+    except MG.GenomeSpecError as err:
+        raise typer.BadParameter(str(err)) from None
+    genome_total = float(sum(g_.share for g_ in genomes))
+    genome_cum = MG.cumulative_shares(genomes)
+    mito_codes = {int(c_) for c_ in mito_idx["code"].unique().to_list()} if mito else set()
+    for g_ in genomes:
+        longest_ = int(g_.train["len"].max())
+        say(f"genome {g_.name}: share {g_.share:g}, context {g_.context}, {g_.train.height} train / "
+            f"{g_.val.height} held-out contigs ({int(g_.train['len'].sum()):,} / {int(g_.val['len'].sum()):,} bases)"
+            + (f", held out: {'+'.join(g_.val['chrom'].unique(maintain_order=True).to_list())}" if g_.val.height
+               else ", no held-out set (no held-out bits/base)")
+            + (f"; longest training contig {longest_:,} < window {max(w for w, _ in phases):,}: taken whole and "
+               f"padded" if longest_ < max(w for w, _ in phases) else ""))
 
     if epigenome_weight > 0:
         regfeat = np.memmap(src / "regfeat.i32", dtype=np.int32, mode="r")
@@ -1076,6 +1106,14 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
             f"loss {ntv3_loss} on split==1 only" + (f", central {ntv3_center:g} of each window" if ntv3_center < 1 else "")
             + f", target {ntv3_target}"
             + (", base-major layout" if dense is not None else ", per-track files"))
+        for k_x, e_x in enumerate(ntv3["extra"]):       # also a --genome: its context, and its held-out contigs kept
+            g_x = next((g_ for g_ in genomes if g_.name == e_x["name"]), None)   # out of its track windows too
+            if g_x is not None:
+                e_x["table"], e_x["p"], e_x["context"] = g_x.train, g_x.train_p, g_x.context
+                rest_ = 1.0 - genome_total - (mito_share if mito else 0.0)
+                say(f"genome {g_x.name} is also an --ntv3-extra species: window share {g_x.share:g} (--genome, "
+                    f"masked bases only) + {rest_ * ntv3_extra_share * ntv3['extra_p'][k_x]:.4f} (--ntv3-extra, "
+                    f"masked bases and its tracks), context {g_x.context} for both, its held-out contigs in neither")
 
     def epi_targets(at: int, take: int, window: int, flip: bool) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """``[bins, E]`` bool: an epigenome is active in a 128-bp bin when an element active there covers a base of
@@ -1125,10 +1163,13 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
         return tuple(out)
 
     def sample(table, window=window, batch=None, gen=None, flip=False, mito_table=None, share=0.0, annot=0.0,
-               extra=0.0, extra_force=None) -> tuple[torch.Tensor, ...]:
+               extra=0.0, extra_force=None, genomes=(), force_genome=None) -> tuple[torch.Tensor, ...]:
         """``batch`` windows: (seqs, segments, contexts[, labels, activity, valid]). With ``mito_table``, each row comes
         from it with probability ``share``; a circular genome is read across its origin when the window is shorter.
-        Context 0 is nuclear; an organelle sequence's context is its genetic code table (1..33)."""
+        Context 0 is nuclear; an organelle sequence's context is its genetic code table (1..33). With ``genomes``
+        (--genome), one uniform draw first sends a row to further genome k with probability its share (its training
+        contigs, by length, masked bases only, its context id); ``force_genome`` k draws every row from ``table``
+        (that genome's held-out contigs) instead."""
         gen = gen or rng
         batch = batch or batch_size
         p = table["len"].to_numpy() / table["len"].sum()                 # contigs by length: every base equally
@@ -1136,13 +1177,25 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
         epi_t, epi_v, epi_e = [], [], []
         nt_t, nt_s, nt_c, nt_x = [], [], [], []
         for _ in range(batch):
-            from_mito = mito_table is not None and gen.random() < share
+            fg = force_genome                        # a further genome's index (--genome), else None
+            if fg is None and genomes:               # no draw at all without --genome: the default stream is unchanged
+                fg = MG.pick_genome(gen.random(), genome_cum)
+            from_mito = fg is None and mito_table is not None and gen.random() < share
             xs = None                                # a further species' index (--ntv3-extra), else None
             if extra_force is not None:
                 xs = extra_force
-            elif not from_mito and extra > 0 and gen.random() < extra:
+            elif fg is None and not from_mito and extra > 0 and gen.random() < extra:
                 xs = int(gen.choice(len(ntv3["extra"]), p=ntv3["extra_p"]))
-            if xs is not None:
+            if fg is not None:
+                g_ = genomes[fg]
+                tab_, p_ = (table, p) if force_genome is not None else (g_.train, g_.train_p)
+                r = tab_.row(int(gen.choice(tab_.height, p=p_)), named=True)
+                take = min(window, r["len"])
+                at = r["offset"] + int(gen.integers(0, r["len"] - take + 1))
+                codes = np.full(window, 4, dtype=np.int64)
+                codes[:take] = g_.bases[at:at + take]
+                ctxs.append(int(g_.context))
+            elif xs is not None:
                 e_ = ntv3["extra"][xs]
                 if extra_force is not None and len(e_["test_pos"]):       # an eval window around a test position
                     k = int(gen.integers(0, len(e_["test_pos"])))
@@ -1155,7 +1208,7 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                     at = r["offset"] + int(gen.integers(0, r["len"] - take + 1))
                 codes = np.full(window, 4, dtype=np.int64)
                 codes[:take] = e_["bases"][at:at + take]
-                ctxs.append(0)                                            # nuclear (context 0)
+                ctxs.append(int(e_.get("context", 0)))                    # nuclear (0) unless --genome gave one
             elif from_mito:
                 r = mito_table.row(int(gen.integers(0, mito_table.height)), named=True)   # each genome alike
                 take = min(window, r["len"])
@@ -1187,7 +1240,7 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
             if flip_row:
                 codes[:take] = G.reverse_complement(codes[:take].astype(np.uint8))
             if epigenome_weight > 0:
-                if from_mito or xs is not None:                           # no human Regulatory Build there
+                if from_mito or xs is not None or fg is not None:         # no human Regulatory Build there
                     epi_t.append(np.zeros((window // epi_unit, n_epi), dtype=bool))
                     epi_v.append(np.zeros(window // epi_unit, dtype=bool))
                     epi_e.append(np.zeros(window // epi_unit, dtype=bool))
@@ -1204,7 +1257,7 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                     nt[:take, e_["lo"]:e_["hi"]] = e_["dense"][at:at + take]
                     sp_[:take] = e_["split"][at:at + take]
                     cm_[e_["lo"]:e_["hi"]] = True
-                elif not from_mito:                                       # organelle windows have no nuclear tracks
+                elif not from_mito and fg is None:                        # organelle windows have no nuclear tracks
                     n_h = ntv3["n_h"]
                     if ntv3["dense"] is not None:
                         nt[:take, :n_h] = ntv3["dense"][at:at + take][:, ntv3["cols"]]
@@ -1226,13 +1279,13 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
             segs.append(seg)
             if labels:
                 lab, act = np.zeros(window, dtype=np.uint8), np.zeros(window, dtype=np.uint8)
-                if not from_mito and xs is None:
+                if not from_mito and xs is None and fg is None:
                     lab[:take], act[:take] = lab_mm[at:at + take], act_mm[at:at + take]
                     if flip_row:                                          # the current tracks are not strand-specific
                         lab[:take], act[:take] = lab[:take][::-1].copy(), act[:take][::-1].copy()
                 labs.append(lab)
                 acts.append(act)
-                valid.append((np.arange(window) < take) & (not from_mito) & (xs is None))
+                valid.append((np.arange(window) < take) & (not from_mito) & (xs is None) & (fg is None))
         epi_batch[:] = [(torch.from_numpy(np.stack(epi_t)), torch.from_numpy(np.stack(epi_v)),
                          torch.from_numpy(np.stack(epi_e)))] if epi_t else []
         ntv3_batch[:] = [(torch.from_numpy(np.stack(nt_t)), torch.from_numpy(np.stack(nt_s)),
@@ -1251,6 +1304,11 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                                 chunk_length_feature=chunk_length_feature,
                                 **(dict(zip(("local_width", "local_layers", "local_span"),
                                             map(int, local_track.split(",")))) if local_track else {}))
+    try:                                              # --genome context ids against the table this model has
+        MG.check_contexts(genomes, config.n_contexts, mito_codes)
+    except MG.GenomeSpecError as err:
+        raise typer.BadParameter(str(err)) from None
+    ctx_on = config.n_contexts > 0                    # the model reads context ids (today: exactly when --mito)
     model = G.KronGenome(config).to(dev)
     model.checkpoint_core = checkpoint_core
     if compile_convs:
@@ -1333,7 +1391,7 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                                            bert=bert_mask and model.training)
         with autocast:
             logits, ctx_core, tracks = (train_model if model.training else model)(inputs, seg.to(dev),
-                                                                                   ctx.to(dev) if mito else None)
+                                                                                   ctx.to(dev) if ctx_on else None)
         if clean:
             mlm = logits.float().sum() * 0.0                             # no masked base to score
         else:
@@ -1403,7 +1461,7 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                         st_[4] += (x_ * x_).sum(0).cpu(); st_[5] += (y_ * y_).sum(0).cpu()
         if target is not None and model.training and model.last_jepa is not None:
             with torch.no_grad(), autocast:
-                _, want_core, _ = target(seq.to(dev), seg.to(dev), ctx.to(dev) if mito else None)
+                _, want_core, _ = target(seq.to(dev), seg.to(dev), ctx.to(dev) if ctx_on else None)
             keep_bins = seg.to(dev) == 0                                # not padding
             cos = F.cosine_similarity(model.last_jepa.float(), want_core.float(), dim=-1)
             jepa_losses.append(float((1 - cos)[keep_bins].mean().detach()))
@@ -1468,10 +1526,14 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
     chunk_rates: list[float] = []
     t0, started = time.time(), time.time()
     metrics = out / "metrics.csv"
+    g_eval = [k for k, g_ in enumerate(genomes) if g_.val.height]     # further genomes with a held-out set
+    header = ("step,lr,train_loss,val_bits_per_base,hours" + (",train_track_loss,val_track_loss" if labels else "")
+              + (",val_mito_bits_per_base" if mito else "")
+              + "".join(f",val_bits_per_base_{genomes[k].name}" for k in g_eval))   # new columns go last
     if main and not metrics.exists():
-        metrics.write_text("step,lr,train_loss,val_bits_per_base,hours" + (",train_track_loss,val_track_loss"
-                                                                           if labels else "")
-                           + (",val_mito_bits_per_base" if mito else "") + "\n")
+        metrics.write_text(header + "\n")
+    elif main and metrics.read_text().split("\n", 1)[0] != header:
+        say(f"warning: {metrics} has other columns than this run writes ({header}); rows are appended anyway")
     track_csv = out / "tracks.csv"
     if main and labels and not track_csv.exists():
         track_csv.write_text("step,track,auroc,average_precision,prevalence\n")
@@ -1487,9 +1549,11 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                 loss, track = contig_loss(*sample_contig(train_idx, longest=bench))
             else:
                 loss, track = loss_on(*sample(train_idx, window=win, batch=bat, flip=rc,
-                                              mito_table=mito_train if mito else None, share=mito_share,
+                                              mito_table=mito_train if mito else None,
+                                              share=mito_share / (1.0 - genome_total),   # absolute (x / 1.0 == x)
                                               annot=annot_oversample,
-                                              extra=ntv3_extra_share if ntv3 and ntv3["extra"] else 0.0))
+                                              extra=ntv3_extra_share if ntv3 and ntv3["extra"] else 0.0,
+                                              genomes=genomes))
             ((loss + track_weight * track if track is not None else loss) / grad_accum).backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         opt.step()
@@ -1551,6 +1615,14 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                     mito_bits = float(np.mean([loss_on(*sample(mito_val, window=mw, batch=4, gen=eval_rng,
                                                                mito_table=mito_val, share=1.0), mask_gen=mask_gen)[0].item()
                                                for _ in range(8)])) / math.log(2)
+                genome_bits = []
+                for k in g_eval:   # each further genome on its own held-out contigs, from streams of its own so the
+                    g_rng = np.random.default_rng([seed, step, 1009, k])     # paired draws above stay bit-for-bit
+                    g_mask = torch.Generator(device=dev).manual_seed(int(g_rng.integers(1 << 62)))
+                    genome_bits.append(float(np.mean([loss_on(*sample(
+                        genomes[k].val, window=eval_window, batch=batch_size if arch == "v1" else 1,  # as above
+                        gen=g_rng, genomes=genomes, force_genome=k), mask_gen=g_mask, track_only=True,
+                        score_ntv3=False)[0].item() for _ in range(8)])) / math.log(2))
             model.train()
             h = hours + (time.time() - t0) / 3600
             bits = float(np.mean([m.item() for m, _ in pairs])) / math.log(2)
@@ -1612,10 +1684,12 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
             tracks_note = extra
             if mito_bits is not None:
                 extra += f",{mito_bits:.4f}"
+            extra += "".join(f",{b_:.4f}" for b_ in genome_bits)
             with metrics.open("a") as fh:
                 fh.write(f"{step},{opt.param_groups[0]['lr']:.3e},{loss.item():.4f},{bits:.4f},{h:.3f}{extra}\n")
             say(f"step {step} (window {win:,} x {bat}): train {loss.item():.4f}, held-out {bits:.3f} bits/base"
                        + (f", mito {mito_bits:.3f}" if mito_bits is not None else "")
+                       + "".join(f", {genomes[k].name} {b_:.3f}" for k, b_ in zip(g_eval, genome_bits))
                        + (f", jepa {np.mean(jepa_losses):.4f} (core std {np.mean(jepa_std):.3f})" if jepa_losses else "")
                        + (f", chunk every {unit / np.mean(chunk_rates):.0f} bp" if chunk_rates else "") + f", {h:.2f} h, "
                        f"peak {torch.cuda.max_memory_allocated(dev) / 2**30:.1f} GiB" + (f", tracks {tracks_note}" if tracks_note else ""))
@@ -1626,7 +1700,10 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                           "step": step, "hours": h,
                           **({"ntv3": {"ids": list(ntv3["ids"]), "loss": ntv3_loss, "target": ntv3_target,
                                        "center": ntv3_center, "extra": [e_x["name"] for e_x in ntv3["extra"]],
-                                       "mlm_weight": mlm_weight}} if ntv3 else {})}, ckpt)
+                                       "mlm_weight": mlm_weight}} if ntv3 else {}),
+                          **({"genomes": [dict(name=g_.name, share=g_.share, context=g_.context,
+                                               held_out=g_.val["chrom"].unique(maintain_order=True).to_list())
+                                          for g_ in genomes]} if genomes else {})}, ckpt)
             if world > 1:
                 dist.barrier()
         if out_of_time:
