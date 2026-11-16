@@ -827,6 +827,23 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                  jepa_log_every: int = typer.Option(0, help="with --jepa-weight: also write a jepa.csv row (and print "
                                                     "it) every this many steps; 0: only at evaluations, and only "
                                                     "with --jepa-block-share"),
+                 jepa_guard: str = typer.Option("off", help="with --jepa-weight, JEPA collapse guard: off (default, "
+                                                "as before), monitor (at every evaluation, collapse measures of the "
+                                                "core states on fixed held-out windows in jepa.csv and the log) or on "
+                                                "(monitor, and when the entropy rank falls below --jepa-guard-rank x "
+                                                "its running maximum or the smallest per-dimension std below "
+                                                "--jepa-guard-std x its running median at two evaluations in a row, "
+                                                "double the --jepa-reg weight at each such evaluation up to "
+                                                "--jepa-guard-cap x; triggered again at the cap: save and stop with "
+                                                "exit code 42)"),
+                 jepa_guard_windows: int = typer.Option(8, help="with --jepa-guard: number of fixed held-out windows"),
+                 jepa_guard_window: int = typer.Option(131072, help="with --jepa-guard: bases per monitoring window"),
+                 jepa_guard_rank: float = typer.Option(0.5, help="with --jepa-guard: entropy-rank trigger, a share "
+                                                       "of its running maximum"),
+                 jepa_guard_std: float = typer.Option(0.05, help="with --jepa-guard: per-dimension std trigger, a "
+                                                      "share of the running median of the minimum"),
+                 jepa_guard_cap: float = typer.Option(8.0, help="with --jepa-guard on: the largest factor on the "
+                                                      "--jepa-reg weight"),
                  start_step: int = typer.Option(0, help="with --init: continue the schedule (curriculum, LR, paired "
                                                 "evals) from this step, so the init run's own history is the control"),
                  stop_step: int = typer.Option(0, help="stop after this step (0: the end of the curriculum)"),
@@ -980,7 +997,25 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
             block_lo, block_hi = G.parse_block_len(jepa_block_len, unit)
         except ValueError as err:
             raise typer.BadParameter(f"--jepa-block-len: {err}") from None
-    jepa_log = main and jepa_weight > 0 and (jepa_block_share > 0 or jepa_log_every > 0)   # jepa.csv (rank 0 writes)
+    if jepa_guard not in ("off", "monitor", "on"):
+        raise typer.BadParameter("--jepa-guard must be off, monitor or on")
+    if jepa_guard != "off":
+        if jepa_weight <= 0 or whole_contigs or arch == "v3":
+            raise typer.BadParameter("--jepa-guard needs --jepa-weight > 0 and does not take --whole-contigs or "
+                                     "--arch v3")
+        if jepa_guard == "on" and jepa_reg == "none":
+            raise typer.BadParameter("--jepa-guard on raises the --jepa-reg weight: it needs --jepa-reg sigreg or vicreg")
+        if (jepa_guard_windows < 1 or jepa_guard_window <= 0 or jepa_guard_window % unit
+                or not (0 < jepa_guard_rank < 1 and 0 < jepa_guard_std < 1) or jepa_guard_cap < 2):
+            raise typer.BadParameter(f"--jepa-guard-windows must be >= 1, --jepa-guard-window a positive multiple of "
+                                     f"{unit}, --jepa-guard-rank and --jepa-guard-std in (0, 1), --jepa-guard-cap >= 2")
+        try:
+            guard_lo, guard_hi = G.parse_block_len(jepa_block_len, unit)
+        except ValueError as err:
+            raise typer.BadParameter(f"--jepa-block-len: {err}") from None
+    guard = G.jepa_guard_new()          # --jepa-guard state; with off its factor stays 1 and the loss is as before
+    guard_saved = None                  # the state a resumed checkpoint carries
+    jepa_log = main and jepa_weight > 0 and (jepa_block_share > 0 or jepa_log_every > 0 or jepa_guard != "off")
     if not (0.0 <= soft_base_rate <= 1.0 and 0.0 <= repeat_channel_drop <= 1.0):
         raise typer.BadParameter("--soft-base-rate and --repeat-channel-drop must lie in [0, 1]")
     if whole_contigs and (soft_base_rate > 0 or repeat_channel):
@@ -1591,6 +1626,7 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
         opt.load_state_dict(state["optimizer"])
         step, hours = state["step"], state.get("hours", 0.0)
         say(f"resumed at step {step}")
+        guard_saved = state.get("jepa_guard")
     elif init is not None and not bench:
         # reserved room (stem input channels, context rows) is zero-padded explicitly, function-preserving; new
         # heads stay missing (strict=False) as before, and any other shape mismatch still raises
@@ -1809,10 +1845,12 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
             z = z - z.mean(0)
             std = torch.sqrt(z.var(0) + 1e-4)
             jepa_std.append(float(std.mean().detach()))
+            # --jepa-guard on raises the regulariser's weight; at factor 1 it is the configured weight, untouched
+            reg_w = jepa_reg_weight if guard["mult"] == 1.0 else jepa_reg_weight * guard["mult"]
             if jepa_reg == "vicreg":
                 cov = (z.T @ z) / (z.shape[0] - 1)
                 off = cov - torch.diag(torch.diag(cov))
-                mlm = mlm + jepa_reg_weight * (torch.relu(1 - std).mean() + off.pow(2).sum() / z.shape[1])
+                mlm = mlm + reg_w * (torch.relu(1 - std).mean() + off.pow(2).sum() / z.shape[1])
             elif jepa_reg == "sigreg":
                 dirs = torch.randn(z.shape[1], 64, device=z.device)
                 proj = (z / std.mean()) @ (dirs / dirs.norm(dim=0))     # [N, 64] 1-D projections
@@ -1821,7 +1859,7 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                 ecf_re, ecf_im = torch.cos(arg).mean(0), torch.sin(arg).mean(0)
                 gauss = torch.exp(-tg.pow(2) / 2)                       # N(0, 1)'s characteristic function
                 ep = ((ecf_re - gauss).pow(2) + ecf_im.pow(2)) * gauss  # Epps-Pulley, Gaussian-weighted
-                mlm = mlm + jepa_reg_weight * ep.mean()
+                mlm = mlm + reg_w * ep.mean()
         if parts_log is not None:
             parts_log["core_std"] = jepa_std[-1] if target is not None and model.last_jepa is not None else float("nan")
             parts_log["total"] = float(mlm.detach())
@@ -1911,8 +1949,32 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
         say(f"block JEPA: {jepa_block_share:g} of each row's bins hidden in blocks of {block_lo * unit:,}-"
             f"{block_hi * unit:,} bases (log-uniform, {unit}-base bins); JEPA loss on {jepa_on} bins; other heads "
             f"{jepa_block_heads} block positions; {jepa_reg} on visible bins")
+    jepa_head = ["step", *jepa_cols, "sec_per_step", "peak_gib", "window", "steps"]
+    if jepa_guard != "off":             # the guard's rows (one per evaluation) share the file: row = train | guard
+        jepa_head += ["row", "g_entropy_rank", "g_participation_ratio", "g_std_min", "g_std_mean", "g_std_median",
+                      "g_jepa_hidden", "g_jepa_visible", "g_copy_hidden", "g_copy_visible", "g_top1_hidden",
+                      "g_top1_chance", "g_reg_weight", "g_mult", "g_hits", "g_trigger_rank", "g_trigger_std",
+                      "g_ref_max_rank", "g_ref_median_std_min", "g_action", "g_windows"]
     if jepa_log and not jepa_csv.exists():
-        jepa_csv.write_text("step," + ",".join(jepa_cols) + ",sec_per_step,peak_gib,window,steps\n")
+        jepa_csv.write_text(",".join(jepa_head) + "\n")
+    elif jepa_log:                      # a resumed run: keep its rows, widened (or kept wider) to one header
+        lines_ = jepa_csv.read_text().rstrip("\n").split("\n")
+        have_ = lines_[0].split(",")
+        if have_ != jepa_head:
+            if have_ == jepa_head[:len(have_)]:
+                pad_ = ["train" if c_ == "row" else "" for c_ in jepa_head[len(have_):]]
+                jepa_csv.write_text("\n".join([",".join(jepa_head)] + [",".join([ln_] + pad_) for ln_ in lines_[1:]
+                                                                         if ln_]) + "\n")
+            elif jepa_head == have_[:len(jepa_head)]:
+                jepa_head = have_
+            else:
+                jepa_csv.rename(out / f"jepa.csv.before-step{step}")
+                jepa_csv.write_text(",".join(jepa_head) + "\n")
+
+    def jepa_write(vals: dict) -> None:
+        """Append one jepa.csv row; ``vals`` maps column names to formatted text (missing: empty)."""
+        with jepa_csv.open("a") as fh:
+            fh.write(",".join(vals.get(c_, "") for c_ in jepa_head) + "\n")
 
     def jepa_row(step_: int, win_: int) -> None:
         """One jepa.csv row and log line: means over the training micro-batches since the last row (nan: no bin of
@@ -1926,9 +1988,9 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
             avg.append(float(np.mean(v_)) if v_ else float("nan"))
         a_ = dict(zip(jepa_keys, avg))
         sec_ = jepa_secs / max(jepa_steps, 1)
-        with jepa_csv.open("a") as fh:
-            fh.write(f"{step_}," + ",".join(f"{v_:.5f}" for v_ in avg)
-                     + f",{sec_:.3f},{jepa_peak:.2f},{win_},{jepa_steps}\n")
+        jepa_write({"step": str(step_), **{c_: f"{v_:.5f}" for c_, v_ in zip(jepa_cols, avg)},
+                    "sec_per_step": f"{sec_:.3f}", "peak_gib": f"{jepa_peak:.2f}", "window": str(win_),
+                    "steps": str(jepa_steps), "row": "train"})
         say(f"jepa step {step_}: hidden bins {a_['jepa_hidden']:.4f}, visible bins {a_['jepa_visible']:.4f}; copy "
             f"baseline hidden {a_['copy_hidden']:.4f}, visible {a_['copy_visible']:.4f}; hidden share "
             f"{a_['hidden_share']:.4f}; core std {a_['core_std']:.3f} (hidden bins {a_['core_std_hidden']:.3f}); "
@@ -1936,6 +1998,68 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
             f"{sec_:.2f} s/step, peak {jepa_peak:.1f} GiB, mean of {jepa_steps} steps")
         jepa_rows.clear()
         jepa_secs, jepa_peak, jepa_steps = 0.0, 0.0, 0
+
+    # --jepa-guard: restore its state on resume (with off a saved state is ignored and the loss is the configured
+    # one); fixed held-out monitoring windows (rank 0 measures, whatever the seed: the same windows in every run)
+    if guard_saved is not None:
+        if jepa_guard == "on":
+            guard.update({k_: v_ for k_, v_ in guard_saved.items() if k_ in guard})
+            guard["stopped"] = False                # a resumed run gets its evaluations again
+            say(f"jepa guard: state restored from the checkpoint: --jepa-reg weight x{guard['mult']:g}, "
+                f"{guard['hits']} triggered evaluation(s) in a row, running max entropy rank "
+                f"{guard['max_rank'] if guard['max_rank'] is None else round(guard['max_rank'], 2)}, "
+                f"{len(guard['std_mins'])} reference minima")
+        else:
+            say(f"jepa guard: the checkpoint carries a guard state (--jepa-reg weight x{guard_saved.get('mult', 1.0):g}); "
+                f"not applied with --jepa-guard {jepa_guard}")
+            if jepa_guard == "monitor":
+                guard.update({k_: v_ for k_, v_ in guard_saved.items() if k_ in ("max_rank", "std_mins", "evals")})
+    guard_win = []
+    if jepa_guard != "off" and main:
+        g_rng = np.random.default_rng(20261117)
+        g_rows = [r_ for r_ in val_idx.iter_rows(named=True) if r_["len"] > jepa_guard_window]
+        if not g_rows:
+            raise typer.BadParameter(f"--jepa-guard-window {jepa_guard_window:,}: no held-out contig is that long")
+        g_share = jepa_block_share if jepa_block_share > 0 else 0.2
+        for _ in range(200 * jepa_guard_windows):
+            if len(guard_win) == jepa_guard_windows:
+                break
+            r_ = g_rows[int(g_rng.integers(len(g_rows)))]
+            at_ = int(r_["offset"]) + int(g_rng.integers(0, int(r_["len"]) - jepa_guard_window + 1))
+            s_ = np.asarray(bases[at_:at_ + jepa_guard_window]).astype(np.int64)
+            if (s_ < 4).mean() < 0.9:               # assembly gaps: no core states worth watching
+                continue
+            pick_ = (g_rng.random(jepa_guard_window) < mask_prob) & (s_ < 4)
+            hid_ = G.block_mask(np.zeros((1, jepa_guard_window // unit), dtype=np.int64), s_[None], unit, g_share,
+                                guard_lo, guard_hi, g_rng)[0]
+            guard_win.append((s_, pick_, hid_))
+        if not guard_win:
+            raise typer.BadParameter("--jepa-guard: no held-out window with at least 90% known bases")
+        say(f"jepa guard ({jepa_guard}): {len(guard_win)} fixed held-out windows of {jepa_guard_window:,} bases "
+            f"({', '.join(sorted(set(val_idx['chrom'].to_list())))}), blocks {g_share:g} of bins + {mask_prob:g} "
+            f"scattered MASK; trigger: entropy rank < {jepa_guard_rank:g} x running max or min dim std < "
+            f"{jepa_guard_std:g} x running median, two evaluations in a row"
+            + (f"; then --jepa-reg weight x2 per evaluation up to x{jepa_guard_cap:g}, then stop (exit 42)"
+               if jepa_guard == "on" else "; monitor only"))
+
+    def guard_measure() -> dict:
+        """Collapse measures on the fixed windows (inference; the online model, its predictor and the target)."""
+        tgt_ = target if target is not None and jepa_ema > 0 else None     # EMA 0: the target is the model
+        cl_, tg_, on_, pr_ = [], [], [], []
+        with torch.no_grad(), autocast:
+            for s_, pick_, hid_ in guard_win:
+                x_ = torch.from_numpy(s_)[None].to(dev)
+                seg_ = torch.zeros(1, s_.shape[0] // unit, dtype=torch.long, device=dev)
+                _, c_, _ = model(x_, seg_)
+                t_ = c_ if tgt_ is None else tgt_(x_, seg_)[1]
+                xo_ = x_.masked_fill(torch.from_numpy(pick_)[None].to(dev), G.MASK_CHANNEL)
+                xo_, _, _, _ = G.hide_blocks(xo_, None, torch.from_numpy(hid_)[None].to(dev), unit)
+                _, o_, _ = model(xo_, seg_)
+                p_ = model.jepa_pred(o_)
+                for l_, v_ in ((cl_, c_), (tg_, t_), (on_, o_), (pr_, p_)):
+                    l_.append(v_.float()[0])
+        hid_all = torch.from_numpy(np.stack([h_ for _, _, h_ in guard_win])).to(dev)
+        return G.jepa_guard_metrics(torch.stack(cl_), torch.stack(tg_), torch.stack(on_), torch.stack(pr_), hid_all)
 
     model.train()
     while step < (stop_step or steps):
@@ -2031,6 +2155,40 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                         genomes[k].val, window=eval_window, batch=batch_size if arch == "v1" else 1,  # as above
                         gen=g_rng, genomes=genomes, force_genome=k), mask_gen=g_mask, track_only=True,
                         score_ntv3=False)[0].item() for _ in range(8)])) / math.log(2))
+            guard_note = None
+            if jepa_guard != "off":         # collapse measures on the fixed windows, then the guard's decision
+                gm_ = guard_measure()
+                gi_ = G.jepa_guard_update(guard, gm_["entropy_rank"], gm_["std_min"], act=jepa_guard == "on",
+                                          rank_frac=jepa_guard_rank, std_frac=jepa_guard_std, cap=jepa_guard_cap)
+                reg_now = jepa_reg_weight * guard["mult"] if jepa_reg != "none" else 0.0
+                fmt_ = lambda v_: "" if v_ is None else (f"{v_:.6g}" if isinstance(v_, float) else str(v_))  # noqa: E731
+                if jepa_log:
+                    jepa_write({"step": str(step), "row": "guard", "window": str(jepa_guard_window),
+                                **{f"g_{k_}": fmt_(gm_[k_]) for k_ in ("entropy_rank", "participation_ratio", "std_min",
+                                                                       "std_mean", "std_median", "jepa_hidden",
+                                                                       "jepa_visible", "copy_hidden", "copy_visible",
+                                                                       "top1_hidden", "top1_chance", "windows")},
+                                "g_reg_weight": fmt_(float(reg_now)), "g_mult": fmt_(float(guard["mult"])),
+                                "g_hits": str(gi_["hits"]), "g_trigger_rank": str(int(gi_["trigger_rank"])),
+                                "g_trigger_std": str(int(gi_["trigger_std"])), "g_ref_max_rank": fmt_(gi_["ref_max_rank"]),
+                                "g_ref_median_std_min": fmt_(gi_["ref_median_std_min"]), "g_action": gi_["action"]})
+                guard_note = (f"jepa guard step {step}: entropy rank {gm_['entropy_rank']:.2f}, participation ratio "
+                              f"{gm_['participation_ratio']:.2f}, dim std min {gm_['std_min']:.4f} / mean "
+                              f"{gm_['std_mean']:.4f}; JEPA hidden {gm_['jepa_hidden']:.4f}, visible "
+                              f"{gm_['jepa_visible']:.4f}, copy hidden {gm_['copy_hidden']:.4f}; top-1 hidden "
+                              f"{gm_['top1_hidden']:.4f} (chance {gm_['top1_chance']:.4f}); --jepa-reg weight "
+                              f"{reg_now:g} (x{guard['mult']:g}); {gi_['action']}")
+                if gi_["action"] != "ok":
+                    why_ = " and ".join(w_ for w_, t_ in (
+                        (f"entropy rank {gm_['entropy_rank']:.2f} < {jepa_guard_rank:g} x running max "
+                         f"{gi_['ref_max_rank']}", gi_["trigger_rank"]),
+                        (f"min dim std {gm_['std_min']:.4g} < {jepa_guard_std:g} x running median "
+                         f"{gi_['ref_median_std_min']}", gi_["trigger_std"])) if t_)
+                    what_ = {"triggered": "first triggered evaluation, no action yet",
+                             "raise": f"--jepa-reg weight raised to x{guard['mult']:g} ({reg_now:g})",
+                             "would-raise": "would raise the --jepa-reg weight (monitor only)",
+                             "stop": f"still triggered at the cap x{jepa_guard_cap:g}: saving and stopping"}[gi_["action"]]
+                    guard_note += f"\nWARNING: JEPA collapse guard at step {step}: {why_} ({gi_['hits']} in a row): {what_}"
             model.train()
             h = hours + (time.time() - t0) / 3600
             bits = float(np.mean([m.item() for m, _ in pairs])) / math.log(2)
@@ -2095,6 +2253,8 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
             extra += "".join(f",{b_:.4f}" for b_ in genome_bits)
             with metrics.open("a") as fh:
                 fh.write(f"{step},{opt.param_groups[0]['lr']:.3e},{loss.item():.4f},{bits:.4f},{h:.3f}{extra}\n")
+            if guard_note:
+                say(guard_note)
             say(f"step {step} (window {win:,} x {bat}): train {loss.item():.4f}, held-out {bits:.3f} bits/base"
                        + (f", mito {mito_bits:.3f}" if mito_bits is not None else "")
                        + "".join(f", {genomes[k].name} {b_:.3f}" for k, b_ in zip(g_eval, genome_bits))
@@ -2112,11 +2272,26 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                                        "center": ntv3_center, "extra": [e_x["name"] for e_x in ntv3["extra"]],
                                        "mlm_weight": mlm_weight}} if ntv3 else {}),
                           "run_record": record,
+                          **({"jepa_guard": dict(guard, std_mins=list(guard["std_mins"]))} if jepa_guard != "off" else {}),
                           **({"genomes": [dict(name=g_.name, share=g_.share, context=g_.context,
                                                held_out=g_.val["chrom"].unique(maintain_order=True).to_list())
                                           for g_ in genomes]} if genomes else {})}, ckpt)
             if world > 1:
                 dist.barrier()
+        if jepa_guard == "on" and (step % eval_every == 0 or step == steps or out_of_time):
+            if world > 1:                               # rank 0 decided; every card takes its factor and verdict
+                flag_ = torch.tensor([guard["mult"], float(guard["stopped"])], device=dev, dtype=torch.float64)
+                dist.broadcast(flag_, 0)
+                guard["mult"], guard["stopped"] = float(flag_[0].item()), bool(flag_[1].item())
+            if guard["stopped"]:
+                msg_ = (f"JEPA collapse guard: stopped at step {step} (exit code 42): collapse still detected with the "
+                        f"--jepa-reg weight at x{guard['mult']:g}; checkpoint {ckpt} saved at this step")
+                say(msg_)
+                if main:
+                    (out / "JEPA_GUARD_STOP").write_text(msg_ + "\n")
+                if world > 1:
+                    dist.destroy_process_group()
+                raise typer.Exit(42)
         if out_of_time:
             say("stopping at --max-hours; resubmit the same command to continue")
             if world > 1:

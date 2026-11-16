@@ -871,6 +871,94 @@ def hide_blocks(inputs: torch.Tensor, targets: torch.Tensor | None, blocks: torc
     return inputs, targets, extra, at
 
 
+def core_rank(z: torch.Tensor) -> dict:
+    """Effective rank of core states ``z`` ``[N, d]`` (rows centred): ``entropy_rank`` = exp of the entropy of the
+    covariance eigenvalue shares, ``participation_ratio`` = (sum ev)^2 / sum ev^2 (both in 1..d), as in
+    ``v21/jepa_diag.py``."""
+    z = z.double()
+    z = z - z.mean(0)
+    ev = torch.linalg.eigvalsh(z.T @ z / max(z.shape[0] - 1, 1)).clamp(min=0)
+    if not bool(torch.isfinite(ev).all()) or float(ev.sum()) <= 0:
+        return dict(entropy_rank=float("nan"), participation_ratio=float("nan"))
+    p = ev / ev.sum()
+    ent = float(-(p[p > 0] * p[p > 0].log()).sum())
+    return dict(entropy_rank=math.exp(ent), participation_ratio=float(ev.sum() ** 2 / (ev ** 2).sum()))
+
+
+def jepa_guard_metrics(clean: torch.Tensor, target: torch.Tensor, online: torch.Tensor, pred: torch.Tensor,
+                       hidden: torch.Tensor) -> dict:
+    """Collapse monitoring of ``genome-train --jepa-guard`` on fixed held-out windows. ``clean`` ``[W, B, d]``: the
+    online model's core states of the clean windows (the states whose rank and spread are watched); ``target``: the
+    JEPA target's states of the same windows; ``online``: the online model's states with 15% scattered MASK plus
+    hidden blocks; ``pred``: the predictor on ``online``; ``hidden`` ``[W, B]`` bool. Returns the effective ranks
+    (:func:`core_rank` of all W*B states), per-dimension std (min, mean, median), the JEPA loss (1 - cosine) on hidden
+    and visible bins, the copy baseline (online state vs target, 1 - cosine) on hidden and visible bins, and top-1
+    retrieval of each hidden bin's prediction among the target states of its window (chance 1/B)."""
+    clean, target, online, pred = (t.float() for t in (clean, target, online, pred))
+    w, b, d = clean.shape
+    z = clean.reshape(-1, d)
+    out = core_rank(z)
+    sd = z.std(0)
+    out.update(std_min=float(sd.min()), std_mean=float(sd.mean()), std_median=float(sd.median()))
+    vis = ~hidden
+
+    def mean_on(x, m):
+        return float(x[m].mean()) if bool(m.any()) else float("nan")
+
+    d_pred = 1 - F.cosine_similarity(pred, target, dim=-1)
+    d_copy = 1 - F.cosine_similarity(online, target, dim=-1)
+    out.update(jepa_hidden=mean_on(d_pred, hidden), jepa_visible=mean_on(d_pred, vis),
+               copy_hidden=mean_on(d_copy, hidden), copy_visible=mean_on(d_copy, vis))
+    sim = F.normalize(pred, dim=-1) @ F.normalize(target, dim=-1).transpose(1, 2)        # [W, B, B]
+    top = sim.argmax(-1) == torch.arange(b, device=sim.device)
+    out.update(top1_hidden=mean_on(top.float(), hidden), top1_chance=1.0 / b, windows=w)
+    return out
+
+
+def jepa_guard_new() -> dict:
+    """The state of ``genome-train --jepa-guard`` (saved in the checkpoint as ``jepa_guard``): ``mult`` the factor on
+    the --jepa-reg weight, ``max_rank`` the running maximum of the entropy rank and ``std_mins`` the per-evaluation
+    minimum per-dimension std, both over the evaluations that did not trigger; ``hits`` consecutive triggered
+    evaluations; ``evals`` evaluations seen; ``stopped`` set when the guard stopped the run."""
+    return dict(mult=1.0, max_rank=None, std_mins=[], hits=0, evals=0, stopped=False)
+
+
+def jepa_guard_update(state: dict, rank: float, std_min: float, act: bool, rank_frac: float = 0.5,
+                      std_frac: float = 0.05, cap: float = 8.0) -> dict:
+    """One evaluation of the collapse guard (updates ``state`` in place, returns what happened).
+
+    Triggered when the entropy ``rank`` is below ``rank_frac`` x its running maximum, or ``std_min`` (the smallest
+    per-dimension std of the core states) below ``std_frac`` x the running median of earlier minima, or either is not
+    finite. The first evaluation only sets the references; a triggered evaluation does not enter them (a collapse
+    does not lower its own bar). At the second consecutive triggered evaluation, and at each further one, ``act``
+    doubles ``mult`` (at most ``cap``); a triggered evaluation with ``mult`` already at ``cap`` (and two or more in a
+    row) sets ``stopped``. Without ``act`` (``--jepa-guard monitor``) the same is computed and reported, nothing
+    changes but the references. ``action``: ok, triggered, raise, stop or would-raise."""
+    prev_max = state["max_rank"]
+    prev_med = float(np.median(state["std_mins"])) if state["std_mins"] else None
+    bad = not (math.isfinite(rank) and math.isfinite(std_min))
+    trig_rank = bad or (prev_max is not None and rank < rank_frac * prev_max)
+    trig_std = bad or (prev_med is not None and std_min < std_frac * prev_med)
+    trig = trig_rank or trig_std
+    state["evals"] += 1
+    if not trig:
+        state["max_rank"] = rank if prev_max is None else max(prev_max, rank)
+        state["std_mins"].append(std_min)
+    state["hits"] = state["hits"] + 1 if trig else 0
+    action = "triggered" if trig else "ok"
+    if state["hits"] >= 2:
+        if not act:
+            action = "would-raise"
+        elif state["mult"] < cap:
+            state["mult"] = min(state["mult"] * 2.0, cap)
+            action = "raise"
+        else:
+            state["stopped"] = True
+            action = "stop"
+    return dict(action=action, trigger_rank=bool(trig_rank), trigger_std=bool(trig_std), ref_max_rank=prev_max,
+                ref_median_std_min=prev_med, mult=state["mult"], hits=state["hits"])
+
+
 def poisson_multinomial_loss(pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor, scale_weight: float = 0.2,
                              eps: float = 1e-7) -> torch.Tensor:
     """NTv3's (and Borzoi's, AlphaGenome's) track objective for non-negative ``pred`` and ``target`` ``[B, L, T]``
