@@ -889,6 +889,11 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                  repeat_channel_drop: float = typer.Option(0.5, help="with --repeat-channel: fraction of training "
                                                            "windows whose repeat channel is zeroed, so the model "
                                                            "also works without it"),
+                 short_sources: str = typer.Option("pad", help="a training window whose contig is shorter than "
+                                                   "the window: 'pad' takes it whole and fills the window with N (as "
+                                                   "before), 'pack' turns it into several shorter rows of the same "
+                                                   "source that together hold about one window of real bases (the "
+                                                   "row lengths: packing.py). Evaluation is unchanged either way"),
                  seed: int = 0) -> None:
     """The multi-track model (KronGenome) over whole gap-free contigs: stage 1 masked-base prediction; with
     ``--labels``, stage 2 adds the Ensembl and GENCODE tracks of ``genome-labels`` and writes ``tracks.csv``.
@@ -951,6 +956,10 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
         raise typer.BadParameter("--whole-contigs does not take --soft-base-rate or --repeat-channel")
     if repeat_channel and n_in_extra < 1:
         raise typer.BadParameter("--repeat-channel feeds reserved input channel 0: it needs --n-in-extra >= 1")
+    if short_sources not in ("pad", "pack"):
+        raise typer.BadParameter("--short-sources must be 'pad' or 'pack'")
+    if short_sources == "pack" and whole_contigs:
+        raise typer.BadParameter("--whole-contigs does not take --short-sources pack (it reads whole contigs already)")
     if new_contexts not in ("zero", "nuclear"):
         raise typer.BadParameter("--new-contexts must be 'zero' or 'nuclear'")
     if new_contexts != "zero" and init is None:
@@ -985,8 +994,9 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
             f"{g_.val.height} held-out contigs ({int(g_.train['len'].sum()):,} / {int(g_.val['len'].sum()):,} bases)"
             + (f", held out: {'+'.join(g_.val['chrom'].unique(maintain_order=True).to_list())}" if g_.val.height
                else ", no held-out set (no held-out bits/base)")
-            + (f"; longest training contig {longest_:,} < window {max(w for w, _ in phases):,}: taken whole and "
-               f"padded" if longest_ < max(w for w, _ in phases) else ""))
+            + (f"; longest training contig {longest_:,} < window {max(w for w, _ in phases):,}: "
+               + ("read in shorter rows (--short-sources pack)" if short_sources == "pack" else "taken whole and "
+                  "padded") if longest_ < max(w for w, _ in phases) else ""))
 
     if epigenome_weight > 0:
         regfeat = np.memmap(src / "regfeat.i32", dtype=np.int32, mode="r")
@@ -1231,15 +1241,49 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
             out += [torch.from_numpy(lab), torch.from_numpy(act), torch.from_numpy(np.arange(n) < r["len"])]
         return tuple(out)
 
+    # --short-sources pack (packing.py): a training window whose contig is shorter than the window becomes a pack of
+    # shorter rows. pack_cells: each source's contigs by the row length they select, per window; tally: what the
+    # training sampler drew since the last report (kept for 'pad' too: it draws no random number).
+    from kron_dna import packing as PK
+    pack_short = short_sources == "pack"
+    pack_unit = math.lcm(unit, epi_unit)
+    pack_cells: dict = {}
+    tally = PK.Tally()
+    if pack_short:
+        w_ = max(w for w, _ in phases)
+        lad_ = PK.row_ladder(w_, pack_unit)
+        say(f"short sources: a training window whose contig is shorter than the window becomes a pack of shorter rows "
+            f"of that source (same length bucket) holding about one window of real bases; row lengths x rows at "
+            f"window {w_:,}: " + ", ".join(f"{r_}x{n_}" for r_, n_ in lad_[:10])
+            + (f", ... {lad_[-1][0]}x{lad_[-1][1]} ({len(lad_)} lengths)" if len(lad_) > 10 else ""))
+
+    def short(key, lengths, p_, length: int):
+        """(row length, further rows to draw, their bucket) of the pack that a contig of ``length`` (shorter than
+        the window) leads: ``key`` names the source, ``lengths`` and ``p_`` are its table's lengths and draw
+        probabilities (None: drawn uniformly)."""
+        window_ = int(key[-1])
+        if key not in pack_cells:
+            pack_cells[key] = PK.Buckets(lengths.to_numpy(), p_, PK.row_ladder(window_, pack_unit))
+        cell_ = pack_cells[key].cell(length)
+        return cell_.row, cell_.n - 1, cell_
+
     def sample(table, window=window, batch=None, gen=None, flip=False, mito_table=None, share=0.0, annot=0.0,
-               extra=0.0, extra_force=None, genomes=(), force_genome=None, rep=False) -> tuple[torch.Tensor, ...]:
+               extra=0.0, extra_force=None, genomes=(), force_genome=None, rep=False, pack=None):
         """``batch`` windows: (seqs, segments, contexts[, labels, activity, valid]). With ``mito_table``, each row comes
         from it with probability ``share``; a circular genome is read across its origin when the window is shorter.
         Context 0 is nuclear; an organelle sequence's context is its genetic code table (1..33). With ``genomes``
         (--genome), one uniform draw first sends a row to further genome k with probability its share (its training
         contigs, by length, masked bases only, its context id); ``force_genome`` k draws every row from ``table``
         (that genome's held-out contigs) instead. ``rep`` (--repeat-channel, training only) also reads each row's
-        repeat.u8 (zeros where a genome has none, or for a dropped window) into ``rep_batch``."""
+        repeat.u8 (zeros where a genome has none, or for a dropped window) into ``rep_batch``.
+
+        ``pack`` is given by the training loop only (None: evaluation, nothing below applies). True
+        (--short-sources pack): a window whose contig is shorter than ``window`` becomes a pack - rows of the longest
+        ladder length that contig fills, as many as fit one window, the further ones drawn from the same source's
+        contigs of the same length bucket (packing.py) - and the call returns a list of parts, one per row length
+        drawn: ``(weight, tensors, (epi, ntv3, repeat targets))``, the weight being the part's share of the
+        ``batch`` windows. Every window is still drawn exactly as before (same draws, same order), so the source
+        shares are per window as they were; a pack only replaces the padding by more rows of that source."""
         gen = gen or rng
         batch = batch or batch_size
         p = table["len"].to_numpy() / table["len"].sum()                 # contigs by length: every base equally
@@ -1247,24 +1291,33 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
         epi_t, epi_v, epi_e = [], [], []
         nt_t, nt_s, nt_c, nt_x = [], [], [], []
         rep_rows = []
-        for _ in range(batch):
+        row_len, row_wt = [], []                     # per row: its length, and its share of one window
+        left, more, cell, wrow = batch, 0, None, window   # windows to draw; rows left in the pack being filled, their
+        while left or more:                               # bucket and length (cell None, wrow == window: a full row)
             rsrc = None                              # --repeat-channel: this row's repeat.u8, read at rsel
-            fg = force_genome                        # a further genome's index (--genome), else None
-            if fg is None and genomes:               # no draw at all without --genome: the default stream is unchanged
-                fg = MG.pick_genome(gen.random(), genome_cum)
-            from_mito = fg is None and mito_table is not None and gen.random() < share
-            xs = None                                # a further species' index (--ntv3-extra), else None
-            if extra_force is not None:
-                xs = extra_force
-            elif fg is None and not from_mito and extra > 0 and gen.random() < extra:
-                xs = int(gen.choice(len(ntv3["extra"]), p=ntv3["extra_p"]))
+            if more:                                 # a further row of the pack: the source its first row drew
+                more -= 1
+            else:
+                left -= 1
+                cell, wrow = None, window
+                fg = force_genome                    # a further genome's index (--genome), else None
+                if fg is None and genomes:           # no draw at all without --genome: the default stream is unchanged
+                    fg = MG.pick_genome(gen.random(), genome_cum)
+                from_mito = fg is None and mito_table is not None and gen.random() < share
+                xs = None                            # a further species' index (--ntv3-extra), else None
+                if extra_force is not None:
+                    xs = extra_force
+                elif fg is None and not from_mito and extra > 0 and gen.random() < extra:
+                    xs = int(gen.choice(len(ntv3["extra"]), p=ntv3["extra_p"]))
             if fg is not None:
                 g_ = genomes[fg]
                 tab_, p_ = (table, p) if force_genome is not None else (g_.train, g_.train_p)
-                r = tab_.row(int(gen.choice(tab_.height, p=p_)), named=True)
-                take = min(window, r["len"])
+                r = tab_.row(cell.draw(gen) if cell else int(gen.choice(tab_.height, p=p_)), named=True)
+                if pack and cell is None and r["len"] < window:
+                    wrow, more, cell = short(("genome", fg, window), tab_["len"], p_, r["len"])
+                take = min(wrow, r["len"])
                 at = r["offset"] + int(gen.integers(0, r["len"] - take + 1))
-                codes = np.full(window, 4, dtype=np.int64)
+                codes = np.full(wrow, 4, dtype=np.int64)
                 codes[:take] = g_.bases[at:at + take]
                 ctxs.append(int(g_.context))
                 rsrc, rsel = rep_genome[fg], slice(at, at + take)
@@ -1276,40 +1329,50 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                     take = min(window, c_len)
                     at = min(max(c_off, int(e_["test_pos"][k]) - take // 2), c_off + c_len - take)
                 else:
-                    r = e_["table"].row(int(gen.choice(e_["table"].height, p=e_["p"])), named=True)
-                    take = min(window, r["len"])
+                    r = e_["table"].row(cell.draw(gen) if cell else int(gen.choice(e_["table"].height, p=e_["p"])),
+                                        named=True)
+                    if pack and cell is None and r["len"] < window:
+                        wrow, more, cell = short(("ntv3_extra", xs, window), e_["table"]["len"], e_["p"], r["len"])
+                    take = min(wrow, r["len"])
                     at = r["offset"] + int(gen.integers(0, r["len"] - take + 1))
-                codes = np.full(window, 4, dtype=np.int64)
+                codes = np.full(wrow, 4, dtype=np.int64)
                 codes[:take] = e_["bases"][at:at + take]
                 ctxs.append(int(e_.get("context", 0)))                    # nuclear (0) unless --genome gave one
                 rsrc, rsel = e_.get("rep"), slice(at, at + take)
             elif from_mito:
-                r = mito_table.row(int(gen.integers(0, mito_table.height)), named=True)   # each genome alike
-                take = min(window, r["len"])
+                r = mito_table.row(cell.draw(gen) if cell else int(gen.integers(0, mito_table.height)),
+                                   named=True)                            # each genome alike
+                if pack and cell is None and r["len"] < window:
+                    wrow, more, cell = short(("mito", window), mito_table["len"], None, r["len"])
+                take = min(wrow, r["len"])
                 if r["circular"]:                                         # read across the origin
                     pos = (int(gen.integers(0, r["len"])) + np.arange(take)) % r["len"]
                 else:
                     pos = int(gen.integers(0, r["len"] - take + 1)) + np.arange(take)
-                codes = np.full(window, 4, dtype=np.int64)
+                codes = np.full(wrow, 4, dtype=np.int64)
                 codes[:take] = mito_bases[r["offset"] + pos]
                 ctxs.append(int(r["code"]))                               # organelle: its genetic code table
                 rsrc, rsel = rep_mito, r["offset"] + pos
-            elif annot and annot_pos is not None and gen.random() < annot:
+            elif cell is None and annot and annot_pos is not None and gen.random() < annot:
                 k = int(gen.integers(0, len(annot_pos)))                  # a window that contains an annotated block
                 c_off, c_len = int(annot_coff[k]), int(annot_clen[k])
-                take = min(window, c_len)
+                if pack and c_len < window:                               # its pack's further rows: primary contigs
+                    wrow, more, cell = short(("primary", window), table["len"], p, c_len)   # of its bucket, by length
+                take = min(wrow, c_len)
                 lo = max(c_off, int(annot_pos[k]) - take + 1)             # the block stays inside the window,
                 hi = min(c_off + c_len - take, int(annot_pos[k]))         # the window inside its contig
                 at = int(gen.integers(lo, max(lo, hi) + 1))
-                codes = np.full(window, 4, dtype=np.int64)
+                codes = np.full(wrow, 4, dtype=np.int64)
                 codes[:take] = bases[at:at + take]
                 ctxs.append(0)                                            # nuclear (context 0)
                 rsrc, rsel = rep_main, slice(at, at + take)
             else:
-                r = table.row(int(gen.choice(table.height, p=p)), named=True)
-                take = min(window, r["len"])
+                r = table.row(cell.draw(gen) if cell else int(gen.choice(table.height, p=p)), named=True)
+                if pack and cell is None and r["len"] < window:
+                    wrow, more, cell = short(("primary", window), table["len"], p, r["len"])
+                take = min(wrow, r["len"])
                 at = r["offset"] + int(gen.integers(0, r["len"] - take + 1))
-                codes = np.full(window, 4, dtype=np.int64)
+                codes = np.full(wrow, 4, dtype=np.int64)
                 codes[:take] = bases[at:at + take]
                 ctxs.append(0)                                            # nuclear (context 0)
                 rsrc, rsel = rep_main, slice(at, at + take)
@@ -1317,7 +1380,7 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
             if flip_row:
                 codes[:take] = G.reverse_complement(codes[:take].astype(np.uint8))
             if rep:                                  # a repeat is a repeat on either strand: reversed, not swapped
-                r_ = np.zeros(window, dtype=np.uint8)
+                r_ = np.zeros(wrow, dtype=np.uint8)
                 if rep_rng.random() >= repeat_channel_drop and rsrc is not None:
                     r_[:take] = rsrc[rsel]
                     if flip_row:
@@ -1325,17 +1388,17 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                 rep_rows.append(r_)
             if epigenome_weight > 0:
                 if from_mito or xs is not None or fg is not None:         # no human Regulatory Build there
-                    epi_t.append(np.zeros((window // epi_unit, n_epi), dtype=bool))
-                    epi_v.append(np.zeros(window // epi_unit, dtype=bool))
-                    epi_e.append(np.zeros(window // epi_unit, dtype=bool))
+                    epi_t.append(np.zeros((wrow // epi_unit, n_epi), dtype=bool))
+                    epi_v.append(np.zeros(wrow // epi_unit, dtype=bool))
+                    epi_e.append(np.zeros(wrow // epi_unit, dtype=bool))
                 else:
-                    h_, v_, e_ = epi_targets(at, take, window, flip_row)
+                    h_, v_, e_ = epi_targets(at, take, wrow, flip_row)
                     epi_t.append(h_)
                     epi_v.append(v_)
                     epi_e.append(e_)
             if ntv3 is not None:
-                nt = np.zeros((window, len(ntv3["ids"])), dtype=np.uint8)
-                sp_ = np.zeros(window, dtype=np.uint8)
+                nt = np.zeros((wrow, len(ntv3["ids"])), dtype=np.uint8)
+                sp_ = np.zeros(wrow, dtype=np.uint8)
                 cm_ = np.zeros(len(ntv3["ids"]), dtype=bool)              # the channels this window can train
                 if xs is not None:
                     nt[:take, e_["lo"]:e_["hi"]] = e_["dense"][at:at + take]
@@ -1357,28 +1420,49 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                 nt_s.append(sp_)
                 nt_c.append(cm_)
                 nt_x.append(-1 if xs is None else xs)
-            seg = np.zeros(window // unit, dtype=np.int64)
+            seg = np.zeros(wrow // unit, dtype=np.int64)
             seg[(take + unit - 1) // unit:] = 1                           # padding is its own segment
             seqs.append(codes)
             segs.append(seg)
+            row_len.append(wrow)
+            row_wt.append(1.0 / cell.n if cell else 1.0)
+            if pack is not None:                                          # the training loop's calls only
+                tally.add(f"genome:{genomes[fg].name}" if fg is not None else
+                          f"ntv3_extra:{ntv3['extra'][xs]['name']}" if xs is not None else
+                          "mito" if from_mito else "primary", window, wrow, take, cell.n if cell else 1,
+                          cell is None or more == cell.n - 1)
             if labels:
-                lab, act = np.zeros(window, dtype=np.uint8), np.zeros(window, dtype=np.uint8)
+                lab, act = np.zeros(wrow, dtype=np.uint8), np.zeros(wrow, dtype=np.uint8)
                 if not from_mito and xs is None and fg is None:
                     lab[:take], act[:take] = lab_mm[at:at + take], act_mm[at:at + take]
                     if flip_row:                                          # the current tracks are not strand-specific
                         lab[:take], act[:take] = lab[:take][::-1].copy(), act[:take][::-1].copy()
                 labs.append(lab)
                 acts.append(act)
-                valid.append((np.arange(window) < take) & (not from_mito) & (xs is None) & (fg is None))
-        epi_batch[:] = [(torch.from_numpy(np.stack(epi_t)), torch.from_numpy(np.stack(epi_v)),
-                         torch.from_numpy(np.stack(epi_e)))] if epi_t else []
-        ntv3_batch[:] = [(torch.from_numpy(np.stack(nt_t)), torch.from_numpy(np.stack(nt_s)),
-                          torch.from_numpy(np.stack(nt_c)), nt_x)] if nt_t else []
-        rep_batch[:] = [torch.from_numpy(np.stack(rep_rows))] if rep_rows else []
-        out = [torch.from_numpy(np.stack(seqs)), torch.from_numpy(np.stack(segs)), torch.tensor(ctxs)]
-        if labels:
-            out += [torch.from_numpy(np.stack(x)) for x in (labs, acts, valid)]
-        return tuple(out)
+                valid.append((np.arange(wrow) < take) & (not from_mito) & (xs is None) & (fg is None))
+
+        def stacked(ix):
+            """Rows ``ix`` as tensors, and the heads' targets for them (what epi_batch, ntv3_batch, rep_batch hold)."""
+            def rows(xs_):
+                return np.stack([xs_[i] for i in ix])
+            epi_ = [(torch.from_numpy(rows(epi_t)), torch.from_numpy(rows(epi_v)),
+                     torch.from_numpy(rows(epi_e)))] if epi_t else []
+            nt_ = [(torch.from_numpy(rows(nt_t)), torch.from_numpy(rows(nt_s)),
+                    torch.from_numpy(rows(nt_c)), [nt_x[i] for i in ix])] if nt_t else []
+            rep_ = [torch.from_numpy(rows(rep_rows))] if rep_rows else []
+            out = [torch.from_numpy(rows(seqs)), torch.from_numpy(rows(segs)), torch.tensor([ctxs[i] for i in ix])]
+            if labels:
+                out += [torch.from_numpy(rows(x)) for x in (labs, acts, valid)]
+            return tuple(out), (epi_, nt_, rep_)
+
+        if pack:                                     # one part per row length, the full window first
+            parts = []
+            for w_ in sorted(set(row_len), reverse=True):
+                ix = [i for i, l_ in enumerate(row_len) if l_ == w_]
+                parts.append((sum(row_wt[i] for i in ix) / batch, *stacked(ix)))
+            return parts
+        out, (epi_batch[:], ntv3_batch[:], rep_batch[:]) = stacked(range(len(seqs)))
+        return out
 
     dev = torch.device("cuda", torch.cuda.current_device())
     if n_contexts < 0:
@@ -1662,6 +1746,23 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
             keep.append((tracks.float()[ok], want[ok]))
         return mlm, track
 
+    def loss_parts(parts):
+        """A training micro-batch from sample(): the tensors of one rectangular batch (--short-sources pad), or with
+        ``pack`` its parts, one per row length - each a forward pass with its own targets, their losses added with
+        the parts' shares of the micro-batch's windows as weights. The caller's single backward covers every part,
+        so data-parallel cards (which sync gradients once per backward, and whose micro-batches now differ in shape
+        and in the number of parts) stay in step; the parts together hold at most the micro-batch's bases."""
+        if not pack_short:
+            return loss_on(*parts)
+        loss = track = None
+        for w_, rows_, sides_ in parts:
+            epi_batch[:], ntv3_batch[:], rep_batch[:] = sides_
+            l_, t_ = loss_on(*rows_)
+            loss = w_ * l_ if loss is None else loss + w_ * l_
+            if t_ is not None:
+                track = w_ * t_ if track is None else track + w_ * t_
+        return loss, track
+
     ntv3_losses: list[float] = []
     ntv3_scale = ntv3_nz = ntv3_rna = None
     ntv3_stats = None
@@ -1715,12 +1816,12 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
             if whole_contigs:
                 loss, track = contig_loss(*sample_contig(train_idx, longest=bench))
             else:
-                loss, track = loss_on(*sample(train_idx, window=win, batch=bat, flip=rc,
-                                              mito_table=mito_train if mito else None,
-                                              share=mito_share / (1.0 - genome_total),   # absolute (x / 1.0 == x)
-                                              annot=annot_oversample,
-                                              extra=ntv3_extra_share if ntv3 and ntv3["extra"] else 0.0,
-                                              genomes=genomes, rep=repeat_channel))
+                loss, track = loss_parts(sample(train_idx, window=win, batch=bat, flip=rc,
+                                                mito_table=mito_train if mito else None,
+                                                share=mito_share / (1.0 - genome_total),   # absolute (x / 1.0 == x)
+                                                annot=annot_oversample,
+                                                extra=ntv3_extra_share if ntv3 and ntv3["extra"] else 0.0,
+                                                genomes=genomes, rep=repeat_channel, pack=pack_short))
             ((loss + track_weight * track if track is not None else loss) / grad_accum).backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         opt.step()
@@ -1860,6 +1961,8 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                        + (f", jepa {np.mean(jepa_losses):.4f} (core std {np.mean(jepa_std):.3f})" if jepa_losses else "")
                        + (f", chunk every {unit / np.mean(chunk_rates):.0f} bp" if chunk_rates else "") + f", {h:.2f} h, "
                        f"peak {torch.cuda.max_memory_allocated(dev) / 2**30:.1f} GiB" + (f", tracks {tracks_note}" if tracks_note else ""))
+            if tally.by:
+                say(f"training rows since the last report (--short-sources {short_sources}): {tally.line()}")
             jepa_losses.clear()
             jepa_std.clear()
             chunk_rates.clear()
