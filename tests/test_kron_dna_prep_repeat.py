@@ -82,6 +82,26 @@ def test_repeat_u8_matches_lower_case(tmp_path, monkeypatch, accession_names):
         run_script(monkeypatch, *args, *(["--report", report] if report else []))
 
 
+def test_check_only_reports_every_contig(tmp_path, monkeypatch):
+    fa, gdir, _, _, rows = make(tmp_path)
+    with pytest.raises(SystemExit) as ok:
+        run_script(monkeypatch, "--fasta", fa, "--genome-dir", gdir, "--stage-dir", tmp_path / "s", "--check-only",
+                   "--held", "chr2")
+    assert ok.value.code == 0 and not (gdir / "repeat.u8").exists()
+    res = json.loads((tmp_path / "s" / "tg.check.json").read_text())
+    assert res["contigs"] == res["contigs_matching"] == len(rows) and res["held_out"] == ["chr2"]
+    b = np.fromfile(gdir / "bases.u8", dtype=np.uint8)
+    for at in (100, 101, rows[-1][3] + 5):                         # two bases in the first contig, one in the last
+        b[at] = (b[at] + 1) % 4
+    b.tofile(gdir / "bases.u8")
+    with pytest.raises(SystemExit) as bad:
+        run_script(monkeypatch, "--fasta", fa, "--genome-dir", gdir, "--stage-dir", tmp_path / "s", "--check-only")
+    res = json.loads((tmp_path / "s" / "tg.check.json").read_text())
+    assert bad.value.code == 2 and res["contigs_matching"] == len(rows) - 2
+    assert [(m["chrom"], m["n_diff"]) for m in res["mismatches"]] == [(rows[0][0], 2), (rows[-1][0], 1)]
+    assert not (gdir / "repeat.u8").exists()
+
+
 def test_refusals(tmp_path, monkeypatch):
     fa, gdir, _, _, _ = make(tmp_path / "a", soft=False)
     with pytest.raises(SystemExit, match="not soft-masked"):

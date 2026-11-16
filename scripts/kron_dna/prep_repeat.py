@@ -15,6 +15,10 @@ The array is built in ``--stage-dir`` (on the same file system) and then moved t
 must not exist yet: nothing else in the genome directory is touched. A JSON summary (lower-case fraction overall, per
 chromosome, training vs held-out) goes to the stage directory.
 
+``--check-only`` compares every contig with ``bases.u8`` and reports each mismatch (count of differing bases, first
+position) and the lower-case fractions, writing nothing but the summary JSON in the stage directory; exit 0 when every
+contig matches, 2 otherwise.
+
 Run:  uv run --no-sync --with duckdb python prep_repeat.py --fasta F --genome-dir D [--report R] --stage-dir S
 """
 from __future__ import annotations
@@ -77,13 +81,16 @@ def main() -> None:
     ap.add_argument("--genome-dir", type=Path, required=True, help="prepared genome: bases.u8 + contigs.parquet")
     ap.add_argument("--report", type=Path, default=None, help="NCBI assembly report (accession -> chromosome)")
     ap.add_argument("--stage-dir", type=Path, required=True, help="where repeat.u8 is built before the move")
+    ap.add_argument("--check-only", action="store_true", help="compare every contig, report, write no repeat.u8")
+    ap.add_argument("--held", default="", help="held-out chromosomes for the summary (comma-separated; default: "
+                                               "assembly.json's held_out)")
     ap.add_argument("--min-lower", type=float, default=0.01,
                     help="stop without writing when less than this fraction of contig bases is lower-case")
     a = ap.parse_args()
     t0 = time.time()
     gdir, stage = a.genome_dir, a.stage_dir
     target = gdir / "repeat.u8"
-    if target.exists():
+    if target.exists() and not a.check_only:
         sys.exit(f"{target} exists; refusing to overwrite it")
     stage.mkdir(parents=True, exist_ok=True)
     name = gdir.name
@@ -118,12 +125,13 @@ def main() -> None:
 
     wanted = plan["name"].unique().to_list()
     seqs = (pb.scan_fasta(str(a.fasta)).filter(pl.col("name").is_in(wanted)).select("name", "sequence").collect())
-    held = set()
+    held = set(x for x in a.held.split(",") if x)
     meta = gdir / "assembly.json"
-    if meta.is_file():
+    if not held and meta.is_file():
         held = set(json.loads(meta.read_text()).get("held_out", []))
     part = stage / f"{name}.repeat.u8.part"
-    out = np.memmap(part, dtype=np.uint8, mode="w+", shape=(total,))
+    out = None if a.check_only else np.memmap(part, dtype=np.uint8, mode="w+", shape=(total,))
+    mismatches = []
     per_chrom, digest = {}, hashlib.md5()
     lower_all = bases_all = 0
     by_record = {r: plan.filter(pl.col("name") == r) for r in wanted}
@@ -133,12 +141,18 @@ def main() -> None:
         rec_bases = rec_lower = 0
         for chrom, _, s, e, off in by_record[rec].iter_rows():
             n = e - s
-            if not np.array_equal(codes[s:e], bases[off:off + n]):
-                bad = int(np.flatnonzero(codes[s:e] != np.asarray(bases[off:off + n]))[0])
-                sys.exit(f"{chrom}:{s + bad}: the FASTA's base differs from bases.u8 at offset {off + bad}; "
-                         f"not the FASTA this genome was prepared from")
+            have = np.asarray(bases[off:off + n])
+            if len(codes) < e or not np.array_equal(codes[s:e], have):
+                diff = (np.flatnonzero(codes[s:e] != have) if len(codes) >= e
+                        else np.arange(max(0, len(codes) - s), n))
+                mismatches.append(dict(chrom=chrom, start=s, end=e, offset=off, n_diff=int(len(diff)),
+                                       first=int(s + diff[0])))
+                if not a.check_only:
+                    sys.exit(f"{chrom}:{s + int(diff[0])}: the FASTA's base differs from bases.u8 at offset "
+                             f"{off + int(diff[0])}; not the FASTA this genome was prepared from")
             rep = LOWER[raw[s:e]]
-            out[off:off + n] = rep
+            if out is not None:
+                out[off:off + n] = rep
             k = int(rep.sum())
             d = per_chrom.setdefault(chrom, dict(bases=0, lower=0, held_out=chrom in held))
             d["bases"] += n
@@ -151,14 +165,24 @@ def main() -> None:
               f"lower-case {100 * rec_lower / max(1, rec_bases):.2f}%", flush=True)
         del raw, codes, seq
     if set(seqs["name"].to_list()) != set(wanted) or bases_all != total:
-        sys.exit(f"wrote {bases_all:,} of {total:,} bases; records missing: "
+        sys.exit(f"covered {bases_all:,} of {total:,} bases; records missing: "
                  f"{sorted(set(wanted) - set(seqs['name'].to_list()))}")
+    frac = lower_all / bases_all
+    if a.check_only:
+        res = dict(genome=name, fasta=str(a.fasta), check_only=True, polars_bio=pb.__version__, contigs=plan.height,
+                   contigs_matching=plan.height - len(mismatches), mismatches=mismatches, total_bases=total,
+                   lower_fraction=frac,
+                   per_chrom={c: dict(d, lower_fraction=d["lower"] / max(1, d["bases"])) for c, d in per_chrom.items()},
+                   held_out=sorted(held), seconds=round(time.time() - t0, 1))
+        (stage / f"{name}.check.json").write_text(json.dumps(res, indent=1) + "\n")
+        print(json.dumps({k: res[k] for k in ("genome", "contigs", "contigs_matching", "total_bases", "lower_fraction",
+                                                "seconds")} | {"mismatches": mismatches[:20]}), flush=True)
+        sys.exit(0 if not mismatches else 2)
     out.flush()
     del out
     with part.open("rb") as fh:
         for block in iter(lambda: fh.read(1 << 24), b""):
             digest.update(block)
-    frac = lower_all / bases_all
     split = {k: dict(bases=sum(d["bases"] for d in per_chrom.values() if d["held_out"] == v),
                      lower=sum(d["lower"] for d in per_chrom.values() if d["held_out"] == v))
              for k, v in (("train", False), ("held_out", True))}
