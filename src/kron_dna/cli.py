@@ -2095,7 +2095,10 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                        + "".join(f", {genomes[k].name} {b_:.3f}" for k, b_ in zip(g_eval, genome_bits))
                        + (f", jepa {np.mean(jepa_losses):.4f} (core std {np.mean(jepa_std):.3f})" if jepa_losses else "")
                        + (f", chunk every {unit / np.mean(chunk_rates):.0f} bp" if chunk_rates else "") + f", {h:.2f} h, "
-                       f"peak {torch.cuda.max_memory_allocated(dev) / 2**30:.1f} GiB" + (f", tracks {tracks_note}" if tracks_note else ""))
+                       + (f"peak {torch.cuda.max_memory_allocated(dev) / 2**30:.1f} GiB" if split_devs is None else
+                          "peak " + ", ".join(f"{d_} {torch.cuda.max_memory_allocated(d_) / 2**30:.1f}"
+                                              for d_ in split_devs) + " GiB")
+                       + (f", tracks {tracks_note}" if tracks_note else ""))
             if tally.by:
                 say(f"training rows since the last report (--short-sources {short_sources}): {tally.line()}")
             jepa_losses.clear()
