@@ -683,6 +683,107 @@ class KronGenome(nn.Module):
             outs.append((out[0], out[1] if len(out) > 1 else None))
         return outs
 
+    #: what a piece of a split window runs on its own device (see :meth:`forward_split`)
+    SPLIT_LOCAL = ("stem", "stem_res", "down", "up", "up2", "skip_proj", "head", "tracks", "ntv3")
+
+    def split_replica(self, device, force: bool = False) -> "KronGenome":
+        """A shallow copy of this model for :meth:`forward_split` whose conv path and per-base heads read
+        differentiable copies (``Tensor.to``) of this model's parameters on ``device``, as DataParallel's
+        ``replicate`` builds them, but one copy per parameter: gradients flow back into THIS model's parameters
+        through autograd, and a parameter whose copy takes no part in the loss gets no gradient at all (as
+        unsplit; a broadcast would hand it a zero). Nothing is registered: no new parameter, no new state-dict
+        key. Rebuild it after every optimizer step (the copies are taken when it is built). On the model's own
+        device it is the model itself, unless ``force`` (tests: real copies on one device)."""
+        device = _device(device)
+        if next(self.parameters()).device == device and not force:
+            return self
+
+        def rep(m: nn.Module, children) -> nn.Module:
+            r = m._replicate_for_data_parallel()          # shallow: own (empty) _parameters, copied dicts
+            r.__dict__["_compiled_call_impl"] = None      # a compiled call would run the original's weights
+            for k, p in m._parameters.items():
+                object.__setattr__(r, k, None if p is None else p.to(device, copy=force))
+            for k, buf in m._buffers.items():
+                r._buffers[k] = None if buf is None else buf.to(device)
+            for k, child in m._modules.items():
+                if child is not None and (children is None or k in children):
+                    r._modules[k] = rep(child, None)
+            return r
+
+        return rep(self, set(self.SPLIT_LOCAL))
+
+    def forward_split(self, seq: torch.Tensor, segments: torch.Tensor | None = None,
+                      context: torch.Tensor | None = None, extra: torch.Tensor | None = None, *, devices,
+                      halo: int | None = None, by: str | None = None, core_only: bool = False
+                      ) -> tuple[list["SplitPiece"], torch.Tensor]:
+        """:meth:`forward` with the window's conv path divided over ``devices`` (the first is this model's own):
+        the batch is cut into ``len(devices)`` pieces, by rows when the batch divides evenly (``by="rows"``),
+        else along the length (``by="length"``: contiguous stretches on 2**n_down boundaries, each encoded with
+        ``halo`` bases of real sequence on both sides, default :func:`split_halo`). Piece k's encoder, decoder
+        and per-base heads run on device k; only its core-input bins (cropped to its own stretch) go to the first
+        device, where the core, the cell-type head and the JEPA predictor run over the whole batch as in
+        :meth:`forward`, and the core states of its stretch plus halo come back. Every output equals
+        :meth:`forward`'s up to floating-point round-off (v2 and v2l normalise per position only).
+
+        Returns ``(pieces, core)``: :class:`SplitPiece` per device with its rows, its stretch and its outputs on
+        its device (``logits`` [b, n, 4], ``tracks``, ``ntv3`` [b, n, n_ntv3]), and ``core`` [B, bins, d_model] on
+        the first device. ``last_jepa``/``last_epi`` are set as by forward; ``last_ntv3`` is None (it is in the
+        pieces; :func:`gather_split` joins them). ``core_only``: stop after the core (no decoder, no heads)."""
+        c = self.config
+        if c.arch not in ("v2", "v2l") or c.chunk_ratio or c.local_width:
+            raise ValueError("forward_split needs arch v2 or v2l without learned chunking or a local track (v1's "
+                             "GroupNorm takes statistics over the whole window, so a piece would see other ones)")
+        devices = [_device(d) for d in devices]
+        dev0 = next(self.parameters()).device
+        if devices[0] != dev0:
+            raise ValueError(f"the first split device must be the model's own ({dev0}), got {devices[0]}")
+        b, length = seq.shape[0], seq.shape[-1]
+        unit = 2 ** c.n_down
+        halo = split_halo(c) if halo is None else int(halo)
+        plan = split_plan(b, length, len(devices), unit, halo, by)
+        by = plan[0][0]
+        reps = {}
+        enc = []                                                      # per piece: (skips, its core-input bins)
+        for k, (_, rows, start, end, lo, hi) in enumerate(plan):
+            d = devices[k]
+            if d not in reps:
+                reps[d] = self.split_replica(d)
+            piece = seq[rows][..., lo:hi].to(d)
+            piece_x = None if extra is None else extra[rows][..., lo:hi].to(d)
+            x, skips = reps[d].encode(piece, piece_x)
+            a = (start - lo) // unit
+            enc.append((None if core_only else skips, x[:, :, a:a + (end - start) // unit].to(dev0)))
+        x = torch.cat([e[1] for e in enc], 2 if by == "length" else 0)
+        h = x.transpose(1, 2)                                         # [B, bins, d_model], as in forward
+        if self.context is not None:
+            h = h + self.context_rows(context, b, dev0).unsqueeze(1).to(h.dtype)
+        bins = h.shape[1]
+        if segments is None:
+            segments = torch.arange(b, device=dev0).unsqueeze(1).expand(b, bins)
+        else:
+            segments = segments + torch.arange(b, device=dev0).unsqueeze(1) * (segments.max() + 1)
+        flat = segments.reshape(-1)
+        starts = torch.nonzero(torch.diff(flat, prepend=flat[:1] - 1)).squeeze(1)
+        cu = torch.cat([starts, torch.tensor([flat.numel()], device=dev0)]).to(torch.int32)
+        core = self.run_core(h.reshape(1, b * bins, -1), cu,
+                             checkpoint=self.checkpoint_core and torch.is_grad_enabled()).reshape(b, bins, -1)
+        self.last_jepa = self.jepa_pred(core) if self.jepa_pred is not None and self.training else None
+        self.last_epi = self.epigenome_logits(core) if self.config.n_epigenomes else None
+        self.last_ntv3 = None
+        if core_only:
+            return [], core
+        pieces = []
+        for k, (_, rows, start, end, lo, hi) in enumerate(plan):
+            d, r = devices[k], reps[devices[k]]
+            skips = enc[k][0]
+            y = r.decode(core[rows, lo // unit:hi // unit].transpose(1, 2).to(d), skips)
+            y = y[:, :, start - lo:end - lo]                          # heads are per position: crop first
+            pieces.append(SplitPiece(rows=rows, start=start, end=end, device=d, logits=r.head(y).transpose(1, 2),
+                                     tracks=r.tracks(y).transpose(1, 2) if r.tracks is not None else None,
+                                     ntv3=r.ntv3(y).transpose(1, 2) if r.ntv3 is not None else None))
+            enc[k] = None                                             # drop this function's hold on the skips
+        return pieces, core
+
     def n_parameters(self) -> int:
         return sum(p.numel() for p in self.parameters())
 
@@ -788,6 +889,140 @@ def poisson_multinomial_loss(pred: torch.Tensor, target: torch.Tensor, mask: tor
     p = counts / (counts.sum(1, keepdim=True) + eps)
     log_p = torch.log(torch.where(mask > 0, p, torch.ones_like(p)))     # 0 outside the mask, and no 0/0 gradient
     shape = -(want * log_p).sum() / mask.sum().clamp_min(1)
+    return shape + scale_weight * scale
+
+
+def _device(d) -> torch.device:
+    """A device with its index ("cuda" -> "cuda:<current>"), so that devices compare as tensors' devices do."""
+    d = torch.device(d)
+    return torch.device("cuda", torch.cuda.current_device()) if d.type == "cuda" and d.index is None else d
+
+
+@dataclass
+class SplitPiece:
+    """One device's share of a split window (:meth:`KronGenome.forward_split`): batch ``rows``, bases
+    ``start:end`` of the window, and its outputs on ``device``."""
+    rows: slice
+    start: int
+    end: int
+    device: torch.device
+    logits: torch.Tensor | None = None       # [b, end - start, 4]
+    tracks: torch.Tensor | None = None       # [b, end - start, n_tracks]
+    ntv3: torch.Tensor | None = None         # [b, end - start, n_ntv3]
+
+
+def split_reach(config: KronGenomeConfig) -> int:
+    """An upper bound, in bases, on how far the zero padding at a piece's cut reaches into the conv path (v2,
+    v2l): beyond it every core-input bin and every decoder output of the piece equals the unsplit window's. Each
+    k = 5 convolution at 2**i bp adds 2 x 2**i, the k = 15 stem 7; every pooling or nearest upsampling step adds
+    a cell (2**i) to stay conservative. The core's states are exact everywhere (the core sees the whole window),
+    so the decoder is reached only through the encoder skips and its own padding at the cut."""
+    nd, arch = config.n_down, config.arch
+    if arch not in ("v2", "v2l"):
+        raise ValueError(f"split_reach covers arch v2 and v2l, not {arch!r}")
+    skip = []
+    c = 7                                                    # the stem
+    if arch == "v2":
+        for i in range(nd):
+            skip.append(c)
+            c += 2 * (2 * 2 ** i) + 2 ** i                  # ConvBlock2 at 2**i bp, then the pool
+    else:
+        c += 2                                               # stem_res (k = 5 at 1 bp)
+        skip.append(c)
+        c += 1                                               # pool
+        for j in range(1, nd):
+            skip.append(c)
+            c += 2 * (2 * 2 ** j) + 2 ** j
+    bins_reach, d = c, 0
+    for i in reversed(range(nd)):
+        if arch == "v2":                                     # upsample, ConvBlock2, + skip, ConvBlock2
+            d = max(d + 2 ** i + 4 * 2 ** i, skip[i]) + 4 * 2 ** i
+        else:                                                # ResConv at 2**(i+1), upsample, + skip, ResConv
+            d = max(d + 2 * 2 ** (i + 1) + 2 ** i, skip[i]) + 2 * 2 ** i
+    return max(bins_reach, d)
+
+
+def split_halo(config: KronGenomeConfig) -> int:
+    """The default halo of :meth:`KronGenome.forward_split`: :func:`split_reach` rounded up to 2**n_down."""
+    unit = 2 ** config.n_down
+    return -(-split_reach(config) // unit) * unit
+
+
+def split_plan(batch: int, length: int, n: int, unit: int, halo: int, by: str | None = None) -> list[tuple]:
+    """``n`` pieces of a ``[batch, length]`` window: ``(by, rows, start, end, lo, hi)`` each, where the piece owns
+    bases ``start:end`` of ``rows`` and is encoded over ``lo:hi`` (its stretch plus ``halo`` each side, clipped
+    to the window). ``by``: "rows" (whole windows, no halo; needs ``batch % n == 0``), "length" (contiguous
+    stretches on ``unit`` boundaries), or None: rows when the batch divides evenly, else length."""
+    if n < 1:
+        raise ValueError("split over at least one device")
+    if length % unit or halo % unit or halo < 0:
+        raise ValueError(f"length and halo must be non-negative multiples of {unit}")
+    by = by or ("rows" if batch % n == 0 else "length")
+    if by == "rows":
+        if batch % n:
+            raise ValueError(f"a split by rows needs a batch divisible by {n}, got {batch}")
+        k = batch // n
+        return [("rows", slice(i * k, (i + 1) * k), 0, length, 0, length) for i in range(n)]
+    if by != "length":
+        raise ValueError(f"split by 'rows' or 'length', not {by!r}")
+    bins = length // unit
+    if bins < n:
+        raise ValueError(f"a window of {length} bases has fewer than {n} bins of {unit}")
+    cuts = [round(i * bins / n) * unit for i in range(n + 1)]
+    return [("length", slice(0, batch), s, e, max(0, s - halo), min(length, e + halo))
+            for s, e in zip(cuts[:-1], cuts[1:])]
+
+
+def gather_split(pieces: list[SplitPiece], field: str, device) -> torch.Tensor | None:
+    """One output of :meth:`KronGenome.forward_split` (``field``: logits, tracks or ntv3) joined into the whole
+    ``[B, L, ...]`` on ``device``, as :meth:`KronGenome.forward` returns it (differentiable)."""
+    parts = [(p, getattr(p, field)) for p in pieces]
+    if any(t is None for _, t in parts):
+        return None
+    b = max(p.rows.stop for p, _ in parts)
+    length = max(p.end for p, _ in parts)
+    t0 = parts[0][1]
+    out = t0.new_zeros((b, length) + tuple(t0.shape[2:]), device=device)
+    for p, t in parts:
+        out[p.rows, p.start:p.end] = t.to(device)
+    return out
+
+
+def poisson_multinomial_parts(pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor,
+                              eps: float = 1e-7) -> dict[str, torch.Tensor]:
+    """The sums :func:`poisson_multinomial_loss` needs over one stretch of positions of ``[b, n, T]`` (one piece
+    of a split window): per (row, track) the supervised count, the predicted and target totals, the summed
+    counts of the profile and the summed target weights; and over all values the target-weighted log count and
+    the mask's sum. Sum them over the stretches (rows stay rows) and :func:`poisson_multinomial_combine` gives the
+    loss of the whole window, up to round-off (log p = log count - log total, rather than log of a quotient)."""
+    mask = mask.to(pred.dtype).expand_as(pred)
+    pred, target = pred * mask, target * mask
+    counts, want = pred + eps * mask, target + eps * mask
+    return dict(n_pos=mask.sum(1), tot_p=pred.sum(1), tot_t=target.sum(1), cnt=counts.sum(1), want=want.sum(1),
+                wlog=(want * torch.log(torch.where(mask > 0, counts, torch.ones_like(counts)))).sum(),
+                msum=mask.sum())
+
+
+def poisson_multinomial_combine(parts: list[tuple[slice, dict]], batch: int, device, scale_weight: float = 0.2,
+                                eps: float = 1e-7) -> torch.Tensor:
+    """:func:`poisson_multinomial_loss` of a whole window from the :func:`poisson_multinomial_parts` of its
+    pieces, each given with its batch ``rows``; computed on ``device``."""
+    keys = ("n_pos", "tot_p", "tot_t", "cnt", "want")
+    acc = {k: None for k in keys}
+    wlog = msum = 0.0
+    for rows, pt in parts:
+        for k in keys:
+            v = pt[k].to(device)
+            full = v.new_zeros((batch,) + tuple(v.shape[1:]))
+            full[rows] = v
+            acc[k] = full if acc[k] is None else acc[k] + full
+        wlog = wlog + pt["wlog"].to(device)
+        msum = msum + pt["msum"].to(device)
+    n_pos, tot_p, tot_t = acc["n_pos"], acc["tot_p"], acc["tot_t"]
+    scale = (tot_p - tot_t * torch.log(tot_p + eps)) / (n_pos + eps)
+    has = n_pos > 0
+    scale = scale[has].mean() if bool(has.any()) else tot_p.sum() * 0
+    shape = -(wlog - (acc["want"] * torch.log(acc["cnt"] + eps)).sum()) / msum.clamp_min(1)
     return shape + scale_weight * scale
 
 
