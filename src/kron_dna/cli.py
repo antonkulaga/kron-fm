@@ -34,6 +34,10 @@ from kron_dna.model import KronDNA, KronDNAConfig
 
 app = typer.Typer(add_completion=False, no_args_is_help=True)
 
+#: tests: set to a list and genome-train appends every training micro-batch's loss terms when jepa.csv is on
+#: (``jepa_log``), plus ``jepa_term`` (the JEPA loss in the total) and ``reg`` (the --jepa-reg term before its weight)
+JEPA_TRACE: list | None = None
+
 
 def _config(d_model: int, n_heads: int, n_layers: int, ff_units: int, dropout: float, attention_every: int,
             tie_directions: bool) -> KronDNAConfig:
@@ -1731,25 +1735,24 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
     def split_mlm(pieces, targets, clean):
         """--split-cards: loss_on's masked-base term from the pieces of a split window, each piece's cross-entropy
         summed on its own card; the mean over the window's targets (or a zero tied to every piece's logits, as
-        unsplit, when the input is clean)."""
+        unsplit, when the input is clean). Unweighted: loss_on applies --mlm-weight as it does unsplit.
+        With block JEPA (--jepa-block-heads exclude) the targets inside blocks are -100 already (hide_blocks)."""
         if clean:
             return sum((p_.logits.float().sum() * 0.0).to(dev) for p_ in pieces)
         count_ = (targets != -100).sum()
         tot_ = sum(F.cross_entropy(p_.logits.float().reshape(-1, 4),
                                    targets[p_.rows, p_.start:p_.end].to(p_.device).reshape(-1),
                                    ignore_index=-100, reduction="sum").to(dev) for p_ in pieces)
-        mlm_ = tot_ / count_
-        if mlm_weight != 1.0:
-            mlm_ = mlm_ * mlm_weight
-        return mlm_
+        return tot_ / count_                                              # loss_on applies --mlm-weight
 
     split_consts: dict = {}
 
-    def split_ntv3_loss(pieces, batch_):
+    def split_ntv3_loss(pieces, batch_, skip_=None):
         """--split-cards: loss_on's training track loss (every --ntv3-loss form) from the pieces of a split window:
         targets go from the host straight to each piece's card, per-position terms are summed there, and only
         per-(row, track) sums and scalars cross to the first card, where the window's loss is assembled exactly as
-        loss_on assembles it from the whole window."""
+        loss_on assembles it from the whole window. ``skip_`` [B, L] bool (block JEPA, --jepa-block-heads exclude):
+        bases inside hidden blocks, left out of the numerator and the denominator as loss_on leaves them out."""
         want_c, sp_c, col_c = batch_[:3]                                  # host tensors [B,L,T] u8, [B,L], [B,T]
         ok_full = (sp_c == 1).float()                                     # as loss_on: NTv3 train split only,
         if ntv3_center < 1.0:                                             # the central fraction of each window
@@ -1757,6 +1760,8 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
             if edge:
                 ok_full[:, :edge] = 0
                 ok_full[:, -edge:] = 0
+        if skip_ is not None:                                             # block JEPA: visible positions only
+            ok_full = ok_full * (~skip_).float().cpu()
         parts_, num_ = [], 0.0
         for p_ in pieces:
             d_ = p_.device
@@ -1839,6 +1844,11 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                                                                                        **fwd_kw)
         if split_now:                   # each piece's loss on its own card; sums (not outputs) cross to the first
             mlm = split_mlm(pieces, targets, clean)
+            if not clean:
+                if parts_log is not None:
+                    parts_log["mlm"] = float(mlm.detach())
+                if mlm_weight != 1.0:
+                    mlm = mlm * mlm_weight
         elif clean:
             mlm = logits.float().sum() * 0.0                             # no masked base to score
         else:
@@ -1867,9 +1877,11 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
             elif not track_only:
                 epi_keep.append((model.last_epi.float()[ok_e].cpu(), want_e[ok_e].cpu()))
         if split_now and ntv3 is not None and model.ntv3 is not None and ntv3_batch:
-            loss_n = split_ntv3_loss(pieces, ntv3_batch[0])
+            loss_n = split_ntv3_loss(pieces, ntv3_batch[0], skip_at)
             mlm = mlm + ntv3_weight * loss_n
             ntv3_losses.append(float(loss_n.detach()))
+            if parts_log is not None:
+                parts_log["ntv3"] = ntv3_losses[-1]
         elif ntv3 is not None and model.last_ntv3 is not None and ntv3_batch:
             want_n, sp_n, col_n = (x.to(dev) for x in ntv3_batch[0][:3])  # [B,L,T] uint8, [B,L] split, [B,T] bool
             spc_n = ntv3_batch[0][3]                                      # per row: -1 human, else the species index
@@ -1920,6 +1932,7 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                         st_[1] += x_.sum(0).cpu(); st_[2] += y_.sum(0).cpu()
                         st_[3] += (x_ * y_).sum(0).cpu()
                         st_[4] += (x_ * x_).sum(0).cpu(); st_[5] += (y_ * y_).sum(0).cpu()
+        reg_t = None                    # the anti-collapse term of this micro-batch (JEPA_TRACE)
         if target is not None and model.training and model.last_jepa is not None:
             with torch.no_grad(), autocast:
                 if split_now:           # the target's core states only: encoder pieces + core, no decoder; it reads
@@ -1974,7 +1987,8 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
             if jepa_reg == "vicreg":
                 cov = (z.T @ z) / (z.shape[0] - 1)
                 off = cov - torch.diag(torch.diag(cov))
-                mlm = mlm + reg_w * (torch.relu(1 - std).mean() + off.pow(2).sum() / z.shape[1])
+                reg_t = torch.relu(1 - std).mean() + off.pow(2).sum() / z.shape[1]
+                mlm = mlm + reg_w * reg_t
             elif jepa_reg == "sigreg":
                 dirs = torch.randn(z.shape[1], 64, device=z.device)
                 proj = (z / std.mean()) @ (dirs / dirs.norm(dim=0))     # [N, 64] 1-D projections
@@ -1983,11 +1997,17 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                 ecf_re, ecf_im = torch.cos(arg).mean(0), torch.sin(arg).mean(0)
                 gauss = torch.exp(-tg.pow(2) / 2)                       # N(0, 1)'s characteristic function
                 ep = ((ecf_re - gauss).pow(2) + ecf_im.pow(2)) * gauss  # Epps-Pulley, Gaussian-weighted
-                mlm = mlm + reg_w * ep.mean()
+                reg_t = ep.mean()
+                mlm = mlm + reg_w * reg_t
         if parts_log is not None:
             parts_log["core_std"] = jepa_std[-1] if target is not None and model.last_jepa is not None else float("nan")
             parts_log["total"] = float(mlm.detach())
             jepa_rows.append(parts_log)
+            if JEPA_TRACE is not None:  # tests: this micro-batch's terms, with the JEPA term and the unweighted
+                # regulariser (not written to jepa.csv)
+                JEPA_TRACE.append(dict(parts_log, jepa_term=jepa_losses[-1] if jepa_losses and target is not None
+                                       and model.last_jepa is not None else float("nan"),
+                                       reg=float(reg_t.detach()) if reg_t is not None else float("nan")))
         if lab is None:
             return mlm, None
         want = G.track_targets(lab.to(dev), act.to(dev))
@@ -2244,7 +2264,8 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
         if jepa_log:
             jepa_secs += time.time() - t_step
             jepa_steps += 1
-            jepa_peak = max(jepa_peak, torch.cuda.max_memory_allocated(dev) / 2**30)
+            jepa_peak = max(jepa_peak, max(torch.cuda.max_memory_allocated(d_) / 2**30  # split: the busiest card
+                                           for d_ in (split_devs or [dev])))
             if (step % eval_every == 0 or step == steps or out_of_time
                     or (jepa_log_every > 0 and step % jepa_log_every == 0)):
                 jepa_row(step, win)
