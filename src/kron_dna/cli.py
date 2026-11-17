@@ -931,6 +931,20 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                                                    "before), 'pack' turns it into several shorter rows of the same "
                                                    "source that together hold about one window of real bases (the "
                                                    "row lengths: packing.py). Evaluation is unchanged either way"),
+                 mito_slice: int = typer.Option(0, help="with --mito and --short-sources pack: every training step "
+                                                "also trains on a slice of this many bases of mitochondrial "
+                                                "genomes, drawn from the --mito training table as one packed "
+                                                "window of this length (packing.py rows: a ~16.5 kb animal "
+                                                "mitogenome gives 4 rows of 16,384, a mitogenome at least this "
+                                                "long one row of it), each sequence with its genetic-code "
+                                                "context; --mito then leaves the main window draw (its share "
+                                                "there is 0, the other sources keep their relative shares). The "
+                                                "slice's loss joins the step's with weight slice / (slice + the "
+                                                "step's main-draw bases), the main draw's with the rest; it runs "
+                                                "after the main draw's backward (gradients accumulate, one "
+                                                "optimizer step) and, with --split-cards, unsplit on the first "
+                                                "card. Its draws come from a stream of their own. 0: off (as "
+                                                "before)"),
                  split_cards: int = typer.Option(0, help="split each training window over this many cards in ONE "
                                                  "process (CUDA_VISIBLE_DEVICES lists them; 0 or 1: off): the conv "
                                                  "encoder, decoder and per-base heads run on contiguous stretches "
@@ -1044,6 +1058,22 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
         raise typer.BadParameter("--short-sources must be 'pad' or 'pack'")
     if short_sources == "pack" and whole_contigs:
         raise typer.BadParameter("--whole-contigs does not take --short-sources pack (it reads whole contigs already)")
+    if mito_slice < 0:
+        raise typer.BadParameter("--mito-slice must be >= 0")
+    if mito_slice > 0:
+        if not mito or short_sources != "pack" or whole_contigs:
+            raise typer.BadParameter("--mito-slice needs --mito and --short-sources pack, and does not take "
+                                     "--whole-contigs")
+        if world > 1:
+            raise typer.BadParameter("--mito-slice is single-process only (one process, or --split-cards): with "
+                                     "torchrun each card would run a second backward per step")
+        if not 0.0 < mito_share < 1.0:
+            raise typer.BadParameter("--mito-slice takes --mito out of the main draw by its --mito-share: that "
+                                     "share must lie in (0, 1)")
+        slice_unit_ = math.lcm(unit, 128 if arch == "v3" else unit)
+        if mito_slice % slice_unit_ or mito_slice < 8 * slice_unit_:
+            raise typer.BadParameter(f"--mito-slice must be a multiple of {slice_unit_} and at least "
+                                     f"{8 * slice_unit_:,} bases")
     if split_cards > 1:
         bad_ = [n_ for n_, on_ in (("--arch v1/v3 (v1's GroupNorm takes whole-window statistics)",
                                     arch not in ("v2", "v2l")),
@@ -1365,14 +1395,17 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
         return cell_.row, cell_.n - 1, cell_
 
     def sample(table, window=window, batch=None, gen=None, flip=False, mito_table=None, share=0.0, annot=0.0,
-               extra=0.0, extra_force=None, genomes=(), force_genome=None, rep=False, pack=None):
+               extra=0.0, extra_force=None, genomes=(), force_genome=None, rep=False, pack=None, cum=None,
+               tally_to=None):
         """``batch`` windows: (seqs, segments, contexts[, labels, activity, valid]). With ``mito_table``, each row comes
         from it with probability ``share``; a circular genome is read across its origin when the window is shorter.
         Context 0 is nuclear; an organelle sequence's context is its genetic code table (1..33). With ``genomes``
         (--genome), one uniform draw first sends a row to further genome k with probability its share (its training
         contigs, by length, masked bases only, its context id); ``force_genome`` k draws every row from ``table``
         (that genome's held-out contigs) instead. ``rep`` (--repeat-channel, training only) also reads each row's
-        repeat.u8 (zeros where a genome has none, or for a dropped window) into ``rep_batch``.
+        repeat.u8 (zeros where a genome has none, or for a dropped window) into ``rep_batch``. ``cum``
+        (--mito-slice): the further genomes' cumulative shares to draw with instead of ``genome_cum``; ``tally_to``:
+        the Tally the rows are counted in instead of ``tally``.
 
         ``pack`` is given by the training loop only (None: evaluation, nothing below applies). True
         (--short-sources pack): a window whose contig is shorter than ``window`` becomes a pack - rows of the longest
@@ -1399,7 +1432,7 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                 cell, wrow = None, window
                 fg = force_genome                    # a further genome's index (--genome), else None
                 if fg is None and genomes:           # no draw at all without --genome: the default stream is unchanged
-                    fg = MG.pick_genome(gen.random(), genome_cum)
+                    fg = MG.pick_genome(gen.random(), genome_cum if cum is None else cum)
                 from_mito = fg is None and mito_table is not None and gen.random() < share
                 xs = None                            # a further species' index (--ntv3-extra), else None
                 if extra_force is not None:
@@ -1524,7 +1557,7 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
             row_len.append(wrow)
             row_wt.append(1.0 / cell.n if cell else 1.0)
             if pack is not None:                                          # the training loop's calls only
-                tally.add(f"genome:{genomes[fg].name}" if fg is not None else
+                (tally if tally_to is None else tally_to).add(f"genome:{genomes[fg].name}" if fg is not None else
                           f"ntv3_extra:{ntv3['extra'][xs]['name']}" if xs is not None else
                           "mito" if from_mito else "primary", window, wrow, take, cell.n if cell else 1,
                           cell is None or more == cell.n - 1)
@@ -1619,16 +1652,39 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
     x_list = ntv3["extra"] if ntv3 else []
     shares_ = MG.window_shares([g_.share for g_ in genomes], mito_share if mito else 0.0,
                                ntv3_extra_share if x_list else 0.0, [float(p_) for p_ in ntv3["extra_p"]] if x_list else None)
+    slice_rec = None
+    if mito_slice:      # --mito-slice: the main draw without mito (the others rescaled by 1 / (1 - --mito-share))
+        shares_ = {k_: (0.0 if k_ == "mito" else v_ / (1.0 - mito_share)) for k_, v_ in shares_.items()}
+        per_phase_ = []
+        for w_, n_ in phases:
+            b_ = tokens_per_step // w_ // world // grad_accum if tokens_per_step else batch_size
+            main_ = w_ * b_ * grad_accum
+            per_phase_.append(dict(window=w_, steps=n_, main_bases=main_, slice_bases=mito_slice,
+                                   mito_base_share=mito_slice / (main_ + mito_slice),
+                                   base_shares={k_: (mito_slice / (main_ + mito_slice) if k_ == "mito" else
+                                                     v_ * main_ / (main_ + mito_slice)) for k_, v_ in shares_.items()}))
+        slice_rec = dict(bases=mito_slice, configured_mito_share=mito_share, main_window_shares=dict(shares_),
+                         per_phase=per_phase_, placement="unsplit on the first card" if split_cards > 1 else "",
+                         stream="np.random.default_rng([seed, rank, 2031, start step])")
+        say(f"mito slice: every step also {mito_slice:,} bases of packed mitogenomes (unsplit"
+            + (f" on {dev}" if split_cards > 1 else "") + "); main draw without mito, its window shares "
+            + ", ".join(f"{k_} {v_:.4f}" for k_, v_ in shares_.items()) + "; mito share of step bases "
+            + ", ".join(f"{q_['mito_base_share']:.4f} at window {q_['window']:,}" for q_ in per_phase_))
     rec_genomes = [RR.genome_entry("primary", name, shares_["primary"], 0,
                                    val_idx["chrom"].unique(maintain_order=True).to_list(), src / "contigs.parquet",
                                    annot_oversample=annot_oversample)]
-    rec_genomes += [RR.genome_entry("genome", g_.name, g_.share, g_.context,
+    rec_genomes += [RR.genome_entry("genome", g_.name, g_.share / (1.0 - mito_share) if mito_slice else g_.share,
+                                    g_.context,
                                     g_.val["chrom"].unique(maintain_order=True).to_list(),
                                     interim_dir("genome", g_.name) / "contigs.parquet") for g_ in genomes]
     if mito:
         rec_genomes.append(RR.genome_entry("mito", mito, mito_share, "per sequence: its genetic code table",
                                            mito_val["chrom"].to_list(), mito_src / "contigs.parquet",
-                                           codes=sorted(mito_codes)))
+                                           codes=sorted(mito_codes),
+                                           **({"main_draw_share": 0.0, "mito_slice": mito_slice,
+                                               "share_note": "--mito-slice: not in the main window draw; "
+                                                             "resolved.mito_slice has its share of step bases"}
+                                              if mito_slice else {})))
     for k_x, e_x in enumerate(x_list):
         g_x = next((g_ for g_ in genomes if g_.name == e_x["name"]), None)
         rec_genomes.append(RR.genome_entry("ntv3_extra", e_x["name"], shares_.get(f"extra{k_x}"),
@@ -1650,7 +1706,8 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
         resolved=dict(n_contexts=config.n_contexts, n_in_extra=config.n_in_extra, ctx_on=ctx_on, arch=arch,
                       curriculum=phases, steps=steps, eval_window=eval_window, world_size=world,
                       held_out_chroms_requested=sorted(held), window_shares=shares_, config=config.to_dict(),
-                      n_parameters=model.n_parameters(), torch=torch.__version__))
+                      n_parameters=model.n_parameters(), torch=torch.__version__,
+                      **({"mito_slice": slice_rec} if slice_rec else {})))
     step, hours = 0, 0.0
     if ckpt.exists() and not bench:
         state = torch.load(ckpt, map_location="cpu")
@@ -1802,7 +1859,7 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
         return num_ / den_.sum().clamp_min(1).to(dev)
 
     def loss_on(seq, seg, ctx, lab=None, act=None, valid=None, keep=None, mask_gen=None,
-                track_only=False, clean=False, score_ntv3=True):
+                track_only=False, clean=False, score_ntv3=True, unsplit=False):
         clean = clean or (mlm_weight == 0 and model.training)        # a track stage reads the sequence unmasked
         if clean:
             inputs, targets = seq.to(dev), None
@@ -1831,7 +1888,8 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                 fwd_kw = {"extra": extra_in.masked_fill(blk_at.unsqueeze(1), 0.0)}
         skip_at = blk_at if jepa_block_heads == "exclude" else None    # [B, L] bases the other heads do not score
         parts_log = {} if jepa_log and model.training else None        # this micro-batch's loss terms, for jepa.csv
-        split_now = split_devs is not None and model.training         # --split-cards: training windows only
+        # --split-cards: training windows only (``unsplit``: the --mito-slice part, whole on the first card)
+        split_now = split_devs is not None and model.training and not unsplit
         with autocast:
             if split_now:
                 pieces, ctx_core = model.forward_split(inputs, seg.to(dev), ctx.to(dev) if ctx_on else None,
@@ -2020,18 +2078,19 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
             keep.append((tracks.float()[ok], want[ok]))
         return mlm, track
 
-    def loss_parts(parts):
+    def loss_parts(parts, **kw):
         """A training micro-batch from sample(): the tensors of one rectangular batch (--short-sources pad), or with
         ``pack`` its parts, one per row length - each a forward pass with its own targets, their losses added with
         the parts' shares of the micro-batch's windows as weights. The caller's single backward covers every part,
         so data-parallel cards (which sync gradients once per backward, and whose micro-batches now differ in shape
-        and in the number of parts) stay in step; the parts together hold at most the micro-batch's bases."""
+        and in the number of parts) stay in step; the parts together hold at most the micro-batch's bases.
+        ``kw`` goes to loss_on (``unsplit``: --mito-slice)."""
         if not pack_short:
-            return loss_on(*parts)
+            return loss_on(*parts, **kw)
         loss = track = None
         for w_, rows_, sides_ in parts:
             epi_batch[:], ntv3_batch[:], rep_batch[:] = sides_
-            l_, t_ = loss_on(*rows_)
+            l_, t_ = loss_on(*rows_, **kw)
             loss = w_ * l_ if loss is None else loss + w_ * l_
             if t_ is not None:
                 track = w_ * t_ if track is None else track + w_ * t_
@@ -2206,6 +2265,14 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
         hid_all = torch.from_numpy(np.stack([h_ for _, _, h_ in guard_win])).to(dev)
         return G.jepa_guard_metrics(torch.stack(cl_), torch.stack(tg_), torch.stack(on_), torch.stack(pr_), hid_all)
 
+    # --mito-slice: a stream of its own (per card, and per start step so a resumed run does not replay its first
+    # slices), the further genomes' cumulative shares for the main draw without mito, and its own row tally
+    slice_rng = np.random.default_rng([seed, rank, 2031, step]) if mito_slice else None
+    cum_main = genome_cum / (1.0 - mito_share) if mito_slice else None
+    slice_tally = PK.Tally()
+    slice_secs, slice_steps, slice_peak = 0.0, 0, {}
+    slice_rows: list[dict] = []                       # the slice's loss terms (jepa.csv keys) since the last report
+    slice_losses: list[float] = []                    # its unweighted training loss per step
     model.train()
     while step < (stop_step or steps):
         t_step = time.time()
@@ -2215,19 +2282,50 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
             torch.cuda.reset_peak_memory_stats(d_)
         opt.zero_grad(set_to_none=True)
         win, bat = phase_at(step)
+        if mito_slice:          # base-proportional weights: the main draw's bases and the slice's
+            main_bases = win * bat * grad_accum
+            w_main, w_slice = main_bases / (main_bases + mito_slice), mito_slice / (main_bases + mito_slice)
         for _ in range(grad_accum):
             if whole_contigs:
                 loss, track = contig_loss(*sample_contig(train_idx, longest=bench))
             else:
                 loss, track = loss_parts(sample(train_idx, window=win, batch=bat, flip=rc,
-                                                mito_table=mito_train if mito else None,
+                                                mito_table=mito_train if mito and not mito_slice else None,
                                                 share=mito_share / (1.0 - genome_total),   # absolute (x / 1.0 == x)
                                                 annot=annot_oversample,
                                                 extra=ntv3_extra_share if ntv3 and ntv3["extra"] else 0.0,
-                                                genomes=genomes, rep=repeat_channel, pack=pack_short))
+                                                genomes=genomes, rep=repeat_channel, pack=pack_short, cum=cum_main))
+            if mito_slice:
+                loss = loss * w_main
+                track = None if track is None else track * w_main
             ((loss + track_weight * track if track is not None else loss) / grad_accum).backward()
             if bench_grads is not None and step == 0:
                 bench_losses.append(float(loss.detach()))
+        if mito_slice:          # after the main draw's backward: its activations are freed; one optimizer step
+            if dev.type == "cuda":                          # time the slice alone (the main backward has finished)
+                torch.cuda.synchronize(dev)
+            t_slice = time.time()
+            # the slice's logged terms are kept apart, so jepa.csv's train rows and the evaluation line's JEPA and
+            # NTv3 train means stay those of the main draw (comparable across the switch)
+            n_logged = (len(jepa_rows), len(jepa_losses), len(jepa_std), len(ntv3_losses))
+            s_loss, s_track = loss_parts(sample(mito_train, window=mito_slice, batch=1, gen=slice_rng, flip=rc,
+                                                mito_table=mito_train, share=1.0, rep=repeat_channel, pack=True,
+                                                tally_to=slice_tally), unsplit=True)
+            slice_rows.extend(jepa_rows[n_logged[0]:])
+            del jepa_rows[n_logged[0]:], jepa_losses[n_logged[1]:], jepa_std[n_logged[2]:], ntv3_losses[n_logged[3]:]
+            slice_losses.append(float(s_loss.detach()))
+            s_loss = s_loss * w_slice
+            s_track = None if s_track is None else s_track * w_slice
+            (s_loss + track_weight * s_track if s_track is not None else s_loss).backward()
+            loss = loss.detach() + s_loss.detach()          # the step's training loss: both parts, base-weighted
+            if bench_grads is not None and step == 0:
+                bench_losses.append(float(s_loss.detach()))
+            if dev.type == "cuda":
+                torch.cuda.synchronize(dev)
+            slice_secs += time.time() - t_slice
+            slice_steps += 1
+            for d_ in (split_devs or [dev]):
+                slice_peak[str(d_)] = max(slice_peak.get(str(d_), 0.0), torch.cuda.max_memory_allocated(d_) / 2**30)
         if bench_grads is not None and step == 0:              # the first step's gradients, before clipping
             torch.save(dict(losses=bench_losses, grads={n_: (None if p_.grad is None else p_.grad.detach().cpu())
                                                         for n_, p_ in model.named_parameters()}), bench_grads)
@@ -2427,6 +2525,17 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                        + (f", tracks {tracks_note}" if tracks_note else ""))
             if tally.by:
                 say(f"training rows since the last report (--short-sources {short_sources}): {tally.line()}")
+            if slice_tally.by:
+                terms_ = {k_: [r_[k_] for r_ in slice_rows if k_ in r_ and not math.isnan(r_[k_])]
+                          for k_ in ("mlm", "jepa_hidden", "total")}
+                say(f"mito slice rows since the last report (--mito-slice {mito_slice:,}, one packed window per "
+                    f"step): {slice_tally.line()}; slice loss {np.mean(slice_losses):.4f} (unweighted"
+                    + "".join(f", {k_} {np.mean(v_):.4f}" for k_, v_ in terms_.items() if v_)
+                    + f"), {slice_secs / max(slice_steps, 1):.3f} s/step; peak per card over the {slice_steps} "
+                    f"steps: " + ", ".join(f"{k_} {v_:.2f}" for k_, v_ in slice_peak.items()) + " GiB")
+                slice_secs, slice_steps, slice_peak = 0.0, 0, {}
+                slice_rows.clear()
+                slice_losses.clear()
             jepa_losses.clear()
             jepa_std.clear()
             chunk_rates.clear()
