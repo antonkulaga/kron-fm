@@ -927,6 +927,20 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                                                    "before), 'pack' turns it into several shorter rows of the same "
                                                    "source that together hold about one window of real bases (the "
                                                    "row lengths: packing.py). Evaluation is unchanged either way"),
+                 split_cards: int = typer.Option(0, help="split each training window over this many cards in ONE "
+                                                 "process (CUDA_VISIBLE_DEVICES lists them; 0 or 1: off): the conv "
+                                                 "encoder, decoder and per-base heads run on contiguous stretches "
+                                                 "of the window (with a halo covering their reach), or on whole "
+                                                 "windows when the batch divides evenly, one per card; the core, "
+                                                 "cell-type head and JEPA predictor run on the first card over the "
+                                                 "whole window. Same outputs up to round-off, no new parameters; "
+                                                 "held-out evaluation stays on the first card, unsplit. Single "
+                                                 "process: --tokens-per-step >= window x --grad-accum"),
+                 split_halo: int = typer.Option(0, help="with --split-cards: bases of context each side of a piece "
+                                                "(0: the conv path's reach, genome.split_halo)"),
+                 bf16: bool = typer.Option(True, help="bfloat16 autocast (--no-bf16: float32 throughout, for checks)"),
+                 bench_grads: Path | None = typer.Option(None, help="with --bench: save the first step's loss and "
+                                                         "every parameter's gradient (before clipping) here"),
                  seed: int = 0) -> None:
     """The multi-track model (KronGenome) over whole gap-free contigs: stage 1 masked-base prediction; with
     ``--labels``, stage 2 adds the Ensembl and GENCODE tracks of ``genome-labels`` and writes ``tracks.csv``.
@@ -1026,6 +1040,19 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
         raise typer.BadParameter("--short-sources must be 'pad' or 'pack'")
     if short_sources == "pack" and whole_contigs:
         raise typer.BadParameter("--whole-contigs does not take --short-sources pack (it reads whole contigs already)")
+    if split_cards > 1:
+        bad_ = [n_ for n_, on_ in (("--arch v1/v3 (v1's GroupNorm takes whole-window statistics)",
+                                    arch not in ("v2", "v2l")),
+                                   ("--whole-contigs", whole_contigs), ("--chunk-ratio", chunk_ratio > 0),
+                                   ("--local-track", bool(local_track)), ("--labels", labels),
+                                   ("--compile-convs", compile_convs), ("torchrun (WORLD_SIZE > 1)", world > 1))
+                if on_]
+        if bad_:
+            raise typer.BadParameter("--split-cards does not take " + ", ".join(bad_))
+        if split_halo % unit or split_halo < 0:
+            raise typer.BadParameter(f"--split-halo must be a non-negative multiple of {unit}")
+    if bench_grads is not None and not bench:
+        raise typer.BadParameter("--bench-grads needs --bench")
     if new_contexts not in ("zero", "nuclear"):
         raise typer.BadParameter("--new-contexts must be 'zero' or 'nuclear'")
     if new_contexts != "zero" and init is None:
@@ -1551,6 +1578,16 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
     ctx_on = config.n_contexts > 0                    # the model reads context ids whenever it has a table
     model = G.KronGenome(config).to(dev)
     model.checkpoint_core = checkpoint_core
+    split_devs = None                                 # --split-cards: the cards one window is divided over
+    split_by = "balanced" if pack_short else None     # packs may hold an odd number of short rows (genome.split_plan)
+    if split_cards > 1:
+        if dev.type == "cuda" and torch.cuda.device_count() < (dev.index or 0) + split_cards:
+            raise typer.BadParameter(f"--split-cards {split_cards} needs {split_cards} visible cards from "
+                                     f"{dev}; CUDA_VISIBLE_DEVICES shows {torch.cuda.device_count()}")
+        split_devs = [dev] + [torch.device("cuda", (dev.index or 0) + k) for k in range(1, split_cards)]
+        say(f"split windows over {split_cards} cards ({', '.join(str(d_) for d_ in split_devs)}): conv path per "
+            f"piece with a halo of {split_halo or G.split_halo(config):,} bases, core on {dev}; "
+            f"held-out evaluation unsplit on {dev}")
     if compile_convs:
         for blocks in [model.down, model.up] + ([model.up2] if arch in ("v2", "v2l") else []):
             for i in range(len(blocks)):
@@ -1668,7 +1705,7 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
         train_model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[dev.index])
         say(f"data-parallel over {world} cards: {tokens_per_step // world if tokens_per_step else batch_size} "
             f"bases per card per micro-batch")
-    autocast = torch.autocast("cuda", dtype=torch.bfloat16)
+    autocast = torch.autocast("cuda", dtype=torch.bfloat16, enabled=bf16)
 
     def contig_loss(seq, lab=None, act=None, valid=None, keep=None):
         inputs, targets = G.mask_bases(seq.to(dev), mask_prob, bert=bert_mask)
@@ -1690,6 +1727,74 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                 if keep is not None:
                     keep.append((tracks.float()[0][ok], want[ok]))
         return mlm / max(count, 1), (track if lab is not None else None)
+
+    def split_mlm(pieces, targets, clean):
+        """--split-cards: loss_on's masked-base term from the pieces of a split window, each piece's cross-entropy
+        summed on its own card; the mean over the window's targets (or a zero tied to every piece's logits, as
+        unsplit, when the input is clean)."""
+        if clean:
+            return sum((p_.logits.float().sum() * 0.0).to(dev) for p_ in pieces)
+        count_ = (targets != -100).sum()
+        tot_ = sum(F.cross_entropy(p_.logits.float().reshape(-1, 4),
+                                   targets[p_.rows, p_.start:p_.end].to(p_.device).reshape(-1),
+                                   ignore_index=-100, reduction="sum").to(dev) for p_ in pieces)
+        mlm_ = tot_ / count_
+        if mlm_weight != 1.0:
+            mlm_ = mlm_ * mlm_weight
+        return mlm_
+
+    split_consts: dict = {}
+
+    def split_ntv3_loss(pieces, batch_):
+        """--split-cards: loss_on's training track loss (every --ntv3-loss form) from the pieces of a split window:
+        targets go from the host straight to each piece's card, per-position terms are summed there, and only
+        per-(row, track) sums and scalars cross to the first card, where the window's loss is assembled exactly as
+        loss_on assembles it from the whole window."""
+        want_c, sp_c, col_c = batch_[:3]                                  # host tensors [B,L,T] u8, [B,L], [B,T]
+        ok_full = (sp_c == 1).float()                                     # as loss_on: NTv3 train split only,
+        if ntv3_center < 1.0:                                             # the central fraction of each window
+            edge = int(round(ok_full.shape[1] * (1 - ntv3_center) / 2))
+            if edge:
+                ok_full[:, :edge] = 0
+                ok_full[:, -edge:] = 0
+        parts_, num_ = [], 0.0
+        for p_ in pieces:
+            d_ = p_.device
+            if d_ not in split_consts:
+                split_consts[d_] = (ntv3_scale.to(d_), None if ntv3_nz is None else ntv3_nz.to(d_), ntv3_rna.to(d_))
+            sc_, nz_, rna_ = split_consts[d_]
+            want_k = want_c[p_.rows, p_.start:p_.end].to(d_)
+            col_k = col_c[p_.rows].to(d_)
+            ok_k = ok_full[p_.rows, p_.start:p_.end].to(d_)
+            log1p_k = want_k.float() / 255.0 * sc_
+            pred_k = p_.ntv3.float()
+            if ntv3_loss == "poisson":
+                pred_k = F.softplus(pred_k)
+            if nz_ is None:
+                tgt_k = log1p_k
+            else:                                                         # ntv3_ag on this card's constants
+                x_ = torch.expm1(log1p_k).clamp_min(0) / nz_
+                x_ = torch.where(rna_, x_.clamp_min(1e-12).pow(0.75), x_)
+                tgt_k = torch.where(x_ > 10, 2 * torch.sqrt(10 * x_) - 10, x_)
+            if ntv3_focus < 1.0:
+                sig_ = (want_k > 0).any(-1).float()
+                ok_k = ok_k * (sig_ + (1 - sig_) * ntv3_focus)
+            if ntv3_loss == "poisson":
+                parts_.append((p_.rows, G.poisson_multinomial_parts(pred_k, tgt_k,
+                                                                    ok_k.unsqueeze(-1) * col_k.unsqueeze(1).float())))
+            elif ntv3["extra"]:
+                sq_ = (pred_k - tgt_k).pow(2) * col_k.unsqueeze(1).float()
+                per_ = sq_.sum(-1) / col_k.float().sum(-1, keepdim=True).clamp_min(1)
+                num_ = num_ + (per_ * ok_k).sum().to(dev)
+            else:
+                num_ = num_ + ((pred_k - tgt_k).pow(2).mean(-1) * ok_k).sum().to(dev)
+        if ntv3_loss == "poisson":
+            return G.poisson_multinomial_combine(parts_, want_c.shape[0], dev)
+        den_ = ok_full if ntv3_focus >= 1.0 else None
+        if den_ is None:                                                  # the focus weights need the targets
+            sig_ = (want_c > 0).any(-1).float()
+            den_ = ok_full * (sig_ + (1 - sig_) * ntv3_focus)
+        return num_ / den_.sum().clamp_min(1).to(dev)
 
     def loss_on(seq, seg, ctx, lab=None, act=None, valid=None, keep=None, mask_gen=None,
                 track_only=False, clean=False, score_ntv3=True):
@@ -1721,11 +1826,20 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                 fwd_kw = {"extra": extra_in.masked_fill(blk_at.unsqueeze(1), 0.0)}
         skip_at = blk_at if jepa_block_heads == "exclude" else None    # [B, L] bases the other heads do not score
         parts_log = {} if jepa_log and model.training else None        # this micro-batch's loss terms, for jepa.csv
+        split_now = split_devs is not None and model.training         # --split-cards: training windows only
         with autocast:
-            logits, ctx_core, tracks = (train_model if model.training else model)(inputs, seg.to(dev),
-                                                                                   ctx.to(dev) if ctx_on else None,
-                                                                                   **fwd_kw)
-        if clean:
+            if split_now:
+                pieces, ctx_core = model.forward_split(inputs, seg.to(dev), ctx.to(dev) if ctx_on else None,
+                                                       devices=split_devs, halo=split_halo or None, by=split_by,
+                                                       **fwd_kw)
+                logits = tracks = None
+            else:
+                logits, ctx_core, tracks = (train_model if model.training else model)(inputs, seg.to(dev),
+                                                                                       ctx.to(dev) if ctx_on else None,
+                                                                                       **fwd_kw)
+        if split_now:                   # each piece's loss on its own card; sums (not outputs) cross to the first
+            mlm = split_mlm(pieces, targets, clean)
+        elif clean:
             mlm = logits.float().sum() * 0.0                             # no masked base to score
         else:
             mlm = F.cross_entropy(logits.float().reshape(-1, 4), targets.reshape(-1), ignore_index=-100)
@@ -1752,7 +1866,11 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                 mlm = mlm + epigenome_weight * loss_e
             elif not track_only:
                 epi_keep.append((model.last_epi.float()[ok_e].cpu(), want_e[ok_e].cpu()))
-        if ntv3 is not None and model.last_ntv3 is not None and ntv3_batch:
+        if split_now and ntv3 is not None and model.ntv3 is not None and ntv3_batch:
+            loss_n = split_ntv3_loss(pieces, ntv3_batch[0])
+            mlm = mlm + ntv3_weight * loss_n
+            ntv3_losses.append(float(loss_n.detach()))
+        elif ntv3 is not None and model.last_ntv3 is not None and ntv3_batch:
             want_n, sp_n, col_n = (x.to(dev) for x in ntv3_batch[0][:3])  # [B,L,T] uint8, [B,L] split, [B,T] bool
             spc_n = ntv3_batch[0][3]                                      # per row: -1 human, else the species index
             # split.u8: 1 NTv3 train, 2 NTv3 val, 3 NTv3 test, 4 chr8/chr9 (KronGenome's held-out chromosomes)
@@ -1804,7 +1922,13 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                         st_[4] += (x_ * x_).sum(0).cpu(); st_[5] += (y_ * y_).sum(0).cpu()
         if target is not None and model.training and model.last_jepa is not None:
             with torch.no_grad(), autocast:
-                _, want_core, _ = target(seq.to(dev), seg.to(dev), ctx.to(dev) if ctx_on else None, **tgt_kw)
+                if split_now:           # the target's core states only: encoder pieces + core, no decoder; it reads
+                    # the clean row and, with block JEPA, the repeat channel without the blocks zeroed (tgt_kw)
+                    _, want_core = target.forward_split(seq.to(dev), seg.to(dev), ctx.to(dev) if ctx_on else None,
+                                                        devices=split_devs, halo=split_halo or None, by=split_by,
+                                                        core_only=True, **tgt_kw)
+                else:
+                    _, want_core, _ = target(seq.to(dev), seg.to(dev), ctx.to(dev) if ctx_on else None, **tgt_kw)
             keep_bins = seg.to(dev) == 0                                # not padding
             cos = F.cosine_similarity(model.last_jepa.float(), want_core.float(), dim=-1)
             if blk_bins is None:
@@ -1919,6 +2043,7 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
         return x * ntv3_nz
 
     jepa_losses: list[float] = []
+    bench_losses: list[float] = []
     jepa_std: list[float] = []
     epi_keep: list = []
     chunk_rates: list[float] = []
@@ -2066,7 +2191,8 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
         t_step = time.time()
         for g in opt.param_groups:
             g["lr"] = lr * min(1.0, (step + 1) / warmup) * 0.5 * (1 + math.cos(math.pi * min(step / steps, 1.0)))
-        torch.cuda.reset_peak_memory_stats(dev)
+        for d_ in (split_devs or [dev]):
+            torch.cuda.reset_peak_memory_stats(d_)
         opt.zero_grad(set_to_none=True)
         win, bat = phase_at(step)
         for _ in range(grad_accum):
@@ -2080,6 +2206,11 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                                                 extra=ntv3_extra_share if ntv3 and ntv3["extra"] else 0.0,
                                                 genomes=genomes, rep=repeat_channel, pack=pack_short))
             ((loss + track_weight * track if track is not None else loss) / grad_accum).backward()
+            if bench_grads is not None and step == 0:
+                bench_losses.append(float(loss.detach()))
+        if bench_grads is not None and step == 0:              # the first step's gradients, before clipping
+            torch.save(dict(losses=bench_losses, grads={n_: (None if p_.grad is None else p_.grad.detach().cpu())
+                                                        for n_, p_ in model.named_parameters()}), bench_grads)
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         opt.step()
         if target is not None:
@@ -2088,13 +2219,20 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                     pt.lerp_(pm.detach(), 1 - jepa_ema)
         step += 1
         if bench and step == 1:                                  # the first step compiles kernels: time the second
-            torch.cuda.synchronize()
+            for d_ in (split_devs or [None]):
+                torch.cuda.synchronize(d_)
             t0 = time.time()
             continue
         if bench:
-            torch.cuda.synchronize()
+            for d_ in (split_devs or [None]):
+                torch.cuda.synchronize(d_)
             what = f"longest contig {min(train_idx['len'].max(), max_contig or 1 << 62):,} bases in {window:,} chunks, {train_chunks} scored" \
                 if whole_contigs else f"window {win:,}, batch {bat} x {grad_accum} accumulated"
+            if split_devs is not None:
+                what += f", split over {len(split_devs)} cards"
+                peak_ = ", ".join(f"{d_} {torch.cuda.max_memory_allocated(d_) / 2**30:.2f}" for d_ in split_devs)
+                say(f"bench: {what}: {time.time() - t0:.2f} s for one step, peak {peak_} GiB, loss {loss.item():.3f}")
+                return
             say(f"bench: {what}: {time.time() - t0:.1f} s for one step, "
                        f"peak {torch.cuda.max_memory_allocated(dev) / 2**30:.1f} GiB, loss {loss.item():.3f}")
             return
@@ -2262,7 +2400,10 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                        + "".join(f", {genomes[k].name} {b_:.3f}" for k, b_ in zip(g_eval, genome_bits))
                        + (f", jepa {np.mean(jepa_losses):.4f} (core std {np.mean(jepa_std):.3f})" if jepa_losses else "")
                        + (f", chunk every {unit / np.mean(chunk_rates):.0f} bp" if chunk_rates else "") + f", {h:.2f} h, "
-                       f"peak {torch.cuda.max_memory_allocated(dev) / 2**30:.1f} GiB" + (f", tracks {tracks_note}" if tracks_note else ""))
+                       + (f"peak {torch.cuda.max_memory_allocated(dev) / 2**30:.1f} GiB" if split_devs is None else
+                          "peak " + ", ".join(f"{d_} {torch.cuda.max_memory_allocated(d_) / 2**30:.1f}"
+                                              for d_ in split_devs) + " GiB")
+                       + (f", tracks {tracks_note}" if tracks_note else ""))
             if tally.by:
                 say(f"training rows since the last report (--short-sources {short_sources}): {tally.line()}")
             jepa_losses.clear()
