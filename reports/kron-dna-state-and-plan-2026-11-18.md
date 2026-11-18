@@ -82,6 +82,15 @@ What the runs say:
 | Output resolution | base level for most heads | base-level stem, track head at the decoder's resolution |
 | Model size | much larger (not measured here) | 47-48M |
 | Context | 1 Mb | 524 kb-1 Mb (works, small gain) |
+| Track Pearson, log1p, 128 bp, our 96 chr8/9 windows | 0.747 (all-folds weights, 24 matched tracks; 0.68-0.72 for the fold models on their own test windows) | 0.50-0.52 (A and D, all 34 tracks) |
+
+The AlphaGenome row comes from a benchmark run on 16 Nov with its downloadable weights on our own evaluation
+windows (`$SCRATCH/kron-dna/v21/alphagenome/REPORT.md`). Two caveats:
+
+- The all-folds model was trained on these regions, so only the fold models' scores (0.68-0.72) are held-out.
+- AlphaGenome has no eCLIP tracks, so it covers 24 of our 34 tracks; ours includes the 10 eCLIP tracks.
+
+Even so, the gap is large: about 0.2 in Pearson.
 
 The masked-base objective is not the bottleneck for AlphaGenome's tasks. Track Pearson and variant effects are learned
 from labels, and labels are where the gap is widest. Our own runs show it: the track stage moves track Pearson by
@@ -119,12 +128,17 @@ Each item says what it costs and what it needs from Anton.
 6. **A longer cooldown** (built, branch `lr-cooldown`). E's finish (about 7 h from this writing, its learning rate
    now near zero) will show what the final decay alone buys. Then decide whether to stretch A and D to about 600k
    steps, about 2 days of GPU time each.
-7. **One shared benchmark with AlphaGenome:** its predictions on our 96 held-out chr8/9 windows, scored by the same
-   track evaluation, and on the same ClinVar sample by region. Without it every comparison is indirect.
+7. **One shared benchmark with AlphaGenome.** The track part exists: AlphaGenome v1 on our 96 windows, same scoring
+   (section 5). Still missing:
+   - our models scored on exactly AlphaGenome's 24 matched tracks, for a like-for-like number;
+   - both models on the same ClinVar sample by region.
+   That run's terms note says AlphaGenome's downloadable weights and outputs are for evaluation only, "nothing here
+   was or may be used to train a model". Using AlphaGenome as a teacher (item 1) therefore rests on the API route
+   Anton approved for AlphaGenome 2, not on these weights.
 8. **More sequence** (pangenome haplotypes, more mammals): modest gain on masked-base bits, best saved for the bigger
    model.
 
-Suggested order: 7 (cheap, makes everything measurable) → 1 and 2 in parallel → 3 → 5. Item 6 is decided after E's
+Suggested order: finish 7 (a few hours) → 1 and 2 in parallel → 3 → 5. Item 6 is decided after E's
 finish.
 
 ## 7. Open decisions for Anton
