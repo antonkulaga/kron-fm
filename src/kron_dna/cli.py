@@ -853,6 +853,27 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                  bench: bool = typer.Option(False, help="time one step and report peak memory, then stop"),
                  labels: bool = typer.Option(False, help="stage 2: also predict the genome-labels tracks (TRACKS)"),
                  init: Path | None = typer.Option(None, help="start a new run from this checkpoint's weights (stage 1)"),
+                 xhead: list[str] = typer.Option([], help="a further per-base head, its own module beside the "
+                                                 "inherited ones (repeatable, kept in this order): NAME:STORE, a "
+                                                 "measured-track store on the primary genome's layout "
+                                                 "(prep_bigwig_tracks.py), or NAME:N to register N outputs ahead "
+                                                 "of their data (no forward, no update). Needs --ntv3-dir (its "
+                                                 "training split) and arch v2 or v2l; with --init the heads are "
+                                                 "the only new parameters"),
+                 xhead_weight: float = typer.Option(0.5, help="weight of each --xhead loss beside the other terms"),
+                 xhead_hidden: int = typer.Option(0, help="hidden width of the --xhead heads (0: as the other heads, "
+                                                  "2 x stem channels); lower it when a 1 Mb window runs out of "
+                                                  "memory"),
+                 xhead_only: int = typer.Option(200, help="with --xhead: labelled updates of the first head before "
+                                                "the inherited weights train too (their rate is 0 until then)"),
+                 xhead_lr: float = typer.Option(4e-4, help="peak rate of each --xhead, reached over --xhead-warmup "
+                                                "of its own labelled updates, under the run's schedule"),
+                 xhead_warmup: int = 200,
+                 inherit_lr: float = typer.Option(4e-5, help="with --xhead: peak rate of the inherited weights in "
+                                                  "joint training, reached over --inherit-warmup joint updates, "
+                                                  "under the run's schedule (it scales genome_lr by "
+                                                  "--inherit-lr / --lr)"),
+                 inherit_warmup: int = 200,
                  track_weight: float = typer.Option(1.0, help="weight of the track loss beside the masked-base loss"),
                  tracks: str = typer.Option("all", help="with --labels: tracks the loss trains, a group (all, "
                                             "regulatory, gene) or names from TRACKS; all are still scored"),
@@ -1137,6 +1158,7 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
     guard = G.jepa_guard_new()          # --jepa-guard state; with off its factor stays 1 and the loss is as before
     guard_saved = None                  # the state a resumed checkpoint carries
     teacher_saved, resumed = None, False
+    xstage_saved = None
     jepa_log = main and jepa_weight > 0 and (jepa_block_share > 0 or jepa_log_every > 0 or jepa_guard != "off")
     if not (0.0 <= soft_base_rate <= 1.0 and 0.0 <= repeat_channel_drop <= 1.0):
         raise typer.BadParameter("--soft-base-rate and --repeat-channel-drop must lie in [0, 1]")
@@ -1259,6 +1281,33 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
 
     ntv3 = None
     ntv3_batch: list = []
+    # --xhead: further heads, each on its own measured-track store over the primary genome (kron_dna.xheads)
+    from kron_dna import xheads as XH
+    xstores: dict = {}                                # head -> its store (a head registered without data has none)
+    xhead_sizes: dict[str, int] = {}                  # head -> outputs, in registration order
+    for spec_x in xhead:
+        name_x, _, val_x = spec_x.partition(":")
+        if not name_x.isidentifier() or not val_x or name_x in xhead_sizes:
+            raise typer.BadParameter(f"--xhead {spec_x!r}: give NAME:STORE or NAME:N, each name once")
+        if val_x.isdigit():
+            xhead_sizes[name_x] = int(val_x)
+            continue
+        try:
+            xstores[name_x] = XH.TrackStore.open(val_x)
+        except (OSError, ValueError, KeyError) as err:
+            raise typer.BadParameter(f"--xhead {name_x}: {err}") from None
+        xhead_sizes[name_x] = len(xstores[name_x].ids)
+        if xstores[name_x].dense.shape[0] != len(bases):
+            raise typer.BadParameter(f"--xhead {name_x}: the store covers {xstores[name_x].dense.shape[0]:,} bases, "
+                                     f"the primary genome {name} has {len(bases):,}")
+    if xhead:
+        if not ntv3_dir or whole_contigs or world > 1 or arch not in ("v2", "v2l"):
+            raise typer.BadParameter("--xhead needs --ntv3-dir (the training split), arch v2 or v2l, windows (not "
+                                     "--whole-contigs) and one process (--split-cards, not data-parallel cards)")
+        for n_, s_ in xstores.items():
+            lone_ = [i_ for k_, i_ in enumerate(s_.ids) if i_.endswith(("_P", "_M")) and s_.swap[k_] == k_]
+            if rc and lone_:
+                raise typer.BadParameter(f"--rc: stranded tracks of --xhead {n_} have no partner: {lone_[:6]}")
     if ntv3_dir:
         import json as _json
         from pathlib import Path as _Path
@@ -1510,6 +1559,7 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
         seqs, segs, ctxs, labs, acts, valid = [], [], [], [], [], []
         epi_t, epi_v, epi_e = [], [], []
         nt_t, nt_s, nt_c, nt_x = [], [], [], []
+        xh_t = {n_: [] for n_ in xstores}            # --xhead: each head's stored targets per row
         rep_rows = []
         row_len, row_wt = [], []                     # per row: its length, and its share of one window
         left, more, cell, wrow = batch, 0, None, window   # windows to draw; rows left in the pack being filled, their
@@ -1636,6 +1686,9 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                 if flip_row and (xs is not None or not from_mito):        # reverse AND swap the strand partners
                     nt[:take] = nt[:take][::-1][:, ntv3["swap"]]
                     sp_[:take] = sp_[:take][::-1]
+                for n_, st_ in xstores.items():           # primary-genome rows only; elsewhere unsupervised zeros
+                    xh_t[n_].append(st_.window(at, take, wrow, flip_row) if xs is None and not from_mito and fg is None
+                                    else np.zeros((wrow, len(st_.ids)), dtype=np.uint8))
                 nt_t.append(nt)
                 nt_s.append(sp_)
                 nt_c.append(cm_)
@@ -1668,7 +1721,8 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
             epi_ = [(torch.from_numpy(rows(epi_t)), torch.from_numpy(rows(epi_v)),
                      torch.from_numpy(rows(epi_e)))] if epi_t else []
             nt_ = [(torch.from_numpy(rows(nt_t)), torch.from_numpy(rows(nt_s)),
-                    torch.from_numpy(rows(nt_c)), [nt_x[i] for i in ix])] if nt_t else []
+                    torch.from_numpy(rows(nt_c)), [nt_x[i] for i in ix],
+                    {n_: torch.from_numpy(rows(v_)) for n_, v_ in xh_t.items()})] if nt_t else []
             rep_ = [torch.from_numpy(rows(rep_rows))] if rep_rows else []
             out = [torch.from_numpy(rows(seqs)), torch.from_numpy(rows(segs)), torch.tensor([ctxs[i] for i in ix])]
             if labels:
@@ -1691,6 +1745,7 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
         raise typer.BadParameter(f"--mito tags windows with genetic-code ids up to 33: --n-contexts must be at least "
                                  f"{G.N_CONTEXTS_ORGANELLE}")
     config = G.KronGenomeConfig(d_model=d_model, n_layers=n_layers, stem_channels=stem_channels, n_down=n_down,
+                                xheads=[[n_x, k_x] for n_x, k_x in xhead_sizes.items()], xhead_hidden=xhead_hidden,
                                 n_tracks=len(G.TRACKS) if labels else 0, arch=arch, head_hidden=head_hidden,
                                 n_contexts=n_contexts, n_in_extra=n_in_extra, jepa=jepa_weight > 0,
                                 n_epigenomes=n_epi if epigenome_weight > 0 else 0, chunk_ratio=chunk_ratio,
@@ -1729,7 +1784,9 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                                   dtype=torch.float32, device=dev)
         say("track positive weights: " + ", ".join(f"{t} {w:.1f}" for t, w in zip(G.TRACKS, pos_weight)))
         say("tracks trained: " + ", ".join(t for t, m in zip(G.TRACKS, train_mask.tolist()) if m))
-    if arch in ("v2", "v2l", "v3"):   # no weight decay on norms, biases, scales and embeddings
+    if xhead:                         # the same split, per role (inherited, each head), so each takes its own rate
+        opt = torch.optim.AdamW(XH.param_groups(model, 0.1), lr=lr, betas=(0.9, 0.95))
+    elif arch in ("v2", "v2l", "v3"):   # no weight decay on norms, biases, scales and embeddings
         decay = [p_ for n_, p_ in model.named_parameters() if p_.ndim >= 2 and "context" not in n_]
         rest = [p_ for n_, p_ in model.named_parameters() if not (p_.ndim >= 2 and "context" not in n_)]
         opt = torch.optim.AdamW([{"params": decay, "weight_decay": 0.1}, {"params": rest, "weight_decay": 0.0}],
@@ -1837,6 +1894,7 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
         say(f"resumed at step {step}")
         guard_saved = state.get("jepa_guard")
         teacher_saved, resumed = state.get("jepa_target"), True
+        xstage_saved = state.get("xstage")
     elif init is not None and not bench:
         # reserved room (stem input channels, context rows) is zero-padded explicitly, function-preserving; new
         # heads stay missing (strict=False) as before, and any other shape mismatch still raises
@@ -1844,6 +1902,10 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
         grown, notes = G.expand_state_dict(init_state["model"], model, new_contexts=new_contexts)
         missing, unexpected = model.load_state_dict(grown, strict=False)
         say(f"initialised from {init}; new: {missing}; dropped: {unexpected}; padded: {notes or 'nothing'}")
+        if xhead:
+            other_ = [k_ for k_ in missing if not k_.startswith("xheads.")]
+            say("--xhead: " + ("the new parameters are the heads' only" if not other_ else
+                               f"WARNING: beside the heads, {len(other_)} parameters start untrained: {other_[:8]}"))
         old_rows = int(init_state["model"]["context.weight"].shape[0]) if "context.weight" in init_state["model"] else 0
         fresh = sorted({g_.context for g_ in genomes if g_.context >= old_rows})
         if fresh:
@@ -1856,6 +1918,46 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                                    .get("commit"))
         del init_state
         step = start_step
+    # --xhead: the stage (head-only, then joint; a rate per group), continued from the checkpoint on a resume
+    xstage = None
+    x_step: set = set()                               # heads with supervised positions in the current step
+    x_rates: dict = {}                                # the last step's rate per role
+    x_losses: dict = {n_: [] for n_ in xhead_sizes}
+    x_pearson: dict = {n_: XH.Pearson(k_) for n_, k_ in xhead_sizes.items()}
+    x_consts: dict = {}
+
+    def x_consts_on(name_):
+        """Head ``name_``'s constants (scales, non-zero means, RNA flags) per card, moved once."""
+        def on(d_):
+            if (name_, d_) not in x_consts:
+                st_ = xstores[name_]
+                x_consts[(name_, d_)] = tuple(torch.as_tensor(np.asarray(v_)).to(d_)
+                                               for v_ in (st_.scales, st_.nonzero_mean, st_.is_rna))
+            return x_consts[(name_, d_)]
+        return on
+
+    if xhead:
+        plan_x = XH.StagePlan(heads=list(xhead_sizes), head_only=xhead_only, lr_inherited=inherit_lr, lr_head=xhead_lr,
+                              warmup_inherited=inherit_warmup, warmup_head=xhead_warmup)
+        if resumed and xstage_saved is None:
+            raise typer.BadParameter(f"refusing to resume {ckpt}: it has no --xhead stage; start a new run directory "
+                                     "with --init")
+        if xstage_saved is not None and xstage_saved["plan"] != plan_x.to_dict():
+            raise typer.BadParameter(f"refusing to resume {ckpt}: its --xhead stage was started with other settings: "
+                                     f"{xstage_saved['plan']}, now {plan_x.to_dict()}")
+        try:
+            xstage = XH.Stage(plan_x, xstage_saved["state"] if xstage_saved is not None else None)
+            for n_, st_ in xstores.items():           # adopted here: a start or a restart is a checkpoint boundary
+                xstage.activate(n_, st_.identity)
+        except ValueError as err:
+            raise typer.BadParameter(f"--xhead: {err}") from None
+        record["xheads"] = dict(plan=plan_x.to_dict(), weight=xhead_weight,
+                                stores={n_: dict(path=str(st_.path), **st_.identity) for n_, st_ in xstores.items()})
+        say(f"--xhead: {', '.join(f'{n_} ({k_} outputs' + ('' if n_ in xstores else ', no data yet') + ')' for n_, k_ in xhead_sizes.items())}; "
+            f"phase {xstage.state['phase']}, stage step {xstage.state['stage_step']}, updates {xstage.state['updates']}")
+    elif resumed and xstage_saved is not None:
+        raise typer.BadParameter(f"refusing to resume {ckpt}: it carries an --xhead stage "
+                                 f"({xstage_saved['plan']['heads']}); pass its --xhead options")
     # TR03/TR04 (audit 2026-11-18): the training-mask/dropout stream gets its own seed per card and start step, and a
     # run starting past step 0 draws its windows (and repeat-channel drops) from step-keyed streams instead of
     # replaying the first windows of a fresh run. A fresh run (step 0) keeps the windows of earlier code.
@@ -1884,6 +1986,7 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
     if jepa_weight > 0:                               # the EMA target: a frozen copy, updated after every step
         import copy
         target = copy.deepcopy(model).eval()
+        target.x_active = set()                       # the target's further heads are never read
         for p_ in target.parameters():
             p_.requires_grad_(False)
         if jepa_ema > 0 and teacher_saved is not None:            # audit 2026-11-18, TR05
@@ -2018,6 +2121,16 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                 tgt_kw = {"extra": extra_in}
                 fwd_kw = {"extra": extra_in.masked_fill(blk_at.unsqueeze(1), 0.0)}
         skip_at = blk_at if jepa_block_heads == "exclude" else None    # [B, L] bases the other heads do not score
+        x_now, x_ok = [], None          # --xhead: the heads this pass runs, and where they are supervised [B, L]
+        if xstage is not None:
+            if ntv3_batch and len(ntv3_batch[0]) > 4 and xstage.active:
+                if model.training:      # the training split, the window's centre, visible bases
+                    x_ok = XH.supervised(ntv3_batch[0][1], ntv3_center, skip_at)
+                else:                   # scored on the held-out chromosomes only (split code 4)
+                    x_ok = (ntv3_batch[0][1] == 4).float()
+                if float(x_ok.sum()) > 0:
+                    x_now = xstage.active
+            model.x_active = set(x_now)
         parts_log = {} if jepa_log and model.training else None        # this micro-batch's loss terms, for jepa.csv
         # --split-cards: training windows only (``unsplit``: the --mito-slice part, whole on the first card)
         split_now = split_devs is not None and model.training and not unsplit
@@ -2121,6 +2234,19 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                         st_[1] += x_.sum(0).cpu(); st_[2] += y_.sum(0).cpu()
                         st_[3] += (x_ * y_).sum(0).cpu()
                         st_[4] += (x_ * x_).sum(0).cpu(); st_[5] += (y_ * y_).sum(0).cpu()
+        for n_ in x_now:                # --xhead: each active head on its own store
+            want_x = ntv3_batch[0][4][n_]
+            if model.training:
+                loss_x = (XH.split_head_loss(pieces, n_, want_x, x_ok, x_consts_on(n_), dev) if split_now else
+                          XH.head_loss(model.last_x[n_], want_x.to(dev), x_ok.to(dev), x_consts_on(n_)(dev)))
+                mlm = mlm + xhead_weight * loss_x
+                x_losses[n_].append(float(loss_x.detach()))
+                x_step.add(n_)
+            else:                       # held-out rows whole, in log1p signal at 128 bp
+                c_x = x_consts_on(n_)(dev)
+                rows_x = (x_ok.sum(1) > 0).to(dev)
+                x_pearson[n_].add(XH.signal_of(F.softplus(model.last_x[n_].float()), c_x[1], c_x[2])[rows_x],
+                                  (want_x.to(dev).float() / 255.0 * c_x[0])[rows_x])
         reg_t = None                    # the anti-collapse term of this micro-batch (JEPA_TRACE)
         if target is not None and model.training and model.last_jepa is not None:
             with torch.no_grad(), autocast:
@@ -2462,7 +2588,20 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
             torch.save(dict(losses=bench_losses, grads={n_: (None if p_.grad is None else p_.grad.detach().cpu())
                                                         for n_, p_ in model.named_parameters()}), bench_grads)
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        if xstage is not None:          # each group's rate: the run's schedule (the line above) as a share of --lr,
+            x_rates = XH.set_rates(opt, xstage, sorted(x_step),               # times the group's own peak and warmup
+                                   genome_lr(step, lr, warmup, steps, lr_total, cooldown_from) / lr)
         opt.step()
+        if xstage is not None:
+            if xstage.stepped(sorted(x_step)) == "joint":
+                say(f"--xhead: head-only phase done after step {step + 1} ({xstage.state['updates']} labelled "
+                    f"updates); the inherited weights train from here, up to {inherit_lr:g} over {inherit_warmup} "
+                    "updates")
+                if main:                # the head-only milestone: weights and stage, beside the run's checkpoint
+                    _save_atomic({"model": model.state_dict(), "config": config.to_dict(), "step": step + 1,
+                                  "xstage": {"plan": xstage.plan.to_dict(), "state": xstage.state},
+                                  "run_record": record}, out / f"head-only-step{step + 1}.pt")
+            x_step.clear()
         if target is not None:
             with torch.no_grad():
                 for pt, pm in zip(target.parameters(), model.parameters()):
@@ -2627,6 +2766,27 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                             fh.write(f"{step},{code_},{float(r_.mean()):.5f},{float(r_.min()):.5f},"
                                      f"{float(r_.max()):.5f}," + ",".join(f"{v:.5f}" for v in r_.tolist()) + "\n")
                 ntv3_losses.clear()
+            if xstage is not None:
+                x_csv = out / "xheads.csv"
+                if main and not x_csv.exists():
+                    x_csv.write_text("step,head,phase,stage_step,updates,lr,lr_inherited,train_loss,heldout_pearson_mean,"
+                                     "heldout_bins,heldout_pearson_per_channel\n")
+                for n_ in xstage.plan.heads:
+                    r_x = x_pearson[n_].value()
+                    ok_x = r_x[~np.isnan(r_x)]
+                    mean_x = float(ok_x.mean()) if len(ok_x) else float("nan")
+                    tl_x = float(np.mean(x_losses[n_])) if x_losses[n_] else float("nan")
+                    say(f"--xhead {n_} [{xstage.state['phase']}]: {xstage.state['updates'][n_]} labelled updates, train "
+                        f"{tl_x:.4f}, chr8/chr9 Pearson(log1p, 128 bp) mean {mean_x:.4f} over {len(ok_x)} of {len(r_x)} "
+                        f"channels, {x_pearson[n_].n:,} bins")
+                    if main:
+                        with x_csv.open("a") as fh:
+                            fh.write(f"{step},{n_},{xstage.state['phase']},{xstage.state['stage_step']},"
+                                     f"{xstage.state['updates'][n_]},{x_rates.get(n_, 0.0):.3e},"
+                                     f"{x_rates.get('inherited', 0.0):.3e},{tl_x:.5f},{mean_x:.5f},{x_pearson[n_].n},"
+                                     + " ".join(f"{v_:.5f}" for v_ in r_x) + "\n")
+                    x_pearson[n_] = XH.Pearson(xhead_sizes[n_])
+                    x_losses[n_].clear()
             if epi_keep:
                 sc = torch.cat([k[0] for k in epi_keep])
                 tr = torch.cat([k[1] for k in epi_keep])
@@ -2677,6 +2837,8 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                                        "center": ntv3_center, "extra": [e_x["name"] for e_x in ntv3["extra"]],
                                        "mlm_weight": mlm_weight}} if ntv3 else {}),
                           "run_record": record,
+                          **({"xstage": {"plan": xstage.plan.to_dict(), "state": xstage.state}}
+                             if xstage is not None else {}),
                           **({"jepa_target": target.state_dict()} if target is not None and jepa_ema > 0 else {}),
                           **({"jepa_guard": dict(guard, std_mins=list(guard["std_mins"]))} if jepa_guard != "off" else {}),
                           **({"genomes": [dict(name=g_.name, share=g_.share, context=g_.context,
