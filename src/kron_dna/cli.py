@@ -161,6 +161,20 @@ def _lr_at(step: int, steps: int, warmup: int, lr: float) -> float:
     return lr * 0.5 * (1 + math.cos(math.pi * min(1.0, progress)))
 
 
+def genome_lr(step: int, lr: float, warmup: int, steps: int, lr_total: int = 0, cooldown_from: int = 0) -> float:
+    """genome-train's learning rate at ``step``: linear warmup, then a cosine over ``lr_total`` steps (0: ``steps``,
+    the curriculum's total). With ``cooldown_from`` S, from step S on the rate starts at the cosine's own value at S
+    and follows a second cosine from there to zero at ``steps``: a run resumed with a longer curriculum keeps its rate
+    continuous and gets a longer cooldown instead of a rewarm (raising ``steps`` alone moves the whole cosine)."""
+    total = lr_total or steps
+    def base(t: int) -> float:
+        return lr * min(1.0, (t + 1) / warmup) * 0.5 * (1 + math.cos(math.pi * min(t / total, 1.0)))
+    if not cooldown_from or step < cooldown_from:
+        return base(step)
+    span = max(1, steps - cooldown_from)
+    return base(cooldown_from) * 0.5 * (1 + math.cos(math.pi * min((step - cooldown_from) / span, 1.0)))
+
+
 def _save_atomic(obj: dict, path: Path) -> None:
     tmp = path.with_suffix(path.suffix + ".tmp")
     torch.save(obj, tmp)
@@ -917,6 +931,11 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                  start_step: int = typer.Option(0, help="with --init: continue the schedule (curriculum, LR, paired "
                                                 "evals) from this step, so the init run's own history is the control"),
                  stop_step: int = typer.Option(0, help="stop after this step (0: the end of the curriculum)"),
+                 lr_total: int = typer.Option(0, help="the length of the LR cosine (0: the curriculum's total); with "
+                                              "--cooldown-from, the run's original total"),
+                 cooldown_from: int = typer.Option(0, help="a longer cooldown: from this step the LR decays by a "
+                                                   "second cosine from its value here to zero at the curriculum's end "
+                                                   "(resume with a longer last phase, --lr-total = the old total)"),
                  chunk_ratio: float = typer.Option(0.0, help="learned chunking (H-Net): the router keeps ~1 in this many "
                                                    "2**n_down-bp positions as chunk starts (use with --n-down 4)"),
                  ratio_weight: float = typer.Option(0.03, help="with --chunk-ratio: weight of the ratio loss"),
@@ -1063,6 +1082,10 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
     phases = [(int(w), int(s)) for w, s in (x.split(":") for x in curriculum.split(","))] if curriculum else \
         [(window, steps)]
     steps = sum(s for _, s in phases)
+    if cooldown_from and not 0 < cooldown_from < steps:
+        raise typer.BadParameter(f"--cooldown-from {cooldown_from} must lie inside the curriculum (1..{steps - 1})")
+    if lr_total < 0 or (cooldown_from and lr_total and lr_total < cooldown_from):
+        raise typer.BadParameter("--lr-total must be 0 or at least --cooldown-from")
     eval_window = eval_window or phases[-1][0]
     if tokens_per_step:          # fail now, not hours in at the phase that cannot run (see phase_at)
         bad = sorted({w for w, _ in phases if tokens_per_step < w * world * grad_accum})
@@ -1844,6 +1867,8 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                          masks="torch.manual_seed(SeedSequence([seed, rank, 2035, start step]))",
                          windows="np.random.default_rng([seed, rank]) from step 0, else [seed, rank, start step]",
                          repeat_drop="np.random.default_rng([seed, rank, 2027]) from step 0, else [seed, rank, 2027, start step]")
+    record["lr_schedule"] = dict(lr=lr, warmup=warmup, steps=steps, lr_total=lr_total or steps,
+                                 cooldown_from=cooldown_from)
     if main and not bench:
         record["started_at_step"] = step
         rec_path = out / "run_record.json"
@@ -2384,7 +2409,7 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
     while step < end_step:
         t_step = time.time()
         for g in opt.param_groups:
-            g["lr"] = lr * min(1.0, (step + 1) / warmup) * 0.5 * (1 + math.cos(math.pi * min(step / steps, 1.0)))
+            g["lr"] = genome_lr(step, lr, warmup, steps, lr_total, cooldown_from)
         for d_ in (split_devs or [dev]):
             torch.cuda.reset_peak_memory_stats(d_)
         opt.zero_grad(set_to_none=True)
