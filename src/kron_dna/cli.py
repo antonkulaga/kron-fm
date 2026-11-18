@@ -1293,7 +1293,7 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
             xhead_sizes[name_x] = int(val_x)
             continue
         try:
-            xstores[name_x] = XH.TrackStore.open(val_x)
+            xstores[name_x] = XH.open_store(val_x)
         except (OSError, ValueError, KeyError) as err:
             raise typer.BadParameter(f"--xhead {name_x}: {err}") from None
         xhead_sizes[name_x] = len(xstores[name_x].ids)
@@ -1923,16 +1923,14 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
     x_step: set = set()                               # heads with supervised positions in the current step
     x_rates: dict = {}                                # the last step's rate per role
     x_losses: dict = {n_: [] for n_ in xhead_sizes}
-    x_pearson: dict = {n_: XH.Pearson(k_) for n_, k_ in xhead_sizes.items()}
+    x_pearson: dict = {n_: (xstores[n_].scorer() if n_ in xstores else XH.Pearson(k_)) for n_, k_ in xhead_sizes.items()}
     x_consts: dict = {}
 
     def x_consts_on(name_):
         """Head ``name_``'s constants (scales, non-zero means, RNA flags) per card, moved once."""
         def on(d_):
             if (name_, d_) not in x_consts:
-                st_ = xstores[name_]
-                x_consts[(name_, d_)] = tuple(torch.as_tensor(np.asarray(v_)).to(d_)
-                                               for v_ in (st_.scales, st_.nonzero_mean, st_.is_rna))
+                x_consts[(name_, d_)] = xstores[name_].consts(d_)
             return x_consts[(name_, d_)]
         return on
 
@@ -2237,16 +2235,16 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
         for n_ in x_now:                # --xhead: each active head on its own store
             want_x = ntv3_batch[0][4][n_]
             if model.training:
-                loss_x = (XH.split_head_loss(pieces, n_, want_x, x_ok, x_consts_on(n_), dev) if split_now else
-                          XH.head_loss(model.last_x[n_], want_x.to(dev), x_ok.to(dev), x_consts_on(n_)(dev)))
+                kind_x = xstores[n_].kind
+                loss_x = (XH.split_head_loss(pieces, n_, want_x, x_ok, x_consts_on(n_), dev, kind_x) if split_now else
+                          XH.head_loss(model.last_x[n_], want_x.to(dev), x_ok.to(dev), x_consts_on(n_)(dev), kind_x))
                 mlm = mlm + xhead_weight * loss_x
                 x_losses[n_].append(float(loss_x.detach()))
                 x_step.add(n_)
-            else:                       # held-out rows whole, in log1p signal at 128 bp
-                c_x = x_consts_on(n_)(dev)
+            else:                       # held-out rows whole: log1p signal at 128 bp, or logits against labels
                 rows_x = (x_ok.sum(1) > 0).to(dev)
-                x_pearson[n_].add(XH.signal_of(F.softplus(model.last_x[n_].float()), c_x[1], c_x[2])[rows_x],
-                                  (want_x.to(dev).float() / 255.0 * c_x[0])[rows_x])
+                p_x, w_x = XH.eval_pair(xstores[n_], model.last_x[n_], want_x.to(dev), x_consts_on(n_)(dev))
+                x_pearson[n_].add(p_x[rows_x], w_x[rows_x])
         reg_t = None                    # the anti-collapse term of this micro-batch (JEPA_TRACE)
         if target is not None and model.training and model.last_jepa is not None:
             with torch.no_grad(), autocast:
@@ -2769,23 +2767,26 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
             if xstage is not None:
                 x_csv = out / "xheads.csv"
                 if main and not x_csv.exists():
-                    x_csv.write_text("step,head,phase,stage_step,updates,lr,lr_inherited,train_loss,heldout_pearson_mean,"
-                                     "heldout_bins,heldout_pearson_per_channel\n")
+                    x_csv.write_text("step,head,phase,stage_step,updates,lr,lr_inherited,train_loss,heldout_metric,"
+                                     "heldout_mean,heldout_n,heldout_per_channel\n")
                 for n_ in xstage.plan.heads:
                     r_x = x_pearson[n_].value()
                     ok_x = r_x[~np.isnan(r_x)]
                     mean_x = float(ok_x.mean()) if len(ok_x) else float("nan")
                     tl_x = float(np.mean(x_losses[n_])) if x_losses[n_] else float("nan")
+                    met_x = ("average precision" if n_ in xstores and xstores[n_].kind == "binary" else
+                             "Pearson(log1p, 128 bp)")
                     say(f"--xhead {n_} [{xstage.state['phase']}]: {xstage.state['updates'][n_]} labelled updates, train "
-                        f"{tl_x:.4f}, chr8/chr9 Pearson(log1p, 128 bp) mean {mean_x:.4f} over {len(ok_x)} of {len(r_x)} "
-                        f"channels, {x_pearson[n_].n:,} bins")
+                        f"{tl_x:.4f}, chr8/chr9 {met_x} mean {mean_x:.4f} over {len(ok_x)} of {len(r_x)} "
+                        f"channels, n {x_pearson[n_].n:,}")
                     if main:
                         with x_csv.open("a") as fh:
                             fh.write(f"{step},{n_},{xstage.state['phase']},{xstage.state['stage_step']},"
                                      f"{xstage.state['updates'][n_]},{x_rates.get(n_, 0.0):.3e},"
-                                     f"{x_rates.get('inherited', 0.0):.3e},{tl_x:.5f},{mean_x:.5f},{x_pearson[n_].n},"
+                                     f"{x_rates.get('inherited', 0.0):.3e},{tl_x:.5f},{met_x.split('(')[0].strip().replace(' ', '_')},"
+                                     f"{mean_x:.5f},{x_pearson[n_].n},"
                                      + " ".join(f"{v_:.5f}" for v_ in r_x) + "\n")
-                    x_pearson[n_] = XH.Pearson(xhead_sizes[n_])
+                    x_pearson[n_] = xstores[n_].scorer() if n_ in xstores else XH.Pearson(xhead_sizes[n_])
                     x_losses[n_].clear()
             if epi_keep:
                 sc = torch.cat([k[0] for k in epi_keep])

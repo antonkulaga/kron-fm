@@ -127,7 +127,8 @@ def test_head_only_then_joint_at_scheduled_rates(genomes, tmp_path, monkeypatch)
     assert st["phase"] == "joint" and st["updates"] == {"dnase": prev, "splice": 0} and st["active"] == {"dnase": 0}
     assert st["stores"]["dnase"]["ids"] == ["F0", "F1", "F2"] and st["joint_step"] == STEPS - switch
     assert st["stage_step"] == STEPS - 4
-    assert np.isfinite(d["heldout_pearson_mean"].cast(pl.Float64).to_numpy()).all() and (d["heldout_bins"] > 0).all()
+    assert np.isfinite(d["heldout_mean"].cast(pl.Float64).to_numpy()).all() and (d["heldout_n"] > 0).all()
+    assert set(d["heldout_metric"].to_list()) == {"Pearson"}
 
 
 def test_a_resumed_stage_goes_on_from_the_checkpoint(genomes, tmp_path, monkeypatch):
@@ -176,3 +177,35 @@ def test_without_xhead_nothing_changes(genomes, tmp_path, monkeypatch):
     state = torch.load(tmp_path / "r" / "checkpoint.pt", map_location="cpu", weights_only=False)
     assert "xstage" not in state and state["config"]["xheads"] == [] and state["config"]["xhead_hidden"] == 0 and not (tmp_path / "r" / "xheads.csv").exists()
     assert len(state["optimizer"]["param_groups"]) == 2
+
+
+def test_a_label_store_trains_a_binary_head_and_reports_average_precision(genomes, tmp_path, monkeypatch):
+    root, parent, store, child = setup(genomes, tmp_path, monkeypatch)
+    total = int(np.fromfile(genomes["hgt"] / "bases.u8", dtype=np.uint8).size)
+    d = tmp_path / "labels"
+    d.mkdir()
+    rng = np.random.default_rng(4)
+    lab = np.zeros(total, dtype=np.uint8)
+    bits = {"donor_plus": 0, "acceptor_plus": 1, "donor_minus": 2, "acceptor_minus": 3}
+    for b in bits.values():
+        lab[rng.random(total) < 0.02] |= 1 << b
+    lab.tofile(d / "splice.u8")
+    (d / "splice.json").write_text(json.dumps(dict(
+        genome="hgt", total_bases=total, bits=bits, definition="one base per site, per strand", splice_sha256="x",
+        check={k: dict(sites=int(((lab >> b) & 1).sum())) for k, b in bits.items()})))
+    args = [a if a != "splice:2" else f"splice:{d}" for a in child] + ["--rc"]
+    out = tmp_path / "child"
+    res, _ = run(cli, monkeypatch, root, out, args)
+    assert res.exit_code == 0, res.output + repr(res.exception)
+    x = pl.read_csv(out / "xheads.csv")
+    s = x.filter(pl.col("head") == "splice").sort("step")
+    assert set(s["heldout_metric"].to_list()) == {"average_precision"} and s["updates"][-1] >= 6
+    assert np.isfinite(s["heldout_mean"].cast(pl.Float64).to_numpy()).all() and (s["heldout_n"] > 0).all()
+    moved = np.diff(np.concatenate([[0], s["updates"].to_numpy()])) > 0        # rows after a labelled step
+    loss = s["train_loss"].cast(pl.Float64).to_numpy()
+    assert np.isfinite(loss[moved]).all() and np.isnan(loss[~moved]).all() and loss[moved][-1] < loss[moved][0]
+    f = torch.load(out / "checkpoint.pt", map_location="cpu", weights_only=False)
+    p = torch.load(parent / "checkpoint.pt", map_location="cpu", weights_only=False)
+    assert f["config"]["xheads"] == [["dnase", 3], ["splice", 4]]
+    assert f["xstage"]["state"]["stores"]["splice"]["definition"] == "one base per site, per strand"
+    assert "xheads.splice.weight" in f["model"] and "xheads.splice.weight" not in p["model"]

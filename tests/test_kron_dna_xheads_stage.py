@@ -197,3 +197,98 @@ def test_groups_cover_every_parameter_once_and_rates_follow_the_stage(device):
         st.stepped(["dnase"])
     X.freeze(m, st)
     assert m.stem.weight.requires_grad and X.set_rates(opt, st, [])["dnase"] == 0.0
+
+
+# ------------------------------------------------------------------------------------- 0/1 labels (splice sites)
+
+BITS = {"donor_plus": 0, "acceptor_plus": 1, "donor_minus": 2, "acceptor_minus": 3}
+
+
+def write_labels(path, total=4096, rate=0.02):
+    rng = np.random.default_rng(1)
+    path.mkdir(parents=True)
+    lab = np.zeros(total, dtype=np.uint8)
+    for b in range(4):
+        lab[rng.random(total) < rate] |= 1 << b
+    lab.tofile(path / "splice.u8")
+    (path / "splice.json").write_text(json.dumps(dict(
+        genome="toy", total_bases=total, bits=BITS, definition="one base per site, per strand",
+        check={k: dict(sites=int(((lab >> b) & 1).sum())) for k, b in BITS.items()}, splice_sha256="x")))
+    return lab
+
+
+def test_label_store_reads_bits_and_exchanges_strands(tmp_path):
+    lab = write_labels(tmp_path / "s")
+    st = X.open_store(tmp_path / "s")
+    assert st.kind == "binary" and st.ids == list(BITS) and st.swap.tolist() == [2, 3, 0, 1]
+    w = st.window(10, 100, 128)
+    assert w.shape == (128, 4) and not w[100:].any()
+    for b in range(4):
+        assert np.array_equal(w[:100, b], (lab[10:110] >> b) & 1)
+    f = st.window(10, 100, 128, flip=True)
+    assert np.array_equal(f[:100], w[:100][::-1][:, [2, 3, 0, 1]])
+    assert st.differences(json.loads(json.dumps(st.identity))) == []
+    assert st.differences(st.identity | {"definition": "two bases"}) != []
+    (w_,) = st.consts("cpu")
+    assert w_.shape == (4,) and float(w_.min()) >= 1 and float(w_.max()) <= 100
+    write_store(tmp_path / "t")
+    assert X.open_store(tmp_path / "t").kind == "tracks"
+    with pytest.raises(ValueError):
+        X.open_store(tmp_path)
+
+
+@pytest.mark.parametrize("by,b,length", [("length", 2, 2048), (None, 4, 1024)])
+def test_binary_split_loss_and_gradient_equal_the_whole_window(device, monkeypatch, tmp_path, by, b, length):
+    forced_replicas(monkeypatch)
+    write_labels(tmp_path / "s", total=b * length)
+    st = X.open_store(tmp_path / "s")
+    cfg = small("v2").config.to_dict() | {"xheads": [["splice", 4]]}
+    torch.manual_seed(2)
+    m = G.KronGenome(G.KronGenomeConfig(**cfg)).to(device).eval()
+    seq, seg, ctx, extra = batch_for(b, length, device)
+    want = torch.stack([torch.from_numpy(st.window(r * length, length, length)) for r in range(b)])
+    split = torch.ones(b, length, dtype=torch.long)
+    split[0, :100] = 4
+    ok = X.supervised(split, center=0.75)
+    m(seq, seg, ctx, extra)
+    whole = X.head_loss(m.last_x["splice"], want.to(device), ok.to(device), st.consts(device), "binary")
+    whole.backward()
+    g_whole = m.xheads["splice"].fc2.weight.grad.clone()
+    m.zero_grad()
+    pieces, _ = m.forward_split(seq, seg, ctx, extra, devices=[device, device], by=by)
+    parts = X.split_head_loss(pieces, "splice", want, ok, st.consts, device, "binary")
+    parts.backward()
+    assert torch.allclose(parts, whole, rtol=1e-4, atol=1e-6)
+    assert torch.allclose(m.xheads["splice"].fc2.weight.grad, g_whole, rtol=2e-2, atol=1e-6)
+    none = X.head_loss(m.last_x.get("splice", parts.new_zeros(b, length, 4)), want.to(device),
+                       torch.zeros_like(ok).to(device), st.consts(device), "binary")
+    assert float(none) == 0.0                                    # nothing supervised: zero, not NaN
+
+
+def brute_ap(x, y):
+    order = np.argsort(-x, kind="stable")
+    hit = y[order]
+    prec = np.cumsum(hit) / np.arange(1, len(hit) + 1)
+    return float(prec[hit].mean())
+
+
+def test_average_precision_is_exact_with_everything_kept_and_a_lower_bound_otherwise():
+    g = torch.Generator().manual_seed(0)
+    y = torch.rand(2, 4000, 3, generator=g) < 0.02
+    x = torch.randn(2, 4000, 3, generator=g) + 2.5 * y.float()
+    y[..., 2] = False
+    full = X.AveragePrecision(3, keep=1.0)
+    full.add(x[:1], y[:1].to(torch.uint8))
+    full.add(x[1:], y[1:].to(torch.uint8))
+    r = full.value()
+    for k in (0, 1):
+        assert r[k] == pytest.approx(brute_ap(x[..., k].reshape(-1).numpy(), y[..., k].reshape(-1).numpy()), abs=1e-9)
+    assert np.isnan(r[2]) and full.n == int(y.sum())
+    part = X.AveragePrecision(3, keep=0.05)
+    part.add(x[:1], y[:1].to(torch.uint8))
+    part.add(x[1:], y[1:].to(torch.uint8))
+    p = part.value()
+    assert all(p[k] <= r[k] + 1e-9 and p[k] > 0.8 * r[k] for k in (0, 1))
+    perfect = X.AveragePrecision(1)
+    perfect.add(torch.tensor([[[5.0], [4.0], [-1.0], [-2.0]]]), torch.tensor([[[1], [1], [0], [0]]], dtype=torch.uint8))
+    assert perfect.value()[0] == pytest.approx(1.0)

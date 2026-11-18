@@ -4,7 +4,8 @@ Three parts, each used by ``genome-train`` and testable alone:
 
 - :class:`TrackStore`: a store written by ``scripts/kron_dna/prep_bigwig_tracks.py`` on the primary genome's contig
   layout (``dense.u8`` + ``dense.json``), read per window; its identity (channel ids in order, encoding, scales) is
-  what a checkpoint records and a resume checks.
+  what a checkpoint records and a resume checks. :class:`LabelStore`: 0/1 labels (stranded splice sites) the same
+  way; :func:`open_store` picks by what the folder holds.
 - :func:`head_loss` / :func:`head_loss_parts`: the track objective of the inherited NTv3 head (Poisson total +
   multinomial profile on AlphaGenome-scaled targets) for one head, whole or from the pieces of a split window.
 - :class:`Stage`: where a continuation stands - head-only or joint, how many labelled updates each head has taken,
@@ -40,6 +41,14 @@ class TrackStore:
     unobserved: list[list[str]]       # per channel: contigs the source did not cover ("chrom:start-end")
     genome: str
     identity: dict = field(default_factory=dict)
+    kind = "tracks"                   # quantitative: Poisson-multinomial loss, Pearson of log1p signal at 128 bp
+
+    def consts(self, device) -> tuple:
+        """(scales, non-zero means, RNA flags) on ``device``."""
+        return tuple(torch.as_tensor(np.asarray(v)).to(device) for v in (self.scales, self.nonzero_mean, self.is_rna))
+
+    def scorer(self):
+        return Pearson(len(self.ids))
 
     @classmethod
     def open(cls, path: str | Path) -> "TrackStore":
@@ -91,6 +100,85 @@ class TrackStore:
         return out
 
 
+@dataclass
+class LabelStore:
+    """Per-base 0/1 labels on a prepared genome's layout, one bit of ``labels[at]`` per channel (written by
+    ``scripts/kron_dna/prep_splice_labels.py``: donor and acceptor per strand). ``pairs`` are the channels exchanged
+    when a window is read on the other strand."""
+    path: Path
+    ids: list[str]
+    labels: np.ndarray                # [total_bases] uint8, bit k = channel k
+    swap: np.ndarray                  # [T] the other strand's channel
+    positives: np.ndarray             # [T] labelled bases per channel
+    genome: str
+    identity: dict = field(default_factory=dict)
+    kind = "binary"                   # classification: weighted BCE, average precision on the held-out chromosomes
+
+    @classmethod
+    def open(cls, path: str | Path) -> "LabelStore":
+        path = Path(path)
+        raw = (path / "splice.json").read_bytes()
+        j = json.loads(raw)
+        ids = sorted(j["bits"], key=j["bits"].get)
+        if [j["bits"][i] for i in ids] != list(range(len(ids))):
+            raise ValueError(f"{path}: label bits must be 0..{len(ids) - 1}, got {j['bits']}")
+        total = int(j["total_bases"])
+        size = (path / "splice.u8").stat().st_size
+        if size != total:
+            raise ValueError(f"{path / 'splice.u8'} has {size:,} bytes, its record says {total:,}")
+        at = {i: k for k, i in enumerate(ids)}
+        swap = np.arange(len(ids))
+        for k, i in enumerate(ids):
+            other = i[:-4] + "minus" if i.endswith("_plus") else i[:-5] + "plus" if i.endswith("_minus") else i
+            if other not in at:
+                raise ValueError(f"{path}: stranded channel {i} has no partner")
+            swap[k] = at[other]
+        positives = np.array([int(j["check"][i]["sites"]) for i in ids], dtype=np.int64)
+        identity = dict(ids=ids, encoding="one bit per channel", genome=j.get("genome"), total_bases=total,
+                        definition=j.get("definition"), labels_sha256=j.get("splice_sha256"),
+                        record_sha256=hashlib.sha256(raw).hexdigest())
+        return cls(path=path, ids=ids, labels=np.memmap(path / "splice.u8", dtype=np.uint8, mode="r"), swap=swap,
+                   positives=positives, genome=str(j.get("genome")), identity=identity)
+
+    @property
+    def dense(self) -> np.ndarray:                    # for the size check a store's user makes against the genome
+        return self.labels
+
+    def window(self, at: int, take: int, width: int, flip: bool = False) -> np.ndarray:
+        """Targets ``[width, T]`` uint8 (0 or 1) of bases ``at:at + take``; ``flip``: the other strand."""
+        out = np.zeros((width, len(self.ids)), dtype=np.uint8)
+        bits = np.asarray(self.labels[at:at + take])
+        out[:take] = (bits[:, None] >> np.arange(len(self.ids))[None, :]) & 1
+        if flip:
+            out[:take] = out[:take][::-1][:, self.swap]
+        return out
+
+    def differences(self, saved: dict) -> list[str]:
+        return [f"{k}: checkpoint {saved.get(k)!r}, now {self.identity.get(k)!r}"
+                for k in ("ids", "encoding", "genome", "total_bases", "definition", "labels_sha256")
+                if saved.get(k) != self.identity.get(k)]
+
+    def consts(self, device) -> tuple:
+        """(positive weights,) on ``device``: sqrt(negatives / positives) per channel, between 1 and 100, as the
+        prepared genome's own rare tracks are weighted."""
+        share = self.positives / max(len(self.labels), 1)
+        w = np.clip(np.sqrt((1 - share) / np.maximum(share, 1e-12)), 1, 100).astype(np.float32)
+        return (torch.as_tensor(w).to(device),)
+
+    def scorer(self):
+        return AveragePrecision(len(self.ids))
+
+
+def open_store(path: str | Path):
+    """The store at ``path``: measured tracks (``dense.json``) or 0/1 labels (``splice.json``)."""
+    path = Path(path)
+    if (path / "dense.json").exists():
+        return TrackStore.open(path)
+    if (path / "splice.json").exists():
+        return LabelStore.open(path)
+    raise ValueError(f"{path} holds neither dense.json (measured tracks) nor splice.json (labels)")
+
+
 # ------------------------------------------------------------------------------------------------- the loss
 
 def targets_of(want: torch.Tensor, scales: torch.Tensor, nonzero_mean: torch.Tensor,
@@ -125,9 +213,18 @@ def supervised(split: torch.Tensor, center: float = 1.0, skip: torch.Tensor | No
     return ok
 
 
-def head_loss(pred: torch.Tensor, want: torch.Tensor, ok: torch.Tensor, consts: tuple) -> torch.Tensor:
-    """The head's loss on a whole window: ``pred`` [B, L, T] raw outputs, ``want`` [B, L, T] stored bytes, ``ok``
-    [B, L] from :func:`supervised`, ``consts`` = (scales, nonzero_mean, is_rna) on ``pred``'s device."""
+def _bce_sum(pred: torch.Tensor, want: torch.Tensor, ok: torch.Tensor, consts: tuple) -> torch.Tensor:
+    per = F.binary_cross_entropy_with_logits(pred.float(), want.float(), pos_weight=consts[0], reduction="none")
+    return (per * ok.unsqueeze(-1)).sum()
+
+
+def head_loss(pred: torch.Tensor, want: torch.Tensor, ok: torch.Tensor, consts: tuple,
+              kind: str = "tracks") -> torch.Tensor:
+    """The head's loss on a whole window: ``pred`` [B, L, T] raw outputs, ``want`` [B, L, T] stored targets, ``ok``
+    [B, L] from :func:`supervised`, ``consts`` the store's on ``pred``'s device. ``kind`` "tracks": the NTv3 head's
+    Poisson-multinomial on scaled signal; "binary": weighted BCE, the mean over supervised values."""
+    if kind == "binary":
+        return _bce_sum(pred, want, ok, consts) / (ok.sum() * pred.shape[-1]).clamp_min(1)
     return G.poisson_multinomial_loss(F.softplus(pred.float()), targets_of(want, *consts), ok.unsqueeze(-1))
 
 
@@ -137,9 +234,14 @@ def head_loss_parts(pred: torch.Tensor, want: torch.Tensor, ok: torch.Tensor, co
     return G.poisson_multinomial_parts(F.softplus(pred.float()), targets_of(want, *consts), ok.unsqueeze(-1))
 
 
-def split_head_loss(pieces: list, name: str, want: torch.Tensor, ok: torch.Tensor, consts_on, device) -> torch.Tensor:
+def split_head_loss(pieces: list, name: str, want: torch.Tensor, ok: torch.Tensor, consts_on, device,
+                    kind: str = "tracks") -> torch.Tensor:
     """:func:`head_loss` of head ``name`` from the pieces of ``forward_split``: targets go from the host to each
     piece's card, only per-(row, track) sums cross to ``device``. ``consts_on(device)`` gives that card's constants."""
+    if kind == "binary":
+        tot = sum(_bce_sum(p.x[name], want[p.rows, p.start:p.end].to(p.device),
+                           ok[p.rows, p.start:p.end].to(p.device), consts_on(p.device)).to(device) for p in pieces)
+        return tot / (ok.sum() * want.shape[-1]).clamp_min(1).to(device)
     parts = [(p.rows, head_loss_parts(p.x[name], want[p.rows, p.start:p.end].to(p.device),
                                       ok[p.rows, p.start:p.end].to(p.device), consts_on(p.device))) for p in pieces]
     return G.poisson_multinomial_combine(parts, want.shape[0], device)
@@ -175,6 +277,61 @@ class Pearson:
         with np.errstate(divide="ignore", invalid="ignore"):
             r = cov / np.sqrt(vx * vy)
         return np.where((vx > 1e-12) & (vy > 1e-12), r, np.nan)
+
+
+class AveragePrecision:
+    """Per-channel average precision of a binary head's logits against its 0/1 labels over the positions added
+    (positives are about 1 base in 16,000 for splice sites, so AUROC would say little). Every positive is kept;
+    of the negatives, those scoring above a floor that keeps about the top 2 % of each batch, which decide the
+    ranking near the positives; the rest count as ranked below everything kept."""
+
+    def __init__(self, n: int, keep: float = 0.02) -> None:
+        self.keep, self.n = keep, 0                    # n: positives seen, all channels
+        self.pos = [[] for _ in range(n)]
+        self.neg = [[] for _ in range(n)]
+        self.neg_total = [0] * n
+        self.floor = [float("-inf")] * n              # above it every negative of every batch was kept
+
+    def add(self, pred: torch.Tensor, want: torch.Tensor) -> None:
+        """``[B, L, T]`` logits and 0/1 labels."""
+        t = pred.shape[-1]
+        x, y = pred.detach().float().reshape(-1, t).cpu(), want.reshape(-1, t).cpu() > 0
+        for k in range(t):
+            p, q = x[y[:, k], k], x[~y[:, k], k]
+            self.pos[k].append(p)
+            self.neg_total[k] += int(q.numel())
+            if q.numel():
+                top = max(1, int(q.numel() * self.keep))
+                kept = torch.topk(q, top).values
+                self.neg[k].append(kept)
+                if top < q.numel():
+                    self.floor[k] = max(self.floor[k], float(kept.min()))
+            self.n += int(p.numel())
+
+    def value(self) -> np.ndarray:
+        """Per channel; NaN without a positive. Exact for positives above the floor (the highest of the batches' lowest
+        kept negatives); a positive below it is placed after every negative (a lower bound on its precision)."""
+        out = np.full(len(self.pos), np.nan)
+        for k in range(len(self.pos)):
+            p = torch.cat(self.pos[k]) if self.pos[k] else torch.zeros(0)
+            if not p.numel():
+                continue
+            q = torch.cat(self.neg[k]) if self.neg[k] else torch.zeros(0)
+            floor = self.floor[k]
+            p = torch.sort(p, descending=True).values
+            above = torch.searchsorted(-torch.sort(q, descending=True).values, -p, right=False).double()  # negatives > p
+            above = torch.where(p >= floor, above, torch.full_like(above, float(self.neg_total[k])))
+            rank = torch.arange(1, p.numel() + 1, dtype=torch.float64)
+            out[k] = float((rank / (rank + above)).mean())
+        return out
+
+
+def eval_pair(store, pred: torch.Tensor, want: torch.Tensor, consts: tuple) -> tuple[torch.Tensor, torch.Tensor]:
+    """What the store's scorer is given for held-out rows: predicted and measured log1p signal for tracks, logits and
+    labels for binary heads."""
+    if store.kind == "binary":
+        return pred.float(), want
+    return signal_of(F.softplus(pred.float()), consts[1], consts[2]), want.float() / 255.0 * consts[0]
 
 
 # ------------------------------------------------------------------------------------------------ the stage
