@@ -43,8 +43,9 @@ ENCODING = "uint8 = log1p(signal)/log1p_scale*255, clipped"
 _G: dict = {}
 
 
-def scale_of(bw, rows: list[tuple]) -> float:
-    """99.9th percentile of non-zero log1p signal over 200 sampled 100 kb windows (as the NTv3 store)."""
+def scale_of(bw, rows: list[tuple], percentile: float = 99.9) -> float:
+    """The ``percentile`` of non-zero log1p signal over 200 sampled 100 kb windows (99.9: as the NTv3 store; the
+    DNase pilot showed that it clips peak summits where a track's scale is low, so peaky assays take 99.99)."""
     rng = np.random.default_rng(0)
     vals = []
     have = set(bw.chroms())
@@ -56,7 +57,7 @@ def scale_of(bw, rows: list[tuple]) -> float:
         v = np.nan_to_num(bw.values(c, a, a + 100_000, numpy=True))
         vals.append(v[v > 0])
     v = np.concatenate(vals) if vals else np.array([1.0])
-    return float(max(np.log1p(np.percentile(v, 99.9)) if v.size else 1.0, 1e-3))
+    return float(max(np.log1p(np.percentile(v, percentile)) if v.size else 1.0, 1e-3))
 
 
 def one(fid: str) -> dict:
@@ -69,7 +70,7 @@ def one(fid: str) -> dict:
         return json.loads(side.read_text())
     bw = pyBigWig.open(str(src / f"{fid}.bigWig"))
     have = bw.chroms()
-    sc = scale_of(bw, rows)
+    sc = scale_of(bw, rows, _G.get("percentile", 99.9))
     part = str(dst) + f".part.{socket.gethostname()}.{os.getpid()}"
     arr = np.memmap(part, dtype=np.uint8, mode="w+", shape=(total,))
     nan = seen = negative = 0
@@ -103,7 +104,8 @@ def _init(g: dict) -> None:
 
 
 def main(select: Path, bigwigs: Path, out: Path, name: str = "hg38", provenance: Path = typer.Option(None),
-         workers: int = 4, check_windows: int = 40) -> None:
+         workers: int = 4, check_windows: int = 40,
+         scale_percentile: float = typer.Option(99.9, help="percentile of non-zero signal the encoding clips at")) -> None:
     import pyBigWig
 
     genome = interim_dir("genome", name)
@@ -120,7 +122,7 @@ def main(select: Path, bigwigs: Path, out: Path, name: str = "hg38", provenance:
     if provenance and provenance.exists():
         prov = {r["file"]: r for r in map(json.loads, provenance.read_text().splitlines())}
     (out / "tracks").mkdir(parents=True, exist_ok=True)
-    g = dict(rows=rows, total=total, src=bigwigs, out=out)
+    g = dict(rows=rows, total=total, src=bigwigs, out=out, percentile=scale_percentile)
     with Pool(workers, initializer=_init, initargs=(g,)) as p:
         infos = {}
         for info in p.imap_unordered(one, ids):
@@ -181,7 +183,7 @@ def main(select: Path, bigwigs: Path, out: Path, name: str = "hg38", provenance:
 
     meta = {"ids": ids, "total_bases": total, "n_tracks": T, "scales": scales.tolist(),
             "assays": [r["assay"] for r in sel], "nonzero_mean": nzmean.tolist(), "mean_stride": 64,
-            "encoding": ENCODING, "genome": name, "split": f"interim/genome/{name}/ntv3/split.u8 (1 = train; the "
+            "encoding": ENCODING, "scale_percentile": scale_percentile, "genome": name, "split": f"interim/genome/{name}/ntv3/split.u8 (1 = train; the "
             "held-out chromosomes are 0 there)", "strand": "unstranded",
             "tracks": [dict(channel=k, **{c: r.get(c) for c in ("experiment", "file", "assay", "biosample",
                                                                "output_type")},

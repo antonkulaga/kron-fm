@@ -110,6 +110,17 @@ loss on bins and the wiring in `genome-train` (B11).
   two-stage backward (I recommended it before the binned store); a proper literature survey on heads only if he
   asks (one search of four hit the usage limit: heads conditioned on a cell or track embedding).
 
+**19 Nov, 00:40:** stage 1 of the download is complete: 1,889 of 1,889 DNase and RNA-seq files verified, 456 GB in
+3 h 45 min (34 MB/s over three streams). Stage 2 (ChIP-seq) started by itself. Next subset for training, per
+Anton's rule: one DNase file per biosample beyond the pilot's 13, 196 tracks, selection and links in
+`$SCRATCH/kron-dna-build/tracks/dnase-biosamples-v1/`; conversion job 6520646 `kron-dna-build-dnase196-prep` on the
+uncapped account, to `$KRON_FM_DATA/interim/tracks/hg38/dnase-biosamples-v1/`, clipped at the 99.99th percentile
+(the pilot's 99.9 cut peak summits). When it ends: the same checks as the pilot (decoded bins against source, nan
+shares, known loci), then offer it to the trainer as a third head added on a plain resume. Memory at 1 Mb with the
+span cut, my estimate: about 1 GiB per card for 196 per-base outputs, so A and E first, F and D only if their
+bench has room; otherwise it waits for binned heads. The head comparison job 6517859 has been held by the group's
+CPU cap since the E probe ended at 00:03, with the card idle.
+
 ## Items
 
 | item | state |
