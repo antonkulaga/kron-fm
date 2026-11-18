@@ -34,6 +34,15 @@ does not fit); (3) the ClinVar pass, `$SCRATCH/kron-dna-build/clinvar/v1/score.s
 passed, 5 failed, all five failing on trainer main `7fdd30a` too (parent-equivalence tests hit by the audit's
 mask-seed change; the trainer is fixing the helpers). Merge trainer main again when that lands.
 
+**Restart of all four arms (Anton through the trainer, 18 Nov 16:30):** A, D, E and F restart with both new heads,
+from published main; the trainer writes the launchers. Sent to the trainer: E has no NTv3 head, so it needs
+`--xhead-split <split.u8>` (`3d5d1db`, to merge before E launches); D runs data-parallel, which `--xhead` refuses,
+so D runs as one process with `--split-cards 2` or waits (a data-parallel `--xhead` is not written: each process
+would need the labelled sets and rates synced). Recommended options: `--xhead-hidden 128`, `--xhead-weight 0.5`,
+`--xhead-lr` = the arm's `--lr`, `--xhead-warmup 200`, `--xhead-only 1000` (so an evaluation scores the heads on
+the frozen model). `--inherit-lr` is the trainer's and Anton's call: 4e-5 (a tenth of the schedule for the rest of
+the run) or the arm's own `--lr` with a 500-update warmup; asked of Anton in the session.
+
 ## Items
 
 | item | state |
