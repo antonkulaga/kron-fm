@@ -43,6 +43,18 @@ would need the labelled sets and rates synced). Recommended options: `--xhead-hi
 the frozen model). `--inherit-lr` is the trainer's and Anton's call: 4e-5 (a tenth of the schedule for the rest of
 the run) or the arm's own `--lr` with a 500-update warmup; asked of Anton in the session.
 
+**Split gradients on a card, 18 Nov (the trainer's CUDA run failed 2 of my tests):** not a defect. With IEEE
+kernels the split and whole-window gradients of a head's loss agree to 3e-6..1e-5 upstream of the core, the same
+as two whole passes of one input; the heads and decoder agree to 1e-6. The KronLSTM kernels are not bit-repeatable
+and amplify a 2e-7 change about a thousandfold backwards; kernels compiled before `TRITON_F32_DEFAULT=ieee` is set
+(any pytest process that ran other tests first) give about 1e-3. My first guess, max-pool rerouting, was wrong:
+measured, it changes nothing. Tests now use 5e-3 upstream of the core on CUDA; `scripts/kron_dna/diag/split_grad.py`
+reproduces it in 10 s on a card. The CUDA cases of the changed tests are still to be rerun.
+
+**Two slips of mine to not repeat:** a commit id written into a message before the commit existed (twice): take the
+id from `git log` after the push, then write the message. A file created by a shell redirect whose command failed
+was committed empty: check a generated file's size before `git add`.
+
 ## Items
 
 | item | state |
