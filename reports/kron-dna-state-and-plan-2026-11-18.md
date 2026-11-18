@@ -94,13 +94,18 @@ Each item says what it costs and what it needs from Anton.
 1. **Many more track targets, by distillation.** Two sources:
    - AlphaGenome predictions (approved for the pilot; the API is rate-limited).
    - `NTv3_tracks`: 711M parameters, post-trained on 16,262 tracks across 15 species, with 7,362 output channels at
-     base level. Covering hg38 takes about 8,000 windows of 1 Mb on one A100 (32 GB per pass). It is gated, so it
-     needs **Anton's access request**. Its licence is non-commercial, it covers the outputs, and a model distilled
-     from it must be non-commercial and released under the same licence. That is **Anton's call**.
-2. **Real measured tracks in bulk.** Download the hg38 bigwigs behind NTv3's track list (mostly ENCODE experiments)
-   and GTEx RNA-seq, and process them with the T2T pipeline's recipes. This means real labels and no licence on
-   outputs, but per-experiment download and processing. It needs the track list (`NTv3_tracks`'
-   `track_metadata.json`, gated, or the paper's supplement). Disk: hundreds of GB.
+     base level. Covering hg38 takes about 8,000 windows of 1 Mb on one A100 (32 GB per pass). It is gated; Anton's
+     token already has access (the track list was downloaded with it). Its licence is non-commercial, it covers the
+     outputs, and a model distilled from it must be non-commercial and released under the same licence. That is
+     **Anton's call**.
+2. **Real measured tracks in bulk.** Download the hg38 bigwigs behind NTv3's track list and process them with the
+   T2T pipeline's recipes. This means real labels and no licence on outputs, but per-experiment download and
+   processing. Disk: hundreds of GB.
+   The list is in hand (`track_metadata.json`, fetched 18 Nov with Anton's token). For hg38 it has 7,362 channels:
+   5,609 ENCODE ids (5,040 experiments), 1,276 FANTOM CAGE, 84 GTEx, 169 GEO and 222 others. 1,489 of them are
+   RNA-seq. The other assemblies: mm10 2,450, TAIR10 1,899, rice 1,392, wheat 776, maize 921, and fewer for the rest.
+   **None of the 22 human experiments we train and evaluate on (NTv3's benchmark) is in that list.** So the
+   benchmark is held out from NTv3_tracks' training, and adding these tracks keeps our track evaluation clean.
 3. **Splicing heads.** Splice site, splice-site usage and junction heads, trained from GENCODE annotation and RNA-seq
    junctions, as new heads on the existing backbone. This is where AlphaGenome's ClinVar lead comes from, and our
    stage-2 splice delta (0.923 near splice sites) suggests the backbone already carries part of the signal.
@@ -124,7 +129,6 @@ finish.
 
 ## 7. Open decisions for Anton
 
-- Request access to the gated NTv3 models (needed for items 1 and 2), and decide whether NTv3's licence terms are
-  acceptable for distillation (item 1).
+- Whether NTv3's licence terms are acceptable for distilling from `NTv3_tracks` (item 1). Access is already there.
 - After E's finish: stretch A and D with the longer cooldown, or not.
 - Disk and GPU budget for bulk real tracks (item 2) and for a bigger model (item 5).
