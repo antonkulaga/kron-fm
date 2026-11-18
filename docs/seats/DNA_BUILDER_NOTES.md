@@ -62,6 +62,10 @@ the heads on the frozen model, the `joint` rows what updating the shared layers 
 splice is average precision, both on chr8/chr9. Early check (the trainer role's duty, for my heads): a head whose
 held-out score does not move over its first evaluations, or a loss that is not finite, goes to the trainer at once.
 
+**Input length (Anton, 18 Nov evening):** "keep A and E on one card but D and F will be two cards with 1Mb". Forwarded
+to the trainer, who owns the launchers: D changes from two 524 kb rows to one 1 Mb window cut by length; A, E and F
+stay as they were. So from this restart A against D is no longer one recipe at one context.
+
 ## Items
 
 | item | state |
