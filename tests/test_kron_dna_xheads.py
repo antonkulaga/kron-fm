@@ -99,3 +99,38 @@ def test_split_window_sends_gradients_to_the_head_and_the_trunk(device, monkeypa
     sum(p.x["dnase"].float().pow(2).sum().to(device) for p in pieces).backward()
     assert all(p.grad is not None and torch.isfinite(p.grad).all() for p in m.xheads.parameters())
     assert m.stem.weight.grad is not None and float(m.stem.weight.grad.abs().sum()) > 0
+
+
+@pytest.mark.parametrize("arch", ["v2", "v2l"])
+def test_a_binned_head_reads_the_mean_state_of_each_bin(device, monkeypatch, arch):
+    forced_replicas(monkeypatch)
+    m = with_heads(small(arch), [["base", 3], ["b4", 3, 4], ["b16", 7, 16]]).to(device).eval()
+    m.xheads["b4"].load_state_dict(m.xheads["base"].state_dict())    # the same map, so the two can be compared
+    seq, seg, ctx, extra = batch_for(2, 2048, device)
+    with torch.no_grad():
+        m(seq, seg, ctx, extra)
+        got = dict(m.last_x)
+        assert got["base"].shape == (2, 2048, 3) and got["b4"].shape == (2, 512, 3) and got["b16"].shape == (2, 128, 7)
+        # the head is applied to the mean state: a linear probe of the states shows it without a second forward
+        probe = torch.nn.Conv1d(m.xheads["base"].fc1.in_channels, 1, 1).to(device)
+        keep = {}
+        hook = m.xheads["b4"].norm.register_forward_hook(lambda mod, inp, out: keep.setdefault("in", inp[0]))
+        hook1 = m.xheads["base"].norm.register_forward_hook(lambda mod, inp, out: keep.setdefault("x", inp[0]))
+        m(seq, seg, ctx, extra)
+        hook.remove()
+        hook1.remove()
+        assert torch.allclose(keep["in"], keep["x"].reshape(2, -1, 512, 4).mean(-1), rtol=1e-5, atol=1e-6)
+        for by in ("length", None):
+            pieces, _ = m.forward_split(seq, seg, ctx, extra, devices=[device, device], by=by)
+            for name, k in (("b4", 4), ("b16", 16)):
+                whole = torch.zeros_like(got[name])
+                for p in pieces:
+                    whole[p.rows, p.start // k:p.end // k] = p.x[name].to(device)
+                assert torch.allclose(whole, got[name], rtol=1e-4, atol=1e-5), (name, by)
+    del probe
+
+
+@pytest.mark.parametrize("bad", [3, 0, 32])
+def test_a_bin_must_be_a_power_of_two_within_the_core_step(bad):
+    with pytest.raises(ValueError):                                  # small(): n_down 4, so bins up to 16
+        with_heads(small("v2"), [["x", 2, bad]])

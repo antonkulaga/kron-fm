@@ -88,9 +88,12 @@ class KronGenomeConfig:
                                 # in the same log1p units the targets are stored in, beside the masked-base head
     n_in_extra: int = 0         # reserved per-base input channels after the 6 base channels (repeat mask, variant
                                 # dosage, methylation, ...): zero-initialised stem weights, so absent = zero = today
-    xheads: list = field(default_factory=list)   # further per-base heads, each its own module: [name, outputs] pairs
-                                # in registration order (v2/v2l). A head added to a trained model is new parameters
-                                # only; the inherited heads keep their keys, shapes and outputs
+    xheads: list = field(default_factory=list)   # further heads, each its own module: [name, outputs] or
+                                # [name, outputs, bin] in registration order (v2/v2l). bin 1 (default) predicts per
+                                # base; bin k (a power of two up to 2**n_down) predicts per k bases from the mean of
+                                # the decoder states over them, so memory falls k-fold and thousands of outputs fit.
+                                # A head added to a trained model is new parameters only; the inherited heads keep
+                                # their keys, shapes and outputs
     xhead_hidden: int = 0       # hidden width of the further heads (0: as the other MLP heads), their memory knob
 
     def to_dict(self) -> dict:
@@ -333,20 +336,34 @@ class KronGenome(nn.Module):
     def _init_xheads(self, c: KronGenomeConfig, width: int) -> None:
         """The further per-base heads of ``config.xheads``. ``x_active`` (not saved) names the heads the next forward
         runs: None runs all, a set only those, so a head registered ahead of its data costs no forward."""
-        names = [str(n) for n, _ in c.xheads]
+        rows = [(str(h[0]), int(h[1]), int(h[2]) if len(h) > 2 else 1) for h in c.xheads]
+        names = [n for n, _, _ in rows]
         if len(set(names)) != len(names) or any(not n.isidentifier() for n in names):
             raise ValueError(f"xheads need distinct identifier names, got {names}")
         if c.xheads and (c.arch not in ("v2", "v2l") or c.chunk_ratio or c.local_width):
             raise ValueError("xheads need arch v2 or v2l without learned chunking or a local track")
+        for n, _, b in rows:
+            if b < 1 or b & (b - 1) or b > 2 ** c.n_down:
+                raise ValueError(f"xhead {n}: bin {b} must be a power of two up to {2 ** c.n_down}")
         hidden = c.xhead_hidden or c.head_hidden or 2 * width
-        self.xheads = nn.ModuleDict({str(n): MLPHead(width, hidden, int(k)) for n, k in c.xheads})
+        self.xheads = nn.ModuleDict({n: MLPHead(width, hidden, k) for n, k, _ in rows})
+        self.xhead_bin = {n: b for n, _, b in rows}
         self.x_active: set[str] | None = None
         self.last_x: dict[str, torch.Tensor] = {}
 
-    def run_xheads(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
-        """``{name: [B, L, outputs]}`` of the active further heads on decoder states ``x`` [B, C, L]."""
-        return {n: h(x).transpose(1, 2) for n, h in self.xheads.items()
-                if self.x_active is None or n in self.x_active}
+    def run_xheads(self, x: torch.Tensor, heads: nn.ModuleDict | None = None) -> dict[str, torch.Tensor]:
+        """``{name: [B, L / bin, outputs]}`` of the active further heads on decoder states ``x`` [B, C, L] (``L`` a
+        multiple of every bin: windows and split pieces are cut on 2**n_down boundaries). A binned head reads the
+        mean state of each bin. ``heads``: a split replica's copies of the heads."""
+        out, pooled = {}, {1: x}
+        for n, h in (self.xheads if heads is None else heads).items():
+            if self.x_active is not None and n not in self.x_active:
+                continue
+            b = self.xhead_bin[n]
+            if b not in pooled:
+                pooled[b] = F.avg_pool1d(x, b)
+            out[n] = h(pooled[b]).transpose(1, 2)
+        return out
 
     def _stem_conv(self, width: int) -> nn.Conv1d:
         """The k=15 stem over the 6 base channels plus ``n_in_extra`` reserved ones. The base part is drawn exactly as
@@ -811,8 +828,7 @@ class KronGenome(nn.Module):
             pieces.append(SplitPiece(rows=rows, start=start, end=end, device=d, logits=r.head(y).transpose(1, 2),
                                      tracks=r.tracks(y).transpose(1, 2) if r.tracks is not None else None,
                                      ntv3=r.ntv3(y).transpose(1, 2) if r.ntv3 is not None else None,
-                                     x={n: h(y).transpose(1, 2) for n, h in r.xheads.items()
-                                        if self.x_active is None or n in self.x_active}))
+                                     x=self.run_xheads(y, r.xheads)))
             enc[k] = None                                             # drop this function's hold on the skips
         return pieces, core
 
@@ -1129,7 +1145,7 @@ class SplitPiece:
     logits: torch.Tensor | None = None       # [b, end - start, 4]
     tracks: torch.Tensor | None = None       # [b, end - start, n_tracks]
     ntv3: torch.Tensor | None = None         # [b, end - start, n_ntv3]
-    x: dict | None = None                    # the active further heads: {name: [b, end - start, outputs]}
+    x: dict | None = None                    # the active further heads: {name: [b, (end - start) / bin, outputs]}
 
 
 def split_reach(config: KronGenomeConfig) -> int:
