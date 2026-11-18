@@ -23,12 +23,18 @@ class StubWithHeads(MGT.StubGenome):
     def __init__(self, config):
         super().__init__(config)
         self.xheads = torch.nn.ModuleDict({n: torch.nn.Linear(4, k) for n, k in config.xheads})
-        self.x_active, self.last_x = None, {}
+        self.x_active, self.x_span, self.last_x, self.last_x_at = None, None, {}, (0, 0)
 
     def forward(self, seq, segments=None, context=None):
         h = self.emb(seq.long())
-        self.last_x = {n: m(h) for n, m in self.xheads.items() if self.x_active is None or n in self.x_active}
+        lo, hi = (0, h.shape[1]) if self.x_span is None else self.x_span      # as KronGenome: the heads' stretch
+        SPANS.append((self.training, lo, hi, h.shape[1]))
+        self.last_x = {n: m(h[:, lo:hi]) for n, m in self.xheads.items() if self.x_active is None or n in self.x_active}
+        self.last_x_at = (lo, hi)
         return h, None, None
+
+
+SPANS: list = []
 
 
 def make_store(root, primary, n=3):
@@ -113,6 +119,11 @@ def test_head_only_then_joint_at_scheduled_rates(genomes, tmp_path, monkeypatch)
     assert set(s["updates"].to_list()) == {0} and set(s["lr"].to_list()) == {0.0}   # registered, no data: untouched
     prev, switch = replay(d)
     assert switch is not None and f"head-only phase done after step {switch}" in text and prev >= 6
+    # training passes run the heads on the supervised centre only (--ntv3-center is 1 here, so on what the split
+    # leaves), evaluation on whole windows
+    assert any(not tr and lo == 0 and hi == n for tr, lo, hi, n in SPANS)
+    assert all(lo == 0 and hi == n for tr, lo, hi, n in SPANS if not tr)
+    assert all(lo % 128 == 0 and (hi % 128 == 0 or hi == n) for tr, lo, hi, n in SPANS)
     m = pl.read_csv(out / "metrics.csv")                                   # its lr column is the inherited rate
     assert m["lr"].to_list() == pytest.approx(d["lr_inherited"].to_list(), rel=2e-3, abs=1e-12)
     # the inherited weights stood still through the head-only phase, the head moved; then both moved

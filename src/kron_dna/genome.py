@@ -349,21 +349,35 @@ class KronGenome(nn.Module):
         self.xheads = nn.ModuleDict({n: MLPHead(width, hidden, k) for n, k, _ in rows})
         self.xhead_bin = {n: b for n, _, b in rows}
         self.x_active: set[str] | None = None
-        self.last_x: dict[str, torch.Tensor] = {}
+        self.x_span: tuple[int, int] | None = None    # window bases the heads run on (not saved; a multiple of
+        self.last_x: dict[str, torch.Tensor] = {}     # 2**n_down at both ends); last_x_at: the bases last_x covers
+        self.last_x_at: tuple[int, int] = (0, 0)
 
-    def run_xheads(self, x: torch.Tensor, heads: nn.ModuleDict | None = None) -> dict[str, torch.Tensor]:
-        """``{name: [B, L / bin, outputs]}`` of the active further heads on decoder states ``x`` [B, C, L] (``L`` a
-        multiple of every bin: windows and split pieces are cut on 2**n_down boundaries). A binned head reads the
-        mean state of each bin. ``heads``: a split replica's copies of the heads."""
+    def run_xheads(self, x: torch.Tensor, heads: nn.ModuleDict | None = None, at: int = 0
+                   ) -> tuple[dict[str, torch.Tensor], tuple[int, int]]:
+        """The active further heads on decoder states ``x`` [B, C, L] that cover window bases ``at:at + L`` (``at``
+        and ``L`` multiples of 2**n_down, as windows and split pieces are). Returns ``({name: [B, n / bin,
+        outputs]}, (lo, hi))``: the heads run on bases ``lo:hi`` only, the part of ``x`` inside ``x_span`` (all of
+        it when ``x_span`` is None), since a head is per position (or per bin) and costs memory at every base it
+        runs on, while training supervises only part of a window. A binned head reads the mean state of each bin.
+        ``heads``: a split replica's copies."""
+        lo, hi = at, at + x.shape[-1]
+        if self.x_span is not None:
+            lo, hi = max(lo, int(self.x_span[0])), min(hi, int(self.x_span[1]))
+            hi = max(hi, lo)
+            x = x[..., lo - at:hi - at]
         out, pooled = {}, {1: x}
         for n, h in (self.xheads if heads is None else heads).items():
             if self.x_active is not None and n not in self.x_active:
                 continue
             b = self.xhead_bin[n]
+            if hi == lo:                                  # nothing of the span in this stretch
+                out[n] = x.new_zeros(x.shape[0], 0, h.fc2.out_channels)
+                continue
             if b not in pooled:
                 pooled[b] = F.avg_pool1d(x, b)
             out[n] = h(pooled[b]).transpose(1, 2)
-        return out
+        return out, (lo, hi)
 
     def _stem_conv(self, width: int) -> nn.Conv1d:
         """The k=15 stem over the 6 base channels plus ``n_in_extra`` reserved ones. The base part is drawn exactly as
@@ -561,7 +575,7 @@ class KronGenome(nn.Module):
         x = self.add_local(self.decode(core.transpose(1, 2), skips), skips)
         tracks = self.tracks(x).transpose(1, 2) if self.tracks is not None else None   # [B, L, n_tracks]
         self.last_ntv3 = self.ntv3(x).transpose(1, 2) if self.ntv3 is not None else None
-        self.last_x = self.run_xheads(x)
+        self.last_x, self.last_x_at = self.run_xheads(x)
         return self.head(x).transpose(1, 2), core, tracks
 
     def _forward_chunked(self, h: torch.Tensor, skips: list[torch.Tensor], segments: torch.Tensor | None):
@@ -828,7 +842,7 @@ class KronGenome(nn.Module):
             pieces.append(SplitPiece(rows=rows, start=start, end=end, device=d, logits=r.head(y).transpose(1, 2),
                                      tracks=r.tracks(y).transpose(1, 2) if r.tracks is not None else None,
                                      ntv3=r.ntv3(y).transpose(1, 2) if r.ntv3 is not None else None,
-                                     x=self.run_xheads(y, r.xheads)))
+                                     **dict(zip(("x", "x_at"), self.run_xheads(y, r.xheads, at=start)))))
             enc[k] = None                                             # drop this function's hold on the skips
         return pieces, core
 
@@ -1145,7 +1159,8 @@ class SplitPiece:
     logits: torch.Tensor | None = None       # [b, end - start, 4]
     tracks: torch.Tensor | None = None       # [b, end - start, n_tracks]
     ntv3: torch.Tensor | None = None         # [b, end - start, n_ntv3]
-    x: dict | None = None                    # the active further heads: {name: [b, (end - start) / bin, outputs]}
+    x: dict | None = None                    # the active further heads: {name: [b, n / bin, outputs]} over the
+    x_at: tuple[int, int] | None = None      # window bases x_at[0]:x_at[1], the stretch's share of the heads' span
 
 
 def split_reach(config: KronGenomeConfig) -> int:

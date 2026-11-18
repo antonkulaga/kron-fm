@@ -2176,6 +2176,9 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                 if float(x_ok.sum()) > 0:
                     x_now = xstage.active
             model.x_active = set(x_now)
+            # training: the heads run on the supervised stretch only (the window's centre): the same loss and
+            # gradients, without their activations at every other base. Evaluation scores whole windows.
+            model.x_span = XH.span_of(x_ok, unit) if model.training and x_now else None
         parts_log = {} if jepa_log and model.training else None        # this micro-batch's loss terms, for jepa.csv
         # --split-cards: training windows only (``unsplit``: the --mito-slice part, whole on the first card)
         split_now = split_devs is not None and model.training and not unsplit
@@ -2283,8 +2286,10 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
             want_x = ntv3_batch[0][4][n_]
             if model.training:
                 kind_x = xstores[n_].kind
+                lo_x, hi_x = (0, 0) if split_now else model.last_x_at
                 loss_x = (XH.split_head_loss(pieces, n_, want_x, x_ok, x_consts_on(n_), dev, kind_x) if split_now else
-                          XH.head_loss(model.last_x[n_], want_x.to(dev), x_ok.to(dev), x_consts_on(n_)(dev), kind_x))
+                          XH.head_loss(model.last_x[n_], want_x[:, lo_x:hi_x].to(dev), x_ok[:, lo_x:hi_x].to(dev),
+                                       x_consts_on(n_)(dev), kind_x))
                 mlm = mlm + xhead_weight * loss_x
                 x_losses[n_].append(float(loss_x.detach()))
                 x_step.add(n_)

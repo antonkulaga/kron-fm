@@ -368,3 +368,62 @@ def test_optimizer_state_of_the_old_groups_survives_a_new_head(device):
             assert st["step"] == opt.state[by_name_old[n]]["step"]
     with pytest.raises(ValueError):
         X.merge_optimizer_state(saved, opt2.state_dict(), 2)
+
+
+# --------------------------------------------------------------------- the heads run on the supervised stretch
+
+def test_span_of_is_the_supervised_stretch_widened_to_the_unit():
+    ok = torch.zeros(2, 1024)
+    assert X.span_of(ok, 16) is None
+    ok[0, 300:500] = 1
+    ok[1, 420:610] = 1
+    assert X.span_of(ok, 16) == (288, 624) and X.span_of(ok, 128) == (256, 640) and X.span_of(ok, 1) == (300, 610)
+    ok[1, 1023] = 1
+    assert X.span_of(ok, 128) == (256, 1024)
+
+
+@pytest.mark.parametrize("kind", ["tracks", "binary"])
+@pytest.mark.parametrize("by,b,length", [("length", 2, 2048), (None, 4, 1024), ("whole", 2, 2048)])
+def test_running_the_heads_on_the_span_changes_neither_loss_nor_gradients(device, monkeypatch, tmp_path, kind, by, b,
+                                                                         length):
+    forced_replicas(monkeypatch)
+    smooth_routing(monkeypatch)
+    if kind == "tracks":
+        write_store(tmp_path / "s", total=b * length)
+    else:
+        write_labels(tmp_path / "s", total=b * length)
+    st = X.open_store(tmp_path / "s")
+    cfg = small("v2").config.to_dict() | {"xheads": [["h", len(st.ids)]]}
+    torch.manual_seed(2)
+    m = G.KronGenome(G.KronGenomeConfig(**cfg)).to(device).eval()
+    seq, seg, ctx, extra = batch_for(b, length, device)
+    want = torch.stack([torch.from_numpy(st.window(r * length, length, length)) for r in range(b)])
+    split = torch.ones(b, length, dtype=torch.long)
+    split[0, :700] = 4
+    ok = X.supervised(split, center=0.375)
+    span = X.span_of(ok, 16)
+    assert span is not None and span[1] - span[0] < length // 2
+    res = []
+    for use in (None, span):
+        m.zero_grad()
+        m.x_span = use
+        if by == "whole":
+            m(seq, seg, ctx, extra)
+            lo, hi = m.last_x_at
+            assert (lo, hi) == (use or (0, length)) and m.last_x["h"].shape[1] == hi - lo
+            loss = X.head_loss(m.last_x["h"], want[:, lo:hi].to(device), ok[:, lo:hi].to(device), st.consts(device), kind)
+        else:
+            pieces, _ = m.forward_split(seq, seg, ctx, extra, devices=[device, device], by=by)
+            assert all(p.x["h"].shape[1] == p.x_at[1] - p.x_at[0] for p in pieces)
+            if use is not None:
+                assert all(use[0] <= p.x_at[0] <= p.x_at[1] <= use[1] or p.x_at[0] == p.x_at[1] for p in pieces)
+            loss = X.split_head_loss(pieces, "h", want, ok, st.consts, device, kind)
+        loss.backward()
+        res.append((loss.detach(), {n: p.grad.clone() for n, p in m.named_parameters() if p.grad is not None}))
+    (l0, g0), (l1, g1) = res
+    assert torch.allclose(l1, l0, rtol=1e-5, atol=1e-7) and g0.keys() == g1.keys()
+    m.x_span = None
+    for n, g in g0.items():
+        loose = device.type == "cuda" and n.split(".")[0] in UPSTREAM
+        scale = float(g.abs().max()) + 1e-12
+        assert float((g1[n] - g).abs().max()) <= (5e-3 if loose else 1e-4) * scale + 1e-9, n

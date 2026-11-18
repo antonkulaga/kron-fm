@@ -218,6 +218,16 @@ def _bce_sum(pred: torch.Tensor, want: torch.Tensor, ok: torch.Tensor, consts: t
     return (per * ok.unsqueeze(-1)).sum()
 
 
+def span_of(ok: torch.Tensor, unit: int) -> tuple[int, int] | None:
+    """The smallest stretch of window bases, widened to multiples of ``unit``, that holds every supervised position
+    of ``ok`` [B, L]; None when nothing is supervised. The heads run on it alone (``KronGenome.x_span``)."""
+    cols = torch.nonzero(ok.sum(0) > 0)
+    if not cols.numel():
+        return None
+    lo, hi = int(cols[0]) // unit * unit, -(-(int(cols[-1]) + 1) // unit) * unit
+    return lo, min(hi, ok.shape[1])
+
+
 def head_loss(pred: torch.Tensor, want: torch.Tensor, ok: torch.Tensor, consts: tuple,
               kind: str = "tracks") -> torch.Tensor:
     """The head's loss on a whole window: ``pred`` [B, L, T] raw outputs, ``want`` [B, L, T] stored targets, ``ok``
@@ -237,13 +247,17 @@ def head_loss_parts(pred: torch.Tensor, want: torch.Tensor, ok: torch.Tensor, co
 def split_head_loss(pieces: list, name: str, want: torch.Tensor, ok: torch.Tensor, consts_on, device,
                     kind: str = "tracks") -> torch.Tensor:
     """:func:`head_loss` of head ``name`` from the pieces of ``forward_split``: targets go from the host to each
-    piece's card, only per-(row, track) sums cross to ``device``. ``consts_on(device)`` gives that card's constants."""
+    piece's card, only per-(row, track) sums cross to ``device``. ``consts_on(device)`` gives that card's constants.
+    Each piece's outputs cover its ``x_at`` bases (the model's ``x_span`` within the piece); ``ok`` must be zero
+    outside the span, which :func:`span_of` guarantees."""
     if kind == "binary":
-        tot = sum(_bce_sum(p.x[name], want[p.rows, p.start:p.end].to(p.device),
-                           ok[p.rows, p.start:p.end].to(p.device), consts_on(p.device)).to(device) for p in pieces)
+        tot = sum(_bce_sum(p.x[name], want[p.rows, p.x_at[0]:p.x_at[1]].to(p.device),
+                           ok[p.rows, p.x_at[0]:p.x_at[1]].to(p.device), consts_on(p.device)).to(device)
+                  for p in pieces)
         return tot / (ok.sum() * want.shape[-1]).clamp_min(1).to(device)
-    parts = [(p.rows, head_loss_parts(p.x[name], want[p.rows, p.start:p.end].to(p.device),
-                                      ok[p.rows, p.start:p.end].to(p.device), consts_on(p.device))) for p in pieces]
+    parts = [(p.rows, head_loss_parts(p.x[name], want[p.rows, p.x_at[0]:p.x_at[1]].to(p.device),
+                                      ok[p.rows, p.x_at[0]:p.x_at[1]].to(p.device), consts_on(p.device)))
+             for p in pieces]
     return G.poisson_multinomial_combine(parts, want.shape[0], device)
 
 
