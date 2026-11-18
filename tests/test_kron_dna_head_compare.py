@@ -23,11 +23,11 @@ spec.loader.exec_module(HC)
 def test_every_variant_maps_states_to_outputs_and_counts_its_parameters(device):
     if device.type != "cpu":
         pytest.skip("shapes are checked on the CPU, with the stand-in for the KronLSTM layer")
-    x = torch.randn(2, 16, 64)
+    x = torch.randn(2, 16, 256)                                      # at least one 128-base bin
     sizes = {}
     for v in HC.VARIANTS:
         h = HC.make_head(v, 16, 5)
-        assert h(x).shape == (2, 5, 64), v
+        assert h(x).shape == (2, 5, 256), v
         sizes[v] = HC.n_params(h)
     assert sizes["linear"] == 16 * 5 + 5 and sizes["mlp512"] > sizes["mlp128"] > sizes["linear"]
     edge = HC.make_head("conv9", 16, 5)(torch.randn(1, 16, 9))      # the conv head keeps the length

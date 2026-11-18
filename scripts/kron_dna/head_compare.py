@@ -18,6 +18,8 @@ order. Every variant has one head per task with its own AdamW and the same sched
     kron         a per-base linear readout plus one bidirectional KronLSTM layer (width 128) over the 32-base means
                  of the states, its outputs added back at every base: the only variant that mixes distant positions
                  (dropped, with a line saying so, if the layer cannot be built or run on the device)
+    kron2        the same with two KronLSTM layers
+    kron128      one KronLSTM layer of width 256 over 128-base means, the core's own resolution
 
 Tasks: the measured-track store (``--tracks``: Poisson-multinomial loss, scored by Pearson of log1p signal at 128 bp
 per track) and the label store (``--labels``: weighted BCE, scored by average precision per channel). Training
@@ -71,20 +73,24 @@ class KronHead(nn.Module):
     """A per-base linear readout plus one bidirectional KronLSTM layer over ``bin``-base means of the states (each
     window its own document), whose outputs are added back at every base of the bin."""
 
-    def __init__(self, c: int, t: int, bin: int = 32, d: int = 128) -> None:
+    def __init__(self, c: int, t: int, bin: int = 32, d: int = 128, layers: int = 1) -> None:
         super().__init__()
         from kron_core.bidirectional import BiKronLSTMBlock
 
         self.bin = bin
         self.norm, self.local, self.down = G.ChannelRMSNorm(c), nn.Conv1d(c, t, 1), nn.Conv1d(c, d, 1)
-        self.block, self.out = BiKronLSTMBlock(d, 4, 2 * d, 0.0, 0), nn.Conv1d(d, t, 1)
+        self.blocks = nn.ModuleList(BiKronLSTMBlock(d, 4, 2 * d, 0.0, i) for i in range(layers))
+        self.out = nn.Conv1d(d, t, 1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         z = self.norm(x)
         p = F.avg_pool1d(self.down(z), self.bin)                       # [B, d, n]
         b, d, n = p.shape
         cu = torch.arange(0, b * n + 1, n, device=x.device, dtype=torch.int32)
-        h = self.block(p.transpose(1, 2).reshape(1, b * n, d), cu).reshape(b, n, d).transpose(1, 2)
+        h = p.transpose(1, 2).reshape(1, b * n, d)
+        for block in self.blocks:
+            h = block(h, cu)
+        h = h.reshape(b, n, d).transpose(1, 2)
         wide = torch.repeat_interleave(self.out(h), self.bin, dim=-1)
         return self.local(z) + F.pad(wide, (0, x.shape[-1] - wide.shape[-1]))
 
@@ -103,12 +109,14 @@ def make_head(kind: str, c: int, t: int) -> nn.Module:
     if kind == "kan":
         return nn.Sequential(norm, nn.Conv1d(c, 32, 1), G.ChannelRMSNorm(32), KANLayer(32, 64), G.ChannelRMSNorm(64),
                              KANLayer(64, t))
-    if kind == "kron":
-        return KronHead(c, t)
+    if kind in KRON:
+        return KronHead(c, t, **KRON[kind])
     raise ValueError(kind)
 
 
-VARIANTS = ("linear", "mlp32", "mlp128", "mlp512", "mlp3", "conv9", "kan", "kron")
+KRON = {"kron": dict(bin=32, d=128, layers=1), "kron2": dict(bin=32, d=128, layers=2),
+        "kron128": dict(bin=128, d=256, layers=1)}
+VARIANTS = ("linear", "mlp32", "mlp128", "mlp512", "mlp3", "conv9", "kan", "kron", "kron2", "kron128")
 
 
 def n_params(m: nn.Module) -> int:
