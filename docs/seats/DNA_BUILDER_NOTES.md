@@ -66,6 +66,21 @@ held-out score does not move over its first evaluations, or a loss that is not f
 to the trainer, who owns the launchers: D changes from two 524 kb rows to one 1 Mb window cut by length; A, E and F
 stay as they were. So from this restart A against D is no longer one recipe at one context.
 
+**Head comparison (Anton through the trainer, 18 Nov 21:15: "can KAN or MLP with different params do better?"):**
+job 6517859 `kron-dna-build-headcmp`, queued on the card the trainer's E probe (6514768) holds, starting when the
+probe ends (`afterany`). `scripts/kron_dna/head_compare.py`: six head variants (linear, the current MLP 128, MLP
+512, a 3-layer MLP, a 9-base conv head, a reduced KAN) on E's frozen 400k trunk, 131 kb windows, 3 h; scores on 128
+fixed chr8/chr9 windows with a window bootstrap of each variant's difference to the current head. Output in
+`$SCRATCH/kron-dna-build/head-compare/E400k-v1/` (`progress.csv`, `results.json`). First run on a card: if it fails
+early, fix and resubmit; then post the table to the trainer's topic and to Anton, with the caveats (one trunk, one
+seed, 13 DNase tracks and splice sites only, frozen features: a head that mixes positions may matter more or less
+once the trunk trains with it). The ClinVar pass takes the card after it.
+
+**Done 18 Nov evening, on `origin/dna-builder`:** a plain resume may add `--xhead` heads at the end of the list
+(`0366e4e`: old weights, optimizer moments, phase and counts stand); the model side of binned heads (`[name,
+outputs, bin]`, a head on the mean decoder state per bin). Still to do for binned heads: the binned store, the
+loss on bins and the wiring in `genome-train` (B11).
+
 ## Items
 
 | item | state |
