@@ -13,7 +13,8 @@ Sources read: the priming, the kit's trainer and runner roles, the trainer's pla
 **Base (agreed with dna-trainer in `#kron-fm>dna-builder`, 18 Nov):** trainer main `9a1d784` merged into
 `dna-builder` (`8a2a757`), then `7fdd30a` (with `lr-cooldown`). The trainer lands `lr-cooldown` (`c2d205b`, touches `cli.py`: `genome_lr()`, `--lr-total`,
 `--cooldown-from`) and a test-helper fix before pushing main, and says so in the topic: merge main again then.
-The branch is not pushed until the trainer's main is (it carries the trainer's 33 unpushed commits).
+Main was pushed 18 Nov (`6bc790b`); the branch is pushed from then on. **Before every push: scan the diff against
+`origin/main` for account, partition, host names and absolute paths** (this file is public).
 
 **Environment:** `slurm/env.local.sh` copied from the trainer's clone with `JOB_PREFIX=kron-dna-build-`. The venv has
 the `genomics` and `baselines` groups (`uv sync --group genomics --group baselines`; the audit tests need
@@ -23,7 +24,10 @@ the `genomics` and `baselines` groups (`uv sync --group genomics --group baselin
 17:30. By then the trainer needs, in the topic: the tested commit to merge and which data manifests are validated.
 What is not ready waits for the next restart.
 
-Given to the trainer 18 Nov: commit `431c05b` (my `0ec9ccf` merged with the trainer's test-helper fix `f1eae41`; on it the 5 formerly failing cases and the xheads tests pass on CPU, 38 passed, 12 CUDA cases skipped) and the DNase pilot store as validated. Order on E's freed
+Given to the trainer 18 Nov: commit `4045a7a`, pushed as `origin/dna-builder`, one commit on published main
+`6bc790b` (the 5 formerly failing cases and the xheads tests pass on CPU on the same code, 38 passed, 12 CUDA cases
+skipped; the commits before it named cluster accounts in this file, so they stay in the clone under
+`refs/local/dna-builder-raw` and are never pushed) and the DNase pilot store as validated. Order on E's freed
 card (the trainer's plan): (1) the CUDA cases of `tests/test_kron_dna_xheads*.py` and a single-card memory
 estimate; (2) the two-card 1 Mb bench with the new head when F hands over its cards (`--xhead-hidden 128` if it
 does not fit); (3) the ClinVar pass, `$SCRATCH/kron-dna-build/clinvar/v1/score.sh`. Full suite on `58a25de`: 475
