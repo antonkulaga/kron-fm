@@ -563,8 +563,16 @@ def ensemble(scores: list[Path] = typer.Argument(..., help="per-variant parquet 
 def genome_prepare(fasta: Path = typer.Argument(..., help="a genome FASTA (e.g. UCSC hg38.fa.gz)"),
                    min_gap: int = typer.Option(50, help="a run of N at least this long splits a contig"),
                    min_len: int = typer.Option(10_000, help="contigs shorter than this are dropped"),
-                   name: str = typer.Option("hg38", help="folder under data/interim/genome/")) -> None:
-    """Whole gap-free contigs of a genome, as one uint8 array (A, C, G, T, N = 0..4) and a contig index."""
+                   name: str = typer.Option("hg38", help="folder under data/interim/genome/"),
+                   overwrite: bool = typer.Option(False, help="replace an existing bases.u8 + contigs.parquet (the old "
+                                                  "pair is kept as *.prev)")) -> None:
+    """Whole gap-free contigs of a genome, as one uint8 array (A, C, G, T, N = 0..4) and a contig index.
+
+    The pair is built in a staging folder inside the output and published only after the FASTA parsed and the array
+    length matched the index, so a failed or mistaken run never touches a prepared genome other runs read."""
+    import os
+    import shutil
+
     import numpy as np
     import polars as pl
     import polars_bio as pb
@@ -573,20 +581,44 @@ def genome_prepare(fasta: Path = typer.Argument(..., help="a genome FASTA (e.g. 
 
     out = interim_dir("genome", name)
     out.mkdir(parents=True, exist_ok=True)
-    keep = {f"chr{c}" for c in [*map(str, range(1, 23)), "X", "Y"]}
-    rows, offset = [], 0
-    with open(out / "bases.u8", "wb") as fh:
-        for chrom, seq in pb.scan_fasta(str(fasta)).select("name", "sequence").collect().iter_rows():
-            if chrom not in keep:
-                continue
-            codes = G.encode_bases(seq)
-            for start, end in G.contigs_of(codes, min_gap, min_len):
-                fh.write(codes[start:end].tobytes())
-                rows.append((chrom, start, end, offset))
-                offset += end - start
-            typer.echo(f"{chrom}: {sum(1 for r in rows if r[0] == chrom)} contigs")
-    index = pl.DataFrame(rows, schema=["chrom", "start", "end", "offset"], orient="row")
-    index.write_parquet(out / "contigs.parquet")
+    finals = (out / "bases.u8", out / "contigs.parquet")
+    existing = [f for f in finals if f.exists()]
+    if existing and not overwrite:
+        raise typer.BadParameter(f"{out} already holds {', '.join(f.name for f in existing)}; pass --overwrite to "
+                                 "replace them (the old pair is kept as *.prev) or choose another --name")
+    stage = out / f".prepare-{os.getpid()}"
+    shutil.rmtree(stage, ignore_errors=True)
+    stage.mkdir()
+    try:
+        keep = {f"chr{c}" for c in [*map(str, range(1, 23)), "X", "Y"]}
+        records = pb.scan_fasta(str(fasta)).select("name", "sequence").collect()   # parse before writing anything
+        rows, offset = [], 0
+        with open(stage / "bases.u8", "wb") as fh:
+            for chrom, seq in records.iter_rows():
+                if chrom not in keep:
+                    continue
+                codes = G.encode_bases(seq)
+                for start, end in G.contigs_of(codes, min_gap, min_len):
+                    fh.write(codes[start:end].tobytes())
+                    rows.append((chrom, start, end, offset))
+                    offset += end - start
+                typer.echo(f"{chrom}: {sum(1 for r in rows if r[0] == chrom)} contigs")
+        if not rows:
+            raise typer.BadParameter(f"{fasta}: no contig of chr1-22, X or Y passed the filters")
+        index = pl.DataFrame(rows, schema=["chrom", "start", "end", "offset"], orient="row")
+        index.write_parquet(stage / "contigs.parquet")
+        size = (stage / "bases.u8").stat().st_size
+        extent = int((index["offset"] + index["end"] - index["start"]).max())
+        if size != offset or extent != offset:
+            raise RuntimeError(f"staged genome is inconsistent: bases.u8 {size} bytes, index extent {extent}, "
+                               f"written {offset}")
+        for f in finals:                     # publish: the old pair moves aside, then the staged pair takes its place
+            if f.exists():
+                os.replace(f, f.with_name(f.name + ".prev"))
+        for f in finals:
+            os.replace(stage / f.name, f)
+    finally:
+        shutil.rmtree(stage, ignore_errors=True)
     typer.echo(f"{index.height} contigs, {offset / 1e9:.2f} Gb, longest {(index['end'] - index['start']).max() / 1e6:.1f} Mb"
                f" -> {out}")
 
