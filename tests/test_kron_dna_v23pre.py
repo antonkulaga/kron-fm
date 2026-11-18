@@ -194,6 +194,7 @@ def test_uneven_rows_gradients_equal_forward(device, monkeypatch, arch):
 
 AUDIT_MODEL = "    model = G.KronGenome(config).to(dev)\n"
 AUDIT_START = "    if main and not bench:\n        record[\"started_at_step\"] = step\n"
+AUDIT_LOOP = "    model.train()\n    while step < (stop_step or steps):\n"   # the same point in parents before it
 
 
 def with_audit_rng(src: str) -> str:
@@ -203,13 +204,14 @@ def with_audit_rng(src: str) -> str:
     step-keyed streams. Those change every run on purpose; what the parents are compared for is everything else."""
     if "audit 2026-11-18, TR03" in src:                         # already carries them
         return src
-    assert src.count(AUDIT_MODEL) == 1 and src.count(AUDIT_START) == 1, "parent's anchors for the audit RNG patch"
+    start = AUDIT_START if src.count(AUDIT_START) == 1 else AUDIT_LOOP     # parents before the started_at record
+    assert src.count(AUDIT_MODEL) == 1 and src.count(start) == 1, "parent's anchors for the audit RNG patch"
     src = src.replace(AUDIT_MODEL, "    torch.manual_seed(seed)                       # audit 2026-11-18, TR03\n" + AUDIT_MODEL)
-    return src.replace(AUDIT_START,
+    return src.replace(start,
                        "    torch.manual_seed(int(np.random.SeedSequence([seed, rank, 2035, step]).generate_state(1)[0]))\n"
                        "    if step > 0:\n"
                        "        rng = np.random.default_rng([seed, rank, step])\n"
-                       "        rep_rng = np.random.default_rng([seed, rank, 2027, step])\n" + AUDIT_START)
+                       "        rep_rng = np.random.default_rng([seed, rank, 2027, step])\n" + start)
 
 
 def parent_cli(monkeypatch, commit: str, env: str):

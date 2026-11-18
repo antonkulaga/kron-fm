@@ -299,6 +299,8 @@ def base_cli(monkeypatch):
     mod = types.ModuleType("kron_dna_cli_1c8bad9")
     mod.__file__ = f"{BASE}:src/kron_dna/cli.py"
     monkeypatch.setitem(sys.modules, mod.__name__, mod)
+    from test_kron_dna_v23pre import with_audit_rng      # the audit's RNG changes (2026-11-18)
+    src = with_audit_rng(src)
     exec(compile(src, mod.__file__, "exec"), mod.__dict__)
     return mod
 
