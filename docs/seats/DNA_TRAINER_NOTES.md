@@ -8,12 +8,12 @@ secretary, on the maintainer's word)._
 
 ## The placeholders
 
-- `<brief>` = `/data/uq2347/briefs/kron-dna.md` (outside the repository: it names cluster details).
-- `<status file>` = `/data/uq2347/briefs/kron-dna-status.md`, CET (the scheduler's clock). The results, decisions
+- `<brief>` = the brief beside the clone (`$BRIEFS/kron-dna.md`) (outside the repository: it names cluster details).
+- `<status file>` = `$BRIEFS/kron-dna-status.md`, CET (the scheduler's clock). The results, decisions
   and incidents of the run so far are there, not repeated here.
 - `<share>` = the rigger's inventory until desk #4 is answered: a soft share of **25 CPU cores** on the
   account's shared core cap (`[shares]` of the rigger's queue map, desk #4 default); GPU jobs outside it. Devices
-  as the brief and status file hold them: **one A100 card at a time** (gpu12 card 1, training), never the PPG
+  as the brief and status file hold them: **one A100 card at a time** (one card, training), never the PPG
   trainer's last free card; short inference (evaluate, probe, ClinVar scoring) may share a card only after checking
   its free memory.
 - The seat's job prefix `kron-dna-` is in the seat table (`[seat.dna-trainer.slurm]`, kit v0.1.181); the older
@@ -49,7 +49,7 @@ scratch folder.
 
 ## Running
 
-- `kron-dna-syncodon-mlm` (6427115): SynCodonLM pretraining, `mlm`, 300k steps, gpu12 card 1, resumable,
+- `kron-dna-syncodon-mlm` (6427115): SynCodonLM pretraining, `mlm`, 300k steps, one card, resumable,
   `--max-hours 70`, comment set (eta 2026-11-13 07:40 CET by 4,490 steps/h). At each 25k snapshot: evaluate,
   ClinVar and mRFP on it (75k due ~05:10 on 11 Nov).
 
