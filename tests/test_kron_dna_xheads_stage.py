@@ -11,7 +11,7 @@ import torch
 from kron_dna import genome as G
 from kron_dna import xheads as X
 
-from test_kron_dna_split import batch_for, forced_replicas, small
+from test_kron_dna_split import _restore_precision, batch_for, forced_replicas, small, smooth_routing  # noqa: F401
 
 
 def write_store(path, total=4096, ids=("a", "b_P", "b_M"), assays=("DNase-seq", "total RNA-seq", "total RNA-seq")):
@@ -71,9 +71,27 @@ def test_supervised_keeps_the_training_split_the_centre_and_visible_bases():
     assert X.supervised(split, skip=skip)[0].tolist() == [1, 1, 0, 1, 0, 1, 1, 1]
 
 
+UPSTREAM = ("stem", "stem_res", "down", "core", "context")
+
+
+def same_gradients(m, g_whole, device):
+    """Every parameter's split gradient against the whole window's, as a share of the gradient's own scale: 1e-4,
+    as test_kron_dna_split. On CUDA the parameters upstream of the core get 5e-3: what reaches them from a head's
+    loss alone passes back through the KronLSTM kernels, which are not bit-repeatable (a whole pass against itself
+    differs by 1e-5 there) and amplify a 2e-7 change of the stem weights to 1e-4..4e-4, and to about 1e-3 when a
+    test process compiled them before TRITON_F32_DEFAULT=ieee was set. Measured 18 Nov 2026 on an A100: with IEEE
+    kernels split and whole differ by 3e-6..1e-5, the same as two whole passes; the heads and the decoder agree
+    to 1e-6 either way. The CPU stand-in is exact, so there the 1e-4 holds for all."""
+    for n, g in g_whole.items():
+        loose = device.type == "cuda" and n.split(".")[0] in UPSTREAM
+        scale = float(g.abs().max()) + 1e-12
+        assert float((m.get_parameter(n).grad - g).abs().max()) <= (5e-3 if loose else 1e-4) * scale + 1e-9, n
+
+
 @pytest.mark.parametrize("by,b,length", [("length", 2, 2048), (None, 4, 1024)])
 def test_split_loss_and_gradient_equal_the_whole_window(device, monkeypatch, tmp_path, by, b, length):
     forced_replicas(monkeypatch)
+    smooth_routing(monkeypatch)       # as test_kron_dna_split: a max-pool's near-tie must not reroute a gradient
     write_store(tmp_path / "s", total=b * length)
     st = X.TrackStore.open(tmp_path / "s")
     cfg = small("v2").config.to_dict() | {"xheads": [["meas", 3]]}
@@ -93,9 +111,7 @@ def test_split_loss_and_gradient_equal_the_whole_window(device, monkeypatch, tmp
     parts = X.split_head_loss(pieces, "meas", want, ok, lambda d: consts(st, d), device)
     parts.backward()
     assert torch.allclose(parts, whole, rtol=1e-4, atol=1e-6)
-    for n, g in g_whole.items():
-        if n.startswith(("xheads.", "stem.")):
-            assert torch.allclose(m.get_parameter(n).grad, g, rtol=2e-2, atol=1e-6), n
+    same_gradients(m, g_whole, device)
 
 
 def test_pearson_matches_numpy_at_bins():
@@ -240,6 +256,7 @@ def test_label_store_reads_bits_and_exchanges_strands(tmp_path):
 @pytest.mark.parametrize("by,b,length", [("length", 2, 2048), (None, 4, 1024)])
 def test_binary_split_loss_and_gradient_equal_the_whole_window(device, monkeypatch, tmp_path, by, b, length):
     forced_replicas(monkeypatch)
+    smooth_routing(monkeypatch)
     write_labels(tmp_path / "s", total=b * length)
     st = X.open_store(tmp_path / "s")
     cfg = small("v2").config.to_dict() | {"xheads": [["splice", 4]]}
@@ -253,13 +270,13 @@ def test_binary_split_loss_and_gradient_equal_the_whole_window(device, monkeypat
     m(seq, seg, ctx, extra)
     whole = X.head_loss(m.last_x["splice"], want.to(device), ok.to(device), st.consts(device), "binary")
     whole.backward()
-    g_whole = m.xheads["splice"].fc2.weight.grad.clone()
+    g_whole = {n: p.grad.clone() for n, p in m.named_parameters() if p.grad is not None}
     m.zero_grad()
     pieces, _ = m.forward_split(seq, seg, ctx, extra, devices=[device, device], by=by)
     parts = X.split_head_loss(pieces, "splice", want, ok, st.consts, device, "binary")
     parts.backward()
     assert torch.allclose(parts, whole, rtol=1e-4, atol=1e-6)
-    assert torch.allclose(m.xheads["splice"].fc2.weight.grad, g_whole, rtol=2e-2, atol=1e-6)
+    same_gradients(m, g_whole, device)
     none = X.head_loss(m.last_x.get("splice", parts.new_zeros(b, length, 4)), want.to(device),
                        torch.zeros_like(ok).to(device), st.consts(device), "binary")
     assert float(none) == 0.0                                    # nothing supervised: zero, not NaN

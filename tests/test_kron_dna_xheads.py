@@ -11,7 +11,7 @@ import torch
 
 from kron_dna import genome as G
 
-from test_kron_dna_split import batch_for, forced_replicas, small
+from test_kron_dna_split import _restore_precision, batch_for, forced_replicas, small  # noqa: F401
 
 
 def with_heads(parent: G.KronGenome, heads: list) -> G.KronGenome:
