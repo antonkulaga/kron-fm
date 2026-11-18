@@ -10,7 +10,7 @@ Stage 1 trains masked-base prediction (no tracks needed); stage 2 adds track hea
 from __future__ import annotations
 
 import math
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 
 import numpy as np
 
@@ -88,6 +88,10 @@ class KronGenomeConfig:
                                 # in the same log1p units the targets are stored in, beside the masked-base head
     n_in_extra: int = 0         # reserved per-base input channels after the 6 base channels (repeat mask, variant
                                 # dosage, methylation, ...): zero-initialised stem weights, so absent = zero = today
+    xheads: list = field(default_factory=list)   # further per-base heads, each its own module: [name, outputs] pairs
+                                # in registration order (v2/v2l). A head added to a trained model is new parameters
+                                # only; the inherited heads keep their keys, shapes and outputs
+    xhead_hidden: int = 0       # hidden width of the further heads (0: as the other MLP heads), their memory knob
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -292,6 +296,7 @@ class KronGenome(nn.Module):
         self.ntv3 = (MLPHead(widths[0], c.head_hidden or 2 * widths[0], c.n_ntv3) if v2
                      else nn.Conv1d(widths[0], c.n_ntv3, 1)) if c.n_ntv3 else None
         self.last_ntv3 = None
+        self._init_xheads(c, widths[0])
         self.context = nn.Embedding(c.n_contexts, c.d_model) if c.n_contexts else None
         self.jepa_pred = nn.Sequential(nn.RMSNorm(c.d_model, eps=1e-5), nn.Linear(c.d_model, 2 * c.d_model), nn.GELU(),
                                        nn.Linear(2 * c.d_model, c.d_model)) if c.jepa else None
@@ -324,6 +329,24 @@ class KronGenome(nn.Module):
         self.last_chunks = None
         if self.context is not None:
             nn.init.zeros_(self.context.weight)              # a new context starts as the nuclear model
+
+    def _init_xheads(self, c: KronGenomeConfig, width: int) -> None:
+        """The further per-base heads of ``config.xheads``. ``x_active`` (not saved) names the heads the next forward
+        runs: None runs all, a set only those, so a head registered ahead of its data costs no forward."""
+        names = [str(n) for n, _ in c.xheads]
+        if len(set(names)) != len(names) or any(not n.isidentifier() for n in names):
+            raise ValueError(f"xheads need distinct identifier names, got {names}")
+        if c.xheads and (c.arch not in ("v2", "v2l") or c.chunk_ratio or c.local_width):
+            raise ValueError("xheads need arch v2 or v2l without learned chunking or a local track")
+        hidden = c.xhead_hidden or c.head_hidden or 2 * width
+        self.xheads = nn.ModuleDict({str(n): MLPHead(width, hidden, int(k)) for n, k in c.xheads})
+        self.x_active: set[str] | None = None
+        self.last_x: dict[str, torch.Tensor] = {}
+
+    def run_xheads(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
+        """``{name: [B, L, outputs]}`` of the active further heads on decoder states ``x`` [B, C, L]."""
+        return {n: h(x).transpose(1, 2) for n, h in self.xheads.items()
+                if self.x_active is None or n in self.x_active}
 
     def _stem_conv(self, width: int) -> nn.Conv1d:
         """The k=15 stem over the 6 base channels plus ``n_in_extra`` reserved ones. The base part is drawn exactly as
@@ -409,6 +432,7 @@ class KronGenome(nn.Module):
         self.tracks = MLPHead(w, hidden, c.n_tracks) if c.n_tracks else None
         self.ntv3 = MLPHead(w, hidden, c.n_ntv3) if c.n_ntv3 else None
         self.last_ntv3 = None
+        self._init_xheads(c, w)
         self.context = nn.Embedding(c.n_contexts, c.d_model) if c.n_contexts else None
         if self.context is not None:
             nn.init.zeros_(self.context.weight)
@@ -520,6 +544,7 @@ class KronGenome(nn.Module):
         x = self.add_local(self.decode(core.transpose(1, 2), skips), skips)
         tracks = self.tracks(x).transpose(1, 2) if self.tracks is not None else None   # [B, L, n_tracks]
         self.last_ntv3 = self.ntv3(x).transpose(1, 2) if self.ntv3 is not None else None
+        self.last_x = self.run_xheads(x)
         return self.head(x).transpose(1, 2), core, tracks
 
     def _forward_chunked(self, h: torch.Tensor, skips: list[torch.Tensor], segments: torch.Tensor | None):
@@ -688,7 +713,7 @@ class KronGenome(nn.Module):
         return outs
 
     #: what a piece of a split window runs on its own device (see :meth:`forward_split`)
-    SPLIT_LOCAL = ("stem", "stem_res", "down", "up", "up2", "skip_proj", "head", "tracks", "ntv3")
+    SPLIT_LOCAL = ("stem", "stem_res", "down", "up", "up2", "skip_proj", "head", "tracks", "ntv3", "xheads")
 
     def split_replica(self, device, force: bool = False) -> "KronGenome":
         """A shallow copy of this model for :meth:`forward_split` whose conv path and per-base heads read
@@ -774,6 +799,7 @@ class KronGenome(nn.Module):
         self.last_jepa = self.jepa_pred(core) if self.jepa_pred is not None and self.training else None
         self.last_epi = self.epigenome_logits(core) if self.config.n_epigenomes else None
         self.last_ntv3 = None
+        self.last_x = {}
         if core_only:
             return [], core
         pieces = []
@@ -784,7 +810,9 @@ class KronGenome(nn.Module):
             y = y[:, :, start - lo:end - lo]                          # heads are per position: crop first
             pieces.append(SplitPiece(rows=rows, start=start, end=end, device=d, logits=r.head(y).transpose(1, 2),
                                      tracks=r.tracks(y).transpose(1, 2) if r.tracks is not None else None,
-                                     ntv3=r.ntv3(y).transpose(1, 2) if r.ntv3 is not None else None))
+                                     ntv3=r.ntv3(y).transpose(1, 2) if r.ntv3 is not None else None,
+                                     x={n: h(y).transpose(1, 2) for n, h in r.xheads.items()
+                                        if self.x_active is None or n in self.x_active}))
             enc[k] = None                                             # drop this function's hold on the skips
         return pieces, core
 
@@ -1101,6 +1129,7 @@ class SplitPiece:
     logits: torch.Tensor | None = None       # [b, end - start, 4]
     tracks: torch.Tensor | None = None       # [b, end - start, n_tracks]
     ntv3: torch.Tensor | None = None         # [b, end - start, n_ntv3]
+    x: dict | None = None                    # the active further heads: {name: [b, end - start, outputs]}
 
 
 def split_reach(config: KronGenomeConfig) -> int:
