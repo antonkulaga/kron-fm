@@ -55,6 +55,13 @@ reproduces it in 10 s on a card. The CUDA cases of the changed tests are still t
 id from `git log` after the push, then write the message. A file created by a shell redirect whose command failed
 was committed empty: check a generated file's size before `git add`.
 
+**Restarts with both heads (the trainer's, 18 Nov evening, code `780de73`):** A from step 244k (run directory
+`A-best-xh`), D from 166k as one process with `--split-cards 2` (`D-jepa-xh`), E as a frozen-backbone head probe
+first, F at its next checkpoint (71k). Read their `xheads.csv` when evaluations exist: the `head-only` rows are
+the heads on the frozen model, the `joint` rows what updating the shared layers adds; DNase is Pearson at 128 bp,
+splice is average precision, both on chr8/chr9. Early check (the trainer role's duty, for my heads): a head whose
+held-out score does not move over its first evaluations, or a loss that is not finite, goes to the trainer at once.
+
 ## Items
 
 | item | state |
