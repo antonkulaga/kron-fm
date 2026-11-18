@@ -860,6 +860,10 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                                                  "of their data (no forward, no update). Needs --ntv3-dir (its "
                                                  "training split) and arch v2 or v2l; with --init the heads are "
                                                  "the only new parameters"),
+                 xhead_split: Path | None = typer.Option(None, help="with --xhead and no --ntv3-dir: the primary "
+                                                         "genome's split.u8 (1 = train, 4 = the held-out "
+                                                         "chromosomes), read for the heads' training mask without "
+                                                         "an NTv3 head; default: --ntv3-dir's own"),
                  xhead_weight: float = typer.Option(0.5, help="weight of each --xhead loss beside the other terms"),
                  xhead_hidden: int = typer.Option(0, help="hidden width of the --xhead heads (0: as the other heads, "
                                                   "2 x stem channels); lower it when a 1 Mb window runs out of "
@@ -1301,9 +1305,14 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
             raise typer.BadParameter(f"--xhead {name_x}: the store covers {xstores[name_x].dense.shape[0]:,} bases, "
                                      f"the primary genome {name} has {len(bases):,}")
     if xhead:
-        if not ntv3_dir or whole_contigs or world > 1 or arch not in ("v2", "v2l"):
-            raise typer.BadParameter("--xhead needs --ntv3-dir (the training split), arch v2 or v2l, windows (not "
-                                     "--whole-contigs) and one process (--split-cards, not data-parallel cards)")
+        if not (ntv3_dir or xhead_split) or whole_contigs or world > 1 or arch not in ("v2", "v2l"):
+            raise typer.BadParameter("--xhead needs --ntv3-dir or --xhead-split (the training split), arch v2 or v2l, "
+                                     "windows (not --whole-contigs) and one process (--split-cards, not "
+                                     "data-parallel cards)")
+        xsplit = np.memmap(xhead_split or Path(ntv3_dir) / "split.u8", dtype=np.uint8, mode="r")
+        if len(xsplit) != len(bases):
+            raise typer.BadParameter(f"--xhead: the split covers {len(xsplit):,} bases, the primary genome {name} has "
+                                     f"{len(bases):,}")
         for n_, s_ in xstores.items():
             lone_ = [i_ for k_, i_ in enumerate(s_.ids) if i_.endswith(("_P", "_M")) and s_.swap[k_] == k_]
             if rc and lone_:
@@ -1693,6 +1702,20 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                 nt_s.append(sp_)
                 nt_c.append(cm_)
                 nt_x.append(-1 if xs is None else xs)
+            elif xstores:                            # --xhead without an NTv3 head (--xhead-split): the same side
+                primary_ = xs is None and not from_mito and fg is None    # tuple, with no NTv3 channel in it
+                sp_ = np.zeros(wrow, dtype=np.uint8)
+                if primary_:
+                    sp_[:take] = xsplit[at:at + take]
+                    if flip_row:
+                        sp_[:take] = sp_[:take][::-1]
+                for n_, st_ in xstores.items():
+                    xh_t[n_].append(st_.window(at, take, wrow, flip_row) if primary_
+                                    else np.zeros((wrow, len(st_.ids)), dtype=np.uint8))
+                nt_t.append(np.zeros((wrow, 0), dtype=np.uint8))
+                nt_s.append(sp_)
+                nt_c.append(np.zeros(0, dtype=bool))
+                nt_x.append(-1)
             seg = np.zeros(wrow // unit, dtype=np.int64)
             seg[(take + unit - 1) // unit:] = 1                           # padding is its own segment
             seqs.append(codes)

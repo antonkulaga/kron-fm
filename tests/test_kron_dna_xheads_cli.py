@@ -209,3 +209,25 @@ def test_a_label_store_trains_a_binary_head_and_reports_average_precision(genome
     assert f["config"]["xheads"] == [["dnase", 3], ["splice", 4]]
     assert f["xstage"]["state"]["stores"]["splice"]["definition"] == "one base per site, per strand"
     assert "xheads.splice.weight" in f["model"] and "xheads.splice.weight" not in p["model"]
+
+
+def test_heads_train_without_an_ntv3_head_from_the_split_alone(genomes, tmp_path, monkeypatch):
+    """A run with no NTv3 head (a control arm) takes the training mask from --xhead-split."""
+    root, parent0, store, child0 = setup(genomes, tmp_path, monkeypatch)
+    nd = root / "hg_ntv3"
+    plain = SMALL + ["--eval-every", "1", "--lr", str(LR)]
+    parent = tmp_path / "plain-parent"
+    res, _ = run(cli, monkeypatch, root, parent, plain + ["--curriculum", "1024:4"])
+    assert res.exit_code == 0, res.output + repr(res.exception)
+    args = plain + ["--curriculum", f"1024:{STEPS}", "--init", str(parent / "checkpoint.pt"), "--start-step", "4",
+                    "--xhead", f"dnase:{store}", "--rc"] + STAGE
+    res, _ = run(cli, monkeypatch, root, tmp_path / "no-split", args)
+    assert res.exit_code != 0 and "--xhead-split" in MGT.flat(res.output + repr(res.exception))
+    out = tmp_path / "child"
+    res, _ = run(cli, monkeypatch, root, out, args + ["--xhead-split", str(nd / "split.u8")])
+    assert res.exit_code == 0, res.output + repr(res.exception)
+    d = pl.read_csv(out / "xheads.csv").filter(pl.col("head") == "dnase").sort("step")
+    prev, switch = replay(d)
+    assert switch is not None and prev >= 6 and (d["heldout_n"] > 0).all()
+    f = torch.load(out / "checkpoint.pt", map_location="cpu", weights_only=False)
+    assert f["config"]["n_ntv3"] == 0 and f["config"]["xheads"] == [["dnase", 3]] and "ntv3" not in f
