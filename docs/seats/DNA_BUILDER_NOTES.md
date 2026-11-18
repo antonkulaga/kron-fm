@@ -81,6 +81,27 @@ once the trunk trains with it). The ClinVar pass takes the card after it.
 outputs, bin]`, a head on the mean decoder state per bin). Still to do for binned heads: the binned store, the
 loss on bins and the wiring in `genome-train` (B11).
 
+**State at the end of 18 Nov (read this first after a restart of the seat):**
+- The account's 7-day quota passed 85 % at about 22:54: watcher lines (job starts and ends) do not wake this seat
+  until the window resets Monday morning; messages from a person or from the trainer still do. So look at the
+  queue and the logs yourself at every turn.
+- F and D ran out of card memory at 1 Mb with the two heads at hidden 128 (the trainer restarted both at hidden
+  32). The fix is pushed, `4f47980`: in training the heads run on the supervised stretch only (0.375 of the bases
+  at `--ntv3-center 0.375`), same loss and gradients, CPU-tested (90 passed with `test_kron_dna_split.py`), not yet
+  run on a card. The trainer benches it and puts F and D back to hidden 128.
+- Head comparison, job 6517859, still waits on the trainer's E probe. Eight variants now: linear, MLP 32/128/512,
+  3-layer MLP, conv 9, a reduced KAN, and `kron` (a per-base linear readout plus one bidirectional KronLSTM layer
+  over 32-base means; Anton asked whether KronLSTM layers can be heads). A variant that cannot run on the card is
+  dropped, the rest go on. After it: post the table (scores with intervals, parameters, measured memory) to the
+  trainer's topic and to Anton, and replace the computed memory table I gave Anton with the measured one.
+- Downloads run in this session (they die with it; rerun the same commands): stage 1 DNase and RNA-seq, then stage 2
+  ChIP-seq by itself.
+- Anton's open asks to me: the AlphaGenome API key file's path (he has not answered); a probe of where the
+  information lives (heads on the 1 bp decoder states, on the 128 bp core states, on the encoder's 1 bp states), which
+  he has not ordered but which answers his question whether the binning is a problem; a chunked head with a
+  two-stage backward (I recommended it before the binned store); a proper literature survey on heads only if he
+  asks (one search of four hit the usage limit: heads conditioned on a cell or track embedding).
+
 ## Items
 
 | item | state |
