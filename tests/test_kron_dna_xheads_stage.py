@@ -309,3 +309,62 @@ def test_average_precision_is_exact_with_everything_kept_and_a_lower_bound_other
     perfect = X.AveragePrecision(1)
     perfect.add(torch.tensor([[[5.0], [4.0], [-1.0], [-2.0]]]), torch.tensor([[[1], [1], [0], [0]]], dtype=torch.uint8))
     assert perfect.value()[0] == pytest.approx(1.0)
+
+
+# ----------------------------------------------------------------------------------- heads added on a resume
+
+def test_added_heads_must_extend_the_checkpoints_and_change_nothing_else():
+    plan = X.StagePlan(**PLAN)
+    saved = X.StagePlan(**(PLAN | {"heads": ["dnase"]})).to_dict()
+    assert X.added_heads(saved, plan) == ["splice"] and X.added_heads(plan.to_dict(), plan) == []
+    for bad in (PLAN | {"heads": ["splice", "dnase"]}, PLAN | {"heads": ["dnase", "splice"], "head_only": 9}):
+        with pytest.raises(ValueError):
+            X.added_heads(X.StagePlan(**bad).to_dict(), plan)
+    with pytest.raises(ValueError):                              # a head dropped
+        X.added_heads(plan.to_dict(), X.StagePlan(**(PLAN | {"heads": ["dnase"]})))
+
+
+def test_a_stage_extended_by_a_head_keeps_its_phase_and_counts():
+    a = X.Stage(X.StagePlan(**(PLAN | {"heads": ["dnase"]})))
+    a.activate("dnase", {"ids": ["a"]})
+    for _ in range(6):
+        a.stepped(["dnase"])
+    saved = json.loads(json.dumps(a.state))
+    b = X.Stage(X.StagePlan(**PLAN), X.extend_state(saved, ["splice"]))
+    assert b.state["phase"] == "joint" and b.state["updates"] == {"dnase": 6, "splice": 0} and b.active == ["dnase"]
+    assert saved["updates"] == {"dnase": 6}                      # the checkpoint's own dict is not touched
+    b.activate("splice", {"ids": ["d", "a"]})
+    assert b.state["active"]["splice"] == 6
+    assert b.lr_head("splice") == pytest.approx(2e-4) and b.lr_head("dnase") == pytest.approx(4e-4)
+    assert b.stepped(["dnase", "splice"]) is None and b.state["phase"] == "joint"   # no second head-only phase
+
+
+def test_optimizer_state_of_the_old_groups_survives_a_new_head(device):
+    cfg = small("v2").config.to_dict()
+    torch.manual_seed(3)
+    old = G.KronGenome(G.KronGenomeConfig(**(cfg | {"xheads": [["dnase", 3]]}))).to(device)
+    opt = torch.optim.AdamW(X.param_groups(old), lr=1e-3)
+    seq, seg, ctx, extra = batch_for(1, 512, device)
+    for _ in range(2):
+        opt.zero_grad()
+        old(seq, seg, ctx, extra)
+        (old.last_x["dnase"].pow(2).mean() + old.last_ntv3.pow(2).mean()).backward()
+        opt.step()
+    saved = copy.deepcopy(opt.state_dict())
+    new = G.KronGenome(G.KronGenomeConfig(**(cfg | {"xheads": [["dnase", 3], ["splice", 4]]}))).to(device)
+    missing, unexpected = new.load_state_dict(old.state_dict(), strict=False)
+    assert not unexpected and all(k.startswith("xheads.splice.") for k in missing)
+    opt2 = torch.optim.AdamW(X.param_groups(new), lr=1e-3)
+    opt2.load_state_dict(X.merge_optimizer_state(saved, opt2.state_dict(), 4))
+    assert [g["role"] for g in opt2.param_groups] == ["inherited"] * 2 + ["dnase"] * 2 + ["splice"] * 2
+    by_name_old = {n: p for n, p in old.named_parameters()}
+    for n, p in new.named_parameters():
+        st = opt2.state.get(p, {})
+        if n.startswith("xheads.splice."):
+            assert not st                                         # a fresh group: no moments yet
+        elif by_name_old[n] in opt.state and "exp_avg" in opt.state[by_name_old[n]]:
+            assert torch.equal(st["exp_avg"], opt.state[by_name_old[n]]["exp_avg"]), n
+            assert torch.equal(st["exp_avg_sq"], opt.state[by_name_old[n]]["exp_avg_sq"]), n
+            assert st["step"] == opt.state[by_name_old[n]]["step"]
+    with pytest.raises(ValueError):
+        X.merge_optimizer_state(saved, opt2.state_dict(), 2)

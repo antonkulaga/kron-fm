@@ -423,6 +423,45 @@ class Stage:
         return None
 
 
+def added_heads(saved_plan: dict, plan: StagePlan) -> list[str]:
+    """The heads ``plan`` registers beyond a checkpoint's ``saved_plan``, when every other setting is the same and
+    the checkpoint's heads come first in the same order; raises ValueError otherwise (a head removed, reordered, or
+    another setting changed: that is another stage, not a continuation)."""
+    old, new = list(saved_plan["heads"]), list(plan.heads)
+    rest_old = {k: v for k, v in saved_plan.items() if k != "heads"}
+    rest_new = {k: v for k, v in plan.to_dict().items() if k != "heads"}
+    if rest_old != rest_new:
+        raise ValueError(f"the stage was started with other settings: {rest_old}, now {rest_new}")
+    if new[:len(old)] != old:
+        raise ValueError(f"the checkpoint's heads {old} must come first and in this order, got {new}")
+    return new[len(old):]
+
+
+def extend_state(state: dict, added: list[str]) -> dict:
+    """A checkpoint's stage ``state`` with ``added`` heads registered: no labelled update yet, not active; the
+    phase and every other head's counts stand, so a head added in joint training starts on its own warmup while
+    nothing else restarts."""
+    out = dict(state, updates=dict(state["updates"]))
+    for h in added:
+        out["updates"][h] = 0
+    return out
+
+
+def merge_optimizer_state(saved: dict, fresh: dict, n_old_groups: int) -> dict:
+    """An optimizer state for a model that gained heads: ``saved`` (the checkpoint's) for its first ``n_old_groups``
+    groups, ``fresh`` (this run's new optimizer) for the groups after them. The groups are role-ordered
+    (:func:`param_groups`: inherited, then each head in registration order), so a head appended at the end leaves
+    every earlier parameter's index unchanged; that is checked, group by group."""
+    if len(saved["param_groups"]) != n_old_groups or len(fresh["param_groups"]) < n_old_groups:
+        raise ValueError(f"the checkpoint's optimizer has {len(saved['param_groups'])} groups, expected {n_old_groups}")
+    for k in range(n_old_groups):
+        a, b = saved["param_groups"][k], fresh["param_groups"][k]
+        if a["params"] != b["params"] or a.get("role") != b.get("role"):
+            raise ValueError(f"optimizer group {k} ({b.get('role')}) does not hold the checkpoint's parameters")
+    return dict(state=dict(saved["state"]),
+                param_groups=list(saved["param_groups"]) + list(fresh["param_groups"][n_old_groups:]))
+
+
 def param_groups(model: G.KronGenome, weight_decay: float = 0.1) -> list[dict]:
     """AdamW groups for a stage: the inherited weights (decayed, then norms/biases/embeddings as genome-train splits
     them) and one pair per further head, each tagged ``role`` ("inherited" or the head's name) so a rate goes to it."""

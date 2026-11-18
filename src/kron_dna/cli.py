@@ -1911,8 +1911,32 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
         elif saved_nt is not None and not ntv3:
             raise typer.BadParameter(f"refusing to resume {ckpt}: it has an NTv3 head over {len(saved_nt.get('ids', []))} "
                                      "tracks and this run selects none (pass the checkpoint's --ntv3-dir)")
-        model.load_state_dict(state["model"])
-        opt.load_state_dict(state["optimizer"])
+        # --xhead heads registered beyond the checkpoint's: a continuation that gains heads (their weights start
+        # untrained, their optimizer groups fresh; everything the checkpoint holds, its optimizer state too, stands)
+        x_added: list[str] = []
+        if xhead and state.get("xstage") is not None:
+            try:
+                x_added = XH.added_heads(state["xstage"]["plan"], XH.StagePlan(
+                    heads=list(xhead_sizes), head_only=xhead_only, lr_inherited=inherit_lr, lr_head=xhead_lr,
+                    warmup_inherited=inherit_warmup, warmup_head=xhead_warmup))
+            except ValueError as err:
+                raise typer.BadParameter(f"refusing to resume {ckpt}: {err}") from None
+        if x_added:
+            missing_, unexpected_ = model.load_state_dict(state["model"], strict=False)
+            stray_ = [k_ for k_ in missing_ if k_.split(".")[:2] not in [["xheads", n_] for n_ in x_added]]
+            if stray_ or unexpected_:
+                raise typer.BadParameter(f"refusing to resume {ckpt}: beside the added heads {x_added}, the model "
+                                         f"lacks {stray_[:6]} and the checkpoint has {list(unexpected_)[:6]}")
+            try:
+                opt.load_state_dict(XH.merge_optimizer_state(state["optimizer"], opt.state_dict(),
+                                                             2 * (1 + len(state["xstage"]["plan"]["heads"]))))
+            except ValueError as err:
+                raise typer.BadParameter(f"refusing to resume {ckpt}: {err}") from None
+            say(f"--xhead: added on resume: {x_added} (new parameters and optimizer groups; every other weight, "
+                f"moment and count is the checkpoint's)")
+        else:
+            model.load_state_dict(state["model"])
+            opt.load_state_dict(state["optimizer"])
         step, hours = state["step"], state.get("hours", 0.0)
         say(f"resumed at step {step}")
         guard_saved = state.get("jepa_guard")
@@ -1963,15 +1987,15 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
         if resumed and xstage_saved is None:
             raise typer.BadParameter(f"refusing to resume {ckpt}: it has no --xhead stage; start a new run directory "
                                      "with --init")
-        if xstage_saved is not None and xstage_saved["plan"] != plan_x.to_dict():
-            raise typer.BadParameter(f"refusing to resume {ckpt}: its --xhead stage was started with other settings: "
-                                     f"{xstage_saved['plan']}, now {plan_x.to_dict()}")
         try:
+            if xstage_saved is not None:              # the same stage, or the same with heads added at its end
+                xstage_saved = dict(xstage_saved, state=XH.extend_state(
+                    xstage_saved["state"], XH.added_heads(xstage_saved["plan"], plan_x)))
             xstage = XH.Stage(plan_x, xstage_saved["state"] if xstage_saved is not None else None)
             for n_, st_ in xstores.items():           # adopted here: a start or a restart is a checkpoint boundary
                 xstage.activate(n_, st_.identity)
         except ValueError as err:
-            raise typer.BadParameter(f"--xhead: {err}") from None
+            raise typer.BadParameter(f"--xhead: {err} (resuming {ckpt})" if resumed else f"--xhead: {err}") from None
         record["xheads"] = dict(plan=plan_x.to_dict(), weight=xhead_weight,
                                 stores={n_: dict(path=str(st_.path), **st_.identity) for n_, st_ in xstores.items()})
         say(f"--xhead: {', '.join(f'{n_} ({k_} outputs' + ('' if n_ in xstores else ', no data yet') + ')' for n_, k_ in xhead_sizes.items())}; "

@@ -231,3 +231,49 @@ def test_heads_train_without_an_ntv3_head_from_the_split_alone(genomes, tmp_path
     assert switch is not None and prev >= 6 and (d["heldout_n"] > 0).all()
     f = torch.load(out / "checkpoint.pt", map_location="cpu", weights_only=False)
     assert f["config"]["n_ntv3"] == 0 and f["config"]["xheads"] == [["dnase", 3]] and "ntv3" not in f
+
+
+def test_a_head_is_added_on_a_plain_resume(genomes, tmp_path, monkeypatch):
+    """A running stage gains a head at a restart: no --init, no second head-only phase, the old head's counts go on."""
+    root, parent, store, child = setup(genomes, tmp_path, monkeypatch)
+    total = int(np.fromfile(genomes["hgt"] / "bases.u8", dtype=np.uint8).size)
+    d = tmp_path / "labels"
+    d.mkdir()
+    rng = np.random.default_rng(4)
+    lab = np.zeros(total, dtype=np.uint8)
+    bits = {"donor_plus": 0, "acceptor_plus": 1, "donor_minus": 2, "acceptor_minus": 3}
+    for b in bits.values():
+        lab[rng.random(total) < 0.02] |= 1 << b
+    lab.tofile(d / "splice.u8")
+    (d / "splice.json").write_text(json.dumps(dict(
+        genome="hgt", total_bases=total, bits=bits, definition="one base per site, per strand", splice_sha256="x",
+        check={k: dict(sites=int(((lab >> b) & 1).sum())) for k, b in bits.items()})))
+    first = [a for a in child if a != "splice:2"]
+    assert first.count("--xhead") == 2
+    k = len(first) - 1 - first[::-1].index("--xhead")           # drop the second --xhead flag with its value
+    first = first[:k] + first[k + 1:]
+    out = tmp_path / "child"
+    res, _ = run(cli, monkeypatch, root, out, first + ["--stop-step", "11"])
+    assert res.exit_code == 0, res.output + repr(res.exception)
+    mid = torch.load(out / "checkpoint.pt", map_location="cpu", weights_only=False)
+    assert mid["xstage"]["state"]["phase"] == "joint" and list(mid["xstage"]["state"]["updates"]) == ["dnase"]
+    again = [a for a in first if a not in ("--init", str(parent / "checkpoint.pt"), "--start-step", "4")]
+    res, _ = run(cli, monkeypatch, root, out, again + ["--xhead", f"splice:{d}"])
+    assert res.exit_code == 0, res.output + repr(res.exception)
+    text = MGT.flat(res.output)
+    assert "added on resume: ['splice']" in text and "phase joint" in text
+    end = torch.load(out / "checkpoint.pt", map_location="cpu", weights_only=False)
+    st = end["xstage"]["state"]
+    assert st["phase"] == "joint" and st["active"]["splice"] == mid["xstage"]["state"]["stage_step"]
+    assert st["updates"]["dnase"] >= mid["xstage"]["state"]["updates"]["dnase"] and st["updates"]["splice"] > 0
+    assert end["config"]["xheads"] == [["dnase", 3], ["splice", 4]]
+    assert len(end["optimizer"]["param_groups"]) == 6
+    x = pl.read_csv(out / "xheads.csv")
+    s = x.filter(pl.col("head") == "splice").sort("step")
+    assert s["step"].to_list() == list(range(12, STEPS + 1)) and set(s["phase"].to_list()) == {"joint"}
+    replay(x.filter(pl.col("head") == "dnase").sort("step"))    # the first head's schedule runs through the restart
+    # the heads may only be appended
+    k = again.index(f"dnase:{store}")
+    swapped = again[:k - 1] + again[k + 1:] + ["--xhead", f"splice:{d}", "--xhead", f"dnase:{store}"]
+    res, _ = run(cli, monkeypatch, root, out, swapped)
+    assert res.exit_code != 0 and "must come first" in MGT.flat(res.output + repr(res.exception))
