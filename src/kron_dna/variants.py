@@ -309,9 +309,13 @@ def alphagenome_scores(table: pl.DataFrame, positions: pl.DataFrame, api_key: st
     ``version`` 2 is AlphaGenome 2, which predicts one condition (tissue, cell type) per call: each variant is scored
     in every one of ``conditions``, and the largest effect over them is kept. Its scores are named ``alphagenome2:``.
 
-    Results are appended to ``cache`` (a parquet keyed by ``id``) as they arrive, so a rerun skips what is done;
-    a failed call is retried 5 times, then left NaN and not cached, so a rerun tries it again. ``client`` stands
-    in for the API in tests."""
+    Results are appended to ``cache`` as they arrive, one row per variant (id, chrom, pos, ref, alt), model version
+    and condition, with one column per scorer, so a rerun skips what is done and a changed condition set, scorer
+    set or variant only computes what is missing (audit 2026-11-18, EV-02: the cache was keyed by id alone, so a
+    changed condition list silently returned the old conditions' scores). A file written by the earlier id-keyed
+    layout is not read (its conditions are unknown); its rows are recomputed into ``<cache>.v2.parquet``. A failed
+    call is retried 5 times, then left NaN and not cached, so a rerun tries it again. ``client`` stands in for the
+    API in tests."""
     from concurrent.futures import ThreadPoolExecutor
 
     from importlib import import_module
@@ -324,41 +328,60 @@ def alphagenome_scores(table: pl.DataFrame, positions: pl.DataFrame, api_key: st
     VS = import_module(f"alphagenome.models.v{version}.variant_scorers")
     if client is None:
         client = dna_client.create(api_key)
-    per_call = list(conditions) if version == 2 else [None]
+    per_call = list(dict.fromkeys(conditions)) if version == 2 else [""]
+    cache = Path(cache)
+    store = cache if cache.name.endswith(".v2.parquet") else cache.with_name(cache.stem + ".v2.parquet")
+    key_cols = ["id", "chrom", "pos", "ref", "alt", "version", "condition"]
+    key_schema = {"id": pl.Utf8, "chrom": pl.Utf8, "pos": pl.Int64, "ref": pl.Utf8, "alt": pl.Utf8,
+                  "version": pl.Int64, "condition": pl.Utf8}
 
     chosen = [VS.RECOMMENDED_VARIANT_SCORERS[k] for k in scorers]
-    done = pl.read_parquet(cache) if cache.exists() else pl.DataFrame(schema={"id": pl.Utf8, **{k: pl.Float64 for k in scorers}})
-    keyed = positions.select("id", "chrom", "pos", "ref", "alt").unique("id")
-    todo = table.select("id").unique().join(keyed, on="id").join(done.select("id"), on="id", how="anti")
+    done = pl.read_parquet(store) if store.exists() else pl.DataFrame(schema=key_schema)
+    for k in scorers:                                           # a scorer the cache has not seen: null, so recomputed
+        if k not in done.columns:
+            done = done.with_columns(pl.lit(None, dtype=pl.Float64).alias(k))
+    keyed = (positions.select("id", "chrom", "pos", "ref", "alt").unique("id")
+             .with_columns(pl.col("chrom").cast(pl.Utf8), pl.col("pos").cast(pl.Int64)))
+    wanted = (table.select("id").unique().join(keyed, on="id")
+              .join(pl.DataFrame({"condition": per_call}, schema={"condition": pl.Utf8}), how="cross")
+              .with_columns(pl.lit(version, dtype=pl.Int64).alias("version")).select(key_cols))
+    complete = done.filter(pl.all_horizontal([pl.col(k).is_not_null() for k in scorers])).select(key_cols)
+    todo = wanted.join(complete, on=key_cols, how="anti")
 
-    def one(row: dict) -> dict:
+    def one(row: dict) -> dict | None:
         v = genome.Variant(chromosome=f"chr{row['chrom']}", position=int(row["pos"]),
                            reference_bases=row["ref"], alternate_bases=row["alt"])
-        best = {k: float("nan") for k in scorers}
-        for condition in per_call:
-            extra = {"condition": condition} if condition else {}
-            for attempt in range(5):
-                try:
-                    res = client.score_variant(interval=v.reference_interval.resize(dna_client.SEQUENCE_LENGTH_100KB),
-                                               variant=v, variant_scorers=chosen, **extra)
-                    break
-                except Exception:                             # transient gRPC / proxy failures
-                    time.sleep(2 ** attempt)
-            else:
-                return None
-            for k, r in zip(scorers, res):
-                if r.X.size:
-                    best[k] = float(np.nanmax([best[k], float(np.nanmax(np.abs(r.X)))]))
-        return {"id": row["id"], **best}
+        extra = {"condition": row["condition"]} if row["condition"] else {}
+        for attempt in range(5):
+            try:
+                res = client.score_variant(interval=v.reference_interval.resize(dna_client.SEQUENCE_LENGTH_100KB),
+                                           variant=v, variant_scorers=chosen, **extra)
+                break
+            except Exception:                             # transient gRPC / proxy failures
+                time.sleep(2 ** attempt)
+        else:
+            return None
+        got = {k: (float(np.nanmax(np.abs(r.X))) if r.X.size else float("nan")) for k, r in zip(scorers, res)}
+        return {**row, **got}
 
     rows = todo.to_dicts()
+    schema = {**key_schema, **{c: pl.Float64 for c in done.columns if c not in key_schema}}
+    done = done.select(list(schema))
     with ThreadPoolExecutor(workers) as pool:
         for start in range(0, len(rows), 200):
-            got = pl.DataFrame([r for r in pool.map(one, rows[start:start + 200]) if r], schema=done.schema)
-            done = pl.concat([done, got])
-            done.write_parquet(cache)
-            print(f"AlphaGenome: {done.height:,} variants scored", flush=True)
-    joined = table.select("id").join(done, on="id", how="left", maintain_order="left")
+            got = [r for r in pool.map(one, rows[start:start + 200]) if r]
+            if got:
+                new = pl.DataFrame([{c: r.get(c) for c in schema} for r in got], schema=schema)
+                done = pl.concat([done.join(new.select(key_cols), on=key_cols, how="anti"), new])
+            done.write_parquet(store)
+            print(f"AlphaGenome: {done.height:,} variant-condition scores cached", flush=True)
+    # the score of a variant: the largest effect over the requested conditions, NaN unless every one of them is in
+    per_variant = (wanted.join(done, on=key_cols, how="left")
+                   .group_by("id").agg([pl.col(k).is_null().any().alias(f"_miss_{k}") for k in scorers]
+                                       + [pl.col(k).fill_nan(None).max().alias(k) for k in scorers]))
+    per_variant = per_variant.with_columns([pl.when(pl.col(f"_miss_{k}")).then(None).otherwise(pl.col(k)).alias(k)
+                                            for k in scorers])
+    joined = table.select("id").join(per_variant, on="id", how="left", maintain_order="left")
     prefix = "alphagenome" if version == 1 else "alphagenome2"
     return {f"{prefix}:{k.lower()}": -joined[k].fill_null(float("nan")).to_numpy().astype(float) for k in scorers}
 

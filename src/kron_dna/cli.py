@@ -437,6 +437,40 @@ def probe(task: Path = typer.Argument(..., help="a CodonBERT-style CSV (Sequence
     typer.echo(f"wrote {out}")
 
 
+def clinvar_cache_key(vcf: Path, cds: Path, holdout_genes: float, seed: int, version: int = 1) -> str:
+    """Identity of a mapped ClinVar table: the VCF and CDS files (path, size, modification time), the held-out gene
+    fraction, the seed and the mapping version. A changed input or split gets its own cache file instead of the
+    rows (and in_training flags) mapped for another (audit 2026-11-18, EV-01)."""
+    import hashlib
+
+    def ident(p: Path) -> list:
+        p = Path(p)
+        st = p.stat() if p.exists() else None
+        return [str(p.resolve()), st.st_size if st else None, st.st_mtime_ns if st else None]
+    blob = json.dumps(dict(vcf=ident(vcf), cds=ident(cds), holdout_genes=float(holdout_genes), seed=int(seed),
+                           version=version), sort_keys=True)
+    return hashlib.sha256(blob.encode()).hexdigest()[:16]
+
+
+def run_keys(runs: list[Path]) -> list[str]:
+    """One score name per checkpoint of a comparison: the run directory's name, or for a checkpoint file its parent's
+    name, extended by the file's stem (or the whole path) where two would collide. Duplicates are refused before
+    any scoring (audit 2026-11-18, EV-03: two files of one snapshots/ folder overwrote each other's scores)."""
+    base = [r.name if r.is_dir() else r.parent.name for r in runs]
+    keys = []
+    for r, b in zip(runs, base):
+        if base.count(b) == 1:
+            keys.append(b)
+        else:
+            keys.append(f"{r.parent.name}/{r.stem}" if not r.is_dir() else str(r))
+    if len(set(keys)) < len(keys):
+        keys = [str(r) for r in runs]
+    dup = sorted({k for k in keys if keys.count(k) > 1})
+    if dup:
+        raise typer.BadParameter(f"--run lists the same checkpoint more than once: {dup}")
+    return keys
+
+
 @app.command()
 def clinvar(vcf: Path = typer.Option(None, help="ClinVar GRCh38 VCF (default: data/input/variants/clinvar/clinvar.vcf.gz)"),
             cds: str = typer.Option("human-grch38", help="a CDS source name or NCBI cds_from_genomic FASTA path"),
@@ -472,8 +506,8 @@ def clinvar(vcf: Path = typer.Option(None, help="ClinVar GRCh38 VCF (default: da
     t0 = time.time()
     transcripts = V.read_transcripts(fasta)
     typer.echo(f"{len(transcripts):,} genes with a usable CDS ({time.time() - t0:.0f} s)")
-    cache = interim_dir("cds", "clinvar") / "variants.parquet"
-    if cache.exists():
+    cache = interim_dir("cds", "clinvar") / f"variants-{clinvar_cache_key(vcf, fasta, holdout_genes, seed)}.parquet"
+    if cache.exists():                          # audit 2026-11-18, EV-01: keyed by the inputs and the gene split
         table = pl.read_parquet(cache)
     else:
         variants = V.read_clinvar(vcf)
@@ -1079,6 +1113,7 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
             raise typer.BadParameter(f"--jepa-block-len: {err}") from None
     guard = G.jepa_guard_new()          # --jepa-guard state; with off its factor stays 1 and the loss is as before
     guard_saved = None                  # the state a resumed checkpoint carries
+    teacher_saved, resumed = None, False
     jepa_log = main and jepa_weight > 0 and (jepa_block_share > 0 or jepa_log_every > 0 or jepa_guard != "off")
     if not (0.0 <= soft_base_rate <= 1.0 and 0.0 <= repeat_channel_drop <= 1.0):
         raise typer.BadParameter("--soft-base-rate and --repeat-channel-drop must lie in [0, 1]")
@@ -1645,6 +1680,7 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
     except MG.GenomeSpecError as err:
         raise typer.BadParameter(str(err)) from None
     ctx_on = config.n_contexts > 0                    # the model reads context ids whenever it has a table
+    torch.manual_seed(seed)                       # initial weights from --seed (audit 2026-11-18, TR03)
     model = G.KronGenome(config).to(dev)
     model.checkpoint_core = checkpoint_core
     split_devs = None                                 # --split-cards: the cards one window is divided over
@@ -1752,11 +1788,32 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
             raise typer.BadParameter(f"refusing to resume {ckpt}: this run's genomes, held-out sets or context ids "
                                      f"differ from the checkpoint's record: " + "; ".join(diffs)
                                      + ". Start a new run directory instead (with --init to keep the weights).")
+        # TR01 (audit 2026-11-18): the NTv3 head and its optimizer rows load by position, so the ordered channel ids
+        # and the target transform must be the checkpoint's own; a reordered or different same-width selection
+        # would otherwise silently train each head row on another track
+        saved_nt = state.get("ntv3")
+        if ntv3 and saved_nt is not None:
+            nt_diffs = []
+            if list(saved_nt.get("ids", [])) != list(ntv3["ids"]):
+                nt_diffs.append(f"channel ids (in order): checkpoint {list(saved_nt.get('ids', []))}, now {list(ntv3['ids'])}")
+            for k_, v_ in (("target", ntv3_target), ("center", ntv3_center), ("loss", ntv3_loss)):
+                if k_ in saved_nt and saved_nt[k_] != v_:
+                    nt_diffs.append(f"{k_}: checkpoint {saved_nt[k_]!r}, now {v_!r}")
+            if nt_diffs:
+                raise typer.BadParameter(f"refusing to resume {ckpt}: its NTv3 head was trained on other targets: "
+                                         + "; ".join(nt_diffs) + ". Keep the checkpoint's --ntv3-dir/--ntv3-assays and "
+                                         "target options, or start a new run directory (with --init to keep the weights).")
+        elif ntv3 and saved_nt is None and any(k_.startswith("ntv3") for k_ in state["model"]):
+            say("note: the checkpoint records no NTv3 channel ids (older code); their order cannot be checked")
+        elif saved_nt is not None and not ntv3:
+            raise typer.BadParameter(f"refusing to resume {ckpt}: it has an NTv3 head over {len(saved_nt.get('ids', []))} "
+                                     "tracks and this run selects none (pass the checkpoint's --ntv3-dir)")
         model.load_state_dict(state["model"])
         opt.load_state_dict(state["optimizer"])
         step, hours = state["step"], state.get("hours", 0.0)
         say(f"resumed at step {step}")
         guard_saved = state.get("jepa_guard")
+        teacher_saved, resumed = state.get("jepa_target"), True
     elif init is not None and not bench:
         # reserved room (stem input channels, context rows) is zero-padded explicitly, function-preserving; new
         # heads stay missing (strict=False) as before, and any other shape mismatch still raises
@@ -1776,6 +1833,17 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                                    .get("commit"))
         del init_state
         step = start_step
+    # TR03/TR04 (audit 2026-11-18): the training-mask/dropout stream gets its own seed per card and start step, and a
+    # run starting past step 0 draws its windows (and repeat-channel drops) from step-keyed streams instead of
+    # replaying the first windows of a fresh run. A fresh run (step 0) keeps the windows of earlier code.
+    torch.manual_seed(int(np.random.SeedSequence([seed, rank, 2035, step]).generate_state(1)[0]))
+    if step > 0:
+        rng = np.random.default_rng([seed, rank, step])
+        rep_rng = np.random.default_rng([seed, rank, 2027, step])
+    record["rng"] = dict(init="torch.manual_seed(seed) before the model is built",
+                         masks="torch.manual_seed(SeedSequence([seed, rank, 2035, start step]))",
+                         windows="np.random.default_rng([seed, rank]) from step 0, else [seed, rank, start step]",
+                         repeat_drop="np.random.default_rng([seed, rank, 2027]) from step 0, else [seed, rank, 2027, start step]")
     if main and not bench:
         record["started_at_step"] = step
         rec_path = out / "run_record.json"
@@ -1793,6 +1861,12 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
         target = copy.deepcopy(model).eval()
         for p_ in target.parameters():
             p_.requires_grad_(False)
+        if jepa_ema > 0 and teacher_saved is not None:            # audit 2026-11-18, TR05
+            target.load_state_dict(teacher_saved)
+            say("jepa: the EMA teacher continues from the checkpoint")
+        elif jepa_ema > 0 and resumed:
+            say("note: the checkpoint carries no EMA teacher (older code): the teacher restarts as a copy of the "
+                "resumed weights")
     train_model = model
     if world > 1:
         train_model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[dev.index])
@@ -2306,7 +2380,8 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
     slice_rows: list[dict] = []                       # the slice's loss terms (jepa.csv keys) since the last report
     slice_losses: list[float] = []                    # its unweighted training loss per step
     model.train()
-    while step < (stop_step or steps):
+    end_step = stop_step or steps                     # TR02: evaluate and save at the step the run stops at
+    while step < end_step:
         t_step = time.time()
         for g in opt.param_groups:
             g["lr"] = lr * min(1.0, (step + 1) / warmup) * 0.5 * (1 + math.cos(math.pi * min(step / steps, 1.0)))
@@ -2396,12 +2471,12 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
             jepa_steps += 1
             jepa_peak = max(jepa_peak, max(torch.cuda.max_memory_allocated(d_) / 2**30  # split: the busiest card
                                            for d_ in (split_devs or [dev])))
-            if (step % eval_every == 0 or step == steps or out_of_time
+            if (step % eval_every == 0 or step == steps or step == end_step or out_of_time
                     or (jepa_log_every > 0 and step % jepa_log_every == 0)):
                 jepa_row(step, win)
-        if (step % eval_every == 0 or step == steps or out_of_time) and not main:
+        if (step % eval_every == 0 or step == steps or step == end_step or out_of_time) and not main:
             dist.barrier()                              # rank 0 evaluates and saves
-        elif step % eval_every == 0 or step == steps or out_of_time:
+        elif step % eval_every == 0 or step == steps or step == end_step or out_of_time:
             model.eval()
             keep: list = []
             eval_rng = np.random.default_rng([seed, step])               # the same windows for every run with this seed
@@ -2577,13 +2652,14 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                                        "center": ntv3_center, "extra": [e_x["name"] for e_x in ntv3["extra"]],
                                        "mlm_weight": mlm_weight}} if ntv3 else {}),
                           "run_record": record,
+                          **({"jepa_target": target.state_dict()} if target is not None and jepa_ema > 0 else {}),
                           **({"jepa_guard": dict(guard, std_mins=list(guard["std_mins"]))} if jepa_guard != "off" else {}),
                           **({"genomes": [dict(name=g_.name, share=g_.share, context=g_.context,
                                                held_out=g_.val["chrom"].unique(maintain_order=True).to_list())
                                           for g_ in genomes]} if genomes else {})}, ckpt)
             if world > 1:
                 dist.barrier()
-        if jepa_guard == "on" and (step % eval_every == 0 or step == steps or out_of_time):
+        if jepa_guard == "on" and (step % eval_every == 0 or step == steps or step == end_step or out_of_time):
             if world > 1:                               # rank 0 decided; every card takes its factor and verdict
                 flag_ = torch.tensor([guard["mult"], float(guard["stopped"])], device=dev, dtype=torch.float64)
                 dist.broadcast(flag_, 0)
@@ -2652,14 +2728,14 @@ def genome_clinvar(runs: list[Path] = typer.Option([], "--run", help="genome-tra
     g, c_off, c_len = (table[c].to_numpy() for c in ("g", "c_off", "c_len"))
     t_start, t_len = GV.tile_of(g, c_off, c_len, window)
     scores = {"distance to splice site": GV.splice_distance(labels, g)}   # lower = closer = more damaging
-    for run in runs:
+    keys = run_keys(runs)                       # checked before any scoring (audit 2026-11-18, EV-03)
+    for run, key in zip(runs, keys):
         ckpt = run / "checkpoint.pt" if run.is_dir() else run
         state = torch.load(ckpt, map_location="cpu")
         model = G.KronGenome(G.KronGenomeConfig(**state["config"])).to(dev)
         model.load_state_dict(state["model"])
         model.eval()
         t0 = time.time()
-        key = run.name if run.is_dir() else run.parent.name
         scores[key] = GV.masked_marginals(model, bases, g, table["ref_code"].to_numpy(), table["alt_code"].to_numpy(),
                                           t_start, t_len, window, dev, batch_size)
         typer.echo(f"{key} (step {state.get('step')}): {len(np.unique(t_start))} tiles in {time.time() - t0:.0f} s")

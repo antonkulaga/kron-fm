@@ -572,7 +572,10 @@ class KronGenome(nn.Module):
         b, _, length = stem.shape
         h = self.local_in(stem).transpose(1, 2).reshape(1, b * length, -1)
         span = min(c.local_span, length)
-        starts = torch.arange(0, b * length, span, device=x.device)
+        # restart points per row (audit 2026-11-18, TR06): global multiples of span let one recurrent segment straddle
+        # two independent rows whenever length is not a multiple of span (packed rows make such lengths)
+        per_row = torch.arange(0, length, span, device=x.device)
+        starts = (torch.arange(b, device=x.device).unsqueeze(1) * length + per_row).reshape(-1)
         cu = torch.cat([starts, torch.tensor([b * length], device=x.device)]).to(torch.int32)
         for layer in self.local_core:
             h = (torch.utils.checkpoint.checkpoint(layer, h, cu, use_reentrant=False)

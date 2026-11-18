@@ -106,6 +106,9 @@ class ShardWriter:
 
     def __init__(self, out: Path, seq_len: int, shard_rows: int) -> None:
         self.out, self.seq_len, self.shard_rows = out, seq_len, shard_rows
+        if (out / "tokens.npy").is_file():     # audit 2026-11-18, D2: the loader would keep reading the old file
+            raise FileExistsError(f"{out} holds a monolithic tokens.npy; stream the rebuild into another directory "
+                                  "(or move the old dataset away first)")
         out.mkdir(parents=True, exist_ok=True)
         self.buffer = np.full((shard_rows, seq_len), PAD_ID, dtype=np.uint8)
         self.n_in_buffer = 0     # complete rows in the buffer

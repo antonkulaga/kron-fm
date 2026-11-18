@@ -169,6 +169,8 @@ def prepare(paths: Iterable[str | Path], out_dir: str | Path, seq_len: int = 102
             raise ValueError(f"no sequence passed the checks for the {split} split")
         tokens = np.stack(rows)
         target.mkdir(parents=True, exist_ok=True)
+        if (target / "meta.json").is_file() and json.loads((target / "meta.json").read_text()).get("shards"):
+            raise FileExistsError(f"{target} holds a streamed (sharded) dataset; write tokens.npy elsewhere")
         np.save(target / "tokens.npy", tokens)
         c = counts[split]
         meta = {"seq_len": seq_len, "rows": int(tokens.shape[0]), "sequences": c["kept"], "codons": c["codons"],
@@ -213,13 +215,15 @@ def mask_codons(tokens: torch.Tensor, mask_prob: float = 0.15, generator: torch.
 def shard_files(directory: str | Path) -> list[Path]:
     """The token arrays of a prepared directory: ``tokens.npy``, or the shards ``meta.json`` lists."""
     directory = Path(directory)
-    if (directory / "tokens.npy").is_file():
-        return [directory / "tokens.npy"]
     meta_path = directory / "meta.json"
-    if meta_path.is_file():
-        shards = json.loads(meta_path.read_text()).get("shards")
-        if shards:
-            return [directory / s["file"] for s in shards]
+    shards = json.loads(meta_path.read_text()).get("shards") if meta_path.is_file() else None
+    if (directory / "tokens.npy").is_file():
+        if shards:        # audit 2026-11-18, D2: a streamed rebuild into an old monolithic directory
+            raise ValueError(f"{directory} holds both tokens.npy and a meta.json listing {len(shards)} shards: it is "
+                             "ambiguous which dataset is current; move one of them away")
+        return [directory / "tokens.npy"]
+    if shards:
+        return [directory / s["file"] for s in shards]
     raise FileNotFoundError(f"{directory} holds neither tokens.npy nor a meta.json listing shards")
 
 
