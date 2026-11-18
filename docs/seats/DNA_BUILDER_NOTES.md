@@ -96,7 +96,15 @@ loss on bins and the wiring in `genome-train` (B11).
   trainer's topic and to Anton, and replace the computed memory table I gave Anton with the measured one.
 - Downloads run in this session (they die with it; rerun the same commands): stage 1 DNase and RNA-seq, then stage 2
   ChIP-seq by itself.
-- Anton's open asks to me: the AlphaGenome API key file's path (he has not answered); a probe of where the
+- AlphaGenome for the ClinVar cohort: Anton gave the API key in the session on 18 Nov about 23:20. It is in an
+  owner-only file outside every repository (the path is in `clinvar/v1/alphagenome/` logs' command lines and in
+  the seat's machine memory, never here), and it is repeated nowhere. Timing on 100 held-out variants: version 1,
+  149 s with 4 threads; version 2 with the three fixed tissues, 42 s. The full pass over the 13,275 held-out
+  variants runs in this session since about 23:25, version 2 first, then version 1 (about 1.5 h and 3 to 5 h by
+  those rates), resumable, into `$SCRATCH/kron-dna-build/clinvar/v1/alphagenome/`. No score has been looked at:
+  only counts. When both are done, wait for the KronGenome pass (it needs a card) before reading any AUROC, as
+  `PREREG.md` says.
+- Anton's open asks to me: a probe of where the
   information lives (heads on the 1 bp decoder states, on the 128 bp core states, on the encoder's 1 bp states), which
   he has not ordered but which answers his question whether the binning is a problem; a chunked head with a
   two-stage backward (I recommended it before the binned store); a proper literature survey on heads only if he
