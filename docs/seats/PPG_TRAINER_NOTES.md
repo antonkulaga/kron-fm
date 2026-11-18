@@ -12,7 +12,7 @@ secretary on the maintainer's word).
   session's start line and in the secretary's handout.
 - `<status file>`: beside the brief, `kron-samsung-status.md`. Run log and results live there.
 - `<share>`: the rigger's inventory default until desk #4 is answered: 25 CPU cores for this seat; GPU jobs outside
-  the core share; GPU as the loops found it (kron-fm on gpu13). This seat's first jobs used gpu12 card 0, free at
+  the core share; GPU as the loops found it (the node the brief names). This seat's first jobs used a card free at
   the time and named free by the brief; short inference jobs, 4 CPUs each.
 
 ## State
