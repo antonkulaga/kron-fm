@@ -1,6 +1,6 @@
 # Response to the independent code audit of 18 Nov 2026
 
-The audit (`/data/uq2347/scratch/kron-dna/reviews/codex-20261118/` on the cluster) listed 17 open findings: 1 P1, 15 P2
+The audit (`$SCRATCH/kron-dna/reviews/codex-20261118/` on the cluster) listed 17 open findings: 1 P1, 15 P2
 and 1 P3. All 17 were reproduced or checked against the code, fixed, and covered by a regression test that fails on the
 previous code and passes on the fix. For each finding, the last column says whether it changed a result already reported,
 checked against the run directories, checkpoints and evaluation outputs on 18 Nov 2026, 02:30-03:00 CET.
@@ -25,7 +25,7 @@ the findings is serious enough to restart a running arm (see TR04).
 | EV-03 | `genome-clinvar` named a checkpoint file's scores after its parent folder, so two files of one folder overwrote each other | `run_keys`: folder name, extended by the file stem where names collide; duplicates refused before scoring | No. Both genome-ClinVar outputs scored whole run folders with distinct names |
 | OP-03 | `slurm/job.sbatch` picked the first GPU with no process, without a lock | A node-local `flock` lease per card, held through the job's lifetime and released by the kernel on exit | No. The arms pin their cards by hand |
 
-## Scratch-script fixes (cluster scripts; tests in `/data/uq2347/scratch/kron-dna/auditfix/tests/`)
+## Scratch-script fixes (cluster scripts; tests in `$SCRATCH/kron-dna/auditfix/tests/`)
 
 | ID | What was wrong | Fix | Changed a reported result? |
 |---|---|---|---|
