@@ -192,6 +192,26 @@ def test_uneven_rows_gradients_equal_forward(device, monkeypatch, arch):
 
 # ------------------------------------------------------------------------------------------- options off: parents
 
+AUDIT_MODEL = "    model = G.KronGenome(config).to(dev)\n"
+AUDIT_START = "    if main and not bench:\n        record[\"started_at_step\"] = step\n"
+
+
+def with_audit_rng(src: str) -> str:
+    """A parent's cli.py with the audit's random-stream changes (2026-11-18, TR03/TR04) applied, so "option off
+    trains as the parent" compares like with like: since the audit the initial weights come from --seed, the
+    mask/dropout stream from (seed, rank, start step), and a run starting past step 0 draws its windows from
+    step-keyed streams. Those change every run on purpose; what the parents are compared for is everything else."""
+    if "audit 2026-11-18, TR03" in src:                         # already carries them
+        return src
+    assert src.count(AUDIT_MODEL) == 1 and src.count(AUDIT_START) == 1, "parent's anchors for the audit RNG patch"
+    src = src.replace(AUDIT_MODEL, "    torch.manual_seed(seed)                       # audit 2026-11-18, TR03\n" + AUDIT_MODEL)
+    return src.replace(AUDIT_START,
+                       "    torch.manual_seed(int(np.random.SeedSequence([seed, rank, 2035, step]).generate_state(1)[0]))\n"
+                       "    if step > 0:\n"
+                       "        rng = np.random.default_rng([seed, rank, step])\n"
+                       "        rep_rng = np.random.default_rng([seed, rank, 2027, step])\n" + AUDIT_START)
+
+
 def parent_cli(monkeypatch, commit: str, env: str):
     """cli.py at ``commit`` (git show), or the file the environment variable ``env`` names."""
     repo = Path(__file__).resolve().parents[1]
@@ -203,6 +223,7 @@ def parent_cli(monkeypatch, commit: str, env: str):
                                  check=True, text=True).stdout
         except (OSError, subprocess.CalledProcessError):
             pytest.skip(f"commit {commit} is not reachable from {repo} (set {env} to its cli.py)")
+    src = with_audit_rng(src)
     mod = types.ModuleType(f"kron_dna_cli_{commit}")
     mod.__file__ = f"{commit}:src/kron_dna/cli.py"
     monkeypatch.setitem(sys.modules, mod.__name__, mod)
