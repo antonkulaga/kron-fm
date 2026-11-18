@@ -8,6 +8,7 @@ its decoder states, the input every per-base head reads, go to all variants, so 
 order. Every variant has one head per task with its own AdamW and the same schedule:
 
     linear       one 1x1 map, no hidden layer
+    mlp32        the current head's form with 32 hidden units (what a 1 Mb run falls back to for memory)
     mlp128       the current head: RMS norm, 1x1 to 128, GELU, 1x1            (the reference)
     mlp512       the same with 512 hidden units
     mlp3         three layers: norm, 1x1 to 256, GELU, 1x1 to 256, GELU, 1x1
@@ -68,7 +69,7 @@ def make_head(kind: str, c: int, t: int) -> nn.Module:
     norm = G.ChannelRMSNorm(c)
     if kind == "linear":
         return nn.Conv1d(c, t, 1)
-    if kind in ("mlp128", "mlp512"):
+    if kind in ("mlp32", "mlp128", "mlp512"):
         return G.MLPHead(c, int(kind[3:]), t)
     if kind == "mlp3":
         return nn.Sequential(norm, nn.Conv1d(c, 256, 1), nn.GELU(), nn.Conv1d(256, 256, 1), nn.GELU(), nn.Conv1d(256, t, 1))
@@ -80,7 +81,7 @@ def make_head(kind: str, c: int, t: int) -> nn.Module:
     raise ValueError(kind)
 
 
-VARIANTS = ("linear", "mlp128", "mlp512", "mlp3", "conv9", "kan")
+VARIANTS = ("linear", "mlp32", "mlp128", "mlp512", "mlp3", "conv9", "kan")
 
 
 def n_params(m: nn.Module) -> int:
