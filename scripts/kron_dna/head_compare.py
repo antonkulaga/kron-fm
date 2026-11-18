@@ -15,6 +15,9 @@ order. Every variant has one head per task with its own AdamW and the same sched
     conv9        norm, a 9-base convolution to 128, GELU, 1x1: the only variant that reads neighbouring bases
     kan          norm, 1x1 down to 32 (to fit), then two KAN layers (32 -> 64 -> outputs), each a sum of learned
                  one-variable functions on a basis of 8 Gaussians plus a SiLU branch
+    kron         a per-base linear readout plus one bidirectional KronLSTM layer (width 128) over the 32-base means
+                 of the states, its outputs added back at every base: the only variant that mixes distant positions
+                 (dropped, with a line saying so, if the layer cannot be built or run on the device)
 
 Tasks: the measured-track store (``--tracks``: Poisson-multinomial loss, scored by Pearson of log1p signal at 128 bp
 per track) and the label store (``--labels``: weighted BCE, scored by average precision per channel). Training
@@ -64,6 +67,28 @@ class KANLayer(nn.Module):
         return self.mix(phi) + self.base(F.silu(x))
 
 
+class KronHead(nn.Module):
+    """A per-base linear readout plus one bidirectional KronLSTM layer over ``bin``-base means of the states (each
+    window its own document), whose outputs are added back at every base of the bin."""
+
+    def __init__(self, c: int, t: int, bin: int = 32, d: int = 128) -> None:
+        super().__init__()
+        from kron_core.bidirectional import BiKronLSTMBlock
+
+        self.bin = bin
+        self.norm, self.local, self.down = G.ChannelRMSNorm(c), nn.Conv1d(c, t, 1), nn.Conv1d(c, d, 1)
+        self.block, self.out = BiKronLSTMBlock(d, 4, 2 * d, 0.0, 0), nn.Conv1d(d, t, 1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        z = self.norm(x)
+        p = F.avg_pool1d(self.down(z), self.bin)                       # [B, d, n]
+        b, d, n = p.shape
+        cu = torch.arange(0, b * n + 1, n, device=x.device, dtype=torch.int32)
+        h = self.block(p.transpose(1, 2).reshape(1, b * n, d), cu).reshape(b, n, d).transpose(1, 2)
+        wide = torch.repeat_interleave(self.out(h), self.bin, dim=-1)
+        return self.local(z) + F.pad(wide, (0, x.shape[-1] - wide.shape[-1]))
+
+
 def make_head(kind: str, c: int, t: int) -> nn.Module:
     """A head ``[B, C, L] -> [B, T, L]`` of the named variant."""
     norm = G.ChannelRMSNorm(c)
@@ -78,10 +103,12 @@ def make_head(kind: str, c: int, t: int) -> nn.Module:
     if kind == "kan":
         return nn.Sequential(norm, nn.Conv1d(c, 32, 1), G.ChannelRMSNorm(32), KANLayer(32, 64), G.ChannelRMSNorm(64),
                              KANLayer(64, t))
+    if kind == "kron":
+        return KronHead(c, t)
     raise ValueError(kind)
 
 
-VARIANTS = ("linear", "mlp32", "mlp128", "mlp512", "mlp3", "conv9", "kan")
+VARIANTS = ("linear", "mlp32", "mlp128", "mlp512", "mlp3", "conv9", "kan", "kron")
 
 
 def n_params(m: nn.Module) -> int:
@@ -199,8 +226,18 @@ def run(checkpoint: Path, out: Path, tracks: Path, labels: Path, name: str = "hg
 
     consts = {k: st.consts(dev) for k, st in stores.items()}
     torch.manual_seed(seed)
-    heads = {v: nn.ModuleDict({k: make_head(v, width, len(st.ids)) for k, st in stores.items()}).to(dev)
-             for v in variants}
+    heads, dropped = {}, {}
+    for v in variants:
+        try:                                          # a variant that cannot be built or run here is left out
+            h = nn.ModuleDict({k: make_head(v, width, len(st.ids)) for k, st in stores.items()}).to(dev)
+            with torch.no_grad():
+                for k in stores:
+                    h[k](torch.zeros(1, width, min(window, 4096), device=dev))
+            heads[v] = h
+        except Exception as err:                      # noqa: BLE001  (the comparison goes on without it)
+            dropped[v] = f"{type(err).__name__}: {err}"[:300]
+            say(f"variant {v} dropped: {dropped[v]}")
+    variants = tuple(heads)
     opts = {v: torch.optim.AdamW(heads[v].parameters(), lr=lr, weight_decay=0.01, betas=(0.9, 0.95)) for v in variants}
     params = {v: {k: n_params(heads[v][k]) for k in stores} for v in variants}
 
@@ -211,8 +248,8 @@ def run(checkpoint: Path, out: Path, tracks: Path, labels: Path, name: str = "hg
     probe_starts = draw(train, batch, np.random.default_rng([seed, 1]))
     x0, (w0, s0) = features(probe_starts), targets(probe_starts)
     ok0 = X.supervised(s0, center).to(dev)
-    cost = {}
-    for v in variants:
+    def alone(v: str) -> dict:
+        """Three training steps of variant ``v`` alone on one batch: its seconds per step and peak memory."""
         twin = nn.ModuleDict({k: make_head(v, width, len(st.ids)) for k, st in stores.items()}).to(dev)
         o = torch.optim.AdamW(twin.parameters(), lr=0.0)
         if dev.type == "cuda":
@@ -226,12 +263,24 @@ def run(checkpoint: Path, out: Path, tracks: Path, labels: Path, name: str = "hg
             o.step()
         if dev.type == "cuda":
             torch.cuda.synchronize()
-        cost[v] = dict(seconds_per_step=(time.time() - t0) / 3,
+        got = dict(seconds_per_step=(time.time() - t0) / 3,
                        peak_gib_above_features=((torch.cuda.max_memory_allocated(dev) - before) / 2 ** 30
                                                 if dev.type == "cuda" else float("nan")))
         del twin, o
+        return got
+
+    cost = {}
+    for v in list(variants):
+        try:
+            cost[v] = alone(v)
+        except Exception as err:                      # noqa: BLE001  (as above: the comparison goes on without it)
+            dropped[v] = f"{type(err).__name__}: {err}"[:300]
+            heads.pop(v)
+            say(f"variant {v} dropped at its first training steps: {dropped[v]}")
+            continue
         say(f"{v}: {sum(params[v].values()):,} parameters, {cost[v]['seconds_per_step']:.3f} s/step alone, "
             f"{cost[v]['peak_gib_above_features']:.2f} GiB above the features (batch {batch} x {window:,})")
+    variants = tuple(heads)
     del x0, w0
 
     eval_starts = draw(held, eval_windows, np.random.default_rng([seed, 2]))
@@ -309,6 +358,7 @@ def run(checkpoint: Path, out: Path, tracks: Path, labels: Path, name: str = "hg
     ref = REFERENCE if REFERENCE in variants else variants[0]
     result = dict(
         checkpoint=str(checkpoint), trunk_step=state.get("step"), window=window, batch=batch, steps=step,
+        dropped=dropped,
         hours=(time.time() - t_start) / 3600, eval_windows=w, seed=seed, lr=lr, center=center, reference=ref,
         stores={k: st.identity for k, st in stores.items()},
         variants={v: dict(

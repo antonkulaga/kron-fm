@@ -20,7 +20,9 @@ HC = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(HC)
 
 
-def test_every_variant_maps_states_to_outputs_and_counts_its_parameters():
+def test_every_variant_maps_states_to_outputs_and_counts_its_parameters(device):
+    if device.type != "cpu":
+        pytest.skip("shapes are checked on the CPU, with the stand-in for the KronLSTM layer")
     x = torch.randn(2, 16, 64)
     sizes = {}
     for v in HC.VARIANTS:
@@ -80,6 +82,7 @@ def test_run_trains_every_variant_on_the_same_frozen_features(genomes, tmp_path,
     res = HC.run(ckpt, tmp_path / "out", store, lab_dir, name="hgt", split=nd / "split.u8", window=1024, batch=2,
                  steps=6, eval_windows=4, eval_every=3, device="cpu", n_boot=20, n_boot_ap=5, warmup=2)
     assert res["steps"] == 6 and res["trunk_step"] == 7 and set(res["variants"]) == set(HC.VARIANTS)
+    assert res["dropped"] == {} and "kron" in res["variants"]
     ref = res["variants"]["mlp128"]
     assert ref["dnase_minus_reference"] == 0.0 and ref["dnase_minus_reference_ci"] == [0.0, 0.0]
     for v, r in res["variants"].items():
