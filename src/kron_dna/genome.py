@@ -385,10 +385,13 @@ class KronGenome(nn.Module):
             if kb < 1 or kb & (kb - 1) or c.xhead_layers < 1 or c.xhead_width % 4 or not 64 <= c.xhead_width <= 1024:
                 raise ValueError(f"kron xheads: step {kb} must be a power of two, layers {c.xhead_layers} at least 1, "
                                  f"width {c.xhead_width} a multiple of 4 in [64, 1024] (4 KronLSTM heads of 16-256)")
+            # a binned head reads bin means; its KronLSTM steps over xhead_bin bases, or one bin when the bin is wider
+            step = {n: max(1, kb // b) for n, _, b in rows}
             for n, _, b in rows:                      # a span is a multiple of 2**n_down: whole steps in every bin
-                if b * kb > 2 ** c.n_down:
-                    raise ValueError(f"xhead {n}: bin {b} x KronLSTM step {kb} exceeds {2 ** c.n_down} bases")
-            self.xheads = nn.ModuleDict({n: KronHead(width, k, kb, c.xhead_width, c.xhead_layers) for n, k, _ in rows})
+                if b * step[n] > 2 ** c.n_down:
+                    raise ValueError(f"xhead {n}: bin {b} x KronLSTM step {step[n]} exceeds {2 ** c.n_down} bases")
+            self.xheads = nn.ModuleDict({n: KronHead(width, k, step[n], c.xhead_width, c.xhead_layers)
+                                         for n, k, _ in rows})
         else:
             raise ValueError(f"xhead_kind must be mlp or kron, got {c.xhead_kind!r}")
         self.xhead_bin = {n: b for n, _, b in rows}

@@ -868,6 +868,10 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                  xhead_hidden: int = typer.Option(0, help="hidden width of the --xhead heads (0: as the other heads, "
                                                   "2 x stem channels); lower it when a 1 Mb window runs out of "
                                                   "memory"),
+                 xhead_bin: list[str] = typer.Option([], help="NAME=B: --xhead NAME predicts at bins of B bases "
+                                                     "(a power of two up to the core step; targets are the per-base "
+                                                     "targets averaged per bin): wide track sets cost B-fold less in "
+                                                     "the head and its loss. Track heads only; fixed for a head's life"),
                  xhead_kind: str = typer.Option("mlp", help="the --xhead heads' kind: mlp (per position) or kron "
                                                 "(a per-base readout plus bidirectional KronLSTM layers over "
                                                 "--xhead-step-bases means; context is the supervised span)"),
@@ -1310,6 +1314,14 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
         if xstores[name_x].dense.shape[0] != len(bases):
             raise typer.BadParameter(f"--xhead {name_x}: the store covers {xstores[name_x].dense.shape[0]:,} bases, "
                                      f"the primary genome {name} has {len(bases):,}")
+    x_bin: dict[str, int] = {}                        # head -> bases per output (1: per base)
+    for spec_b in xhead_bin:
+        name_b, _, val_b = spec_b.partition("=")
+        if name_b not in xhead_sizes or not val_b.isdigit():
+            raise typer.BadParameter(f"--xhead-bin {spec_b!r}: give NAME=B for a NAME of --xhead")
+        if name_b in xstores and xstores[name_b].kind != "tracks":
+            raise typer.BadParameter(f"--xhead-bin {name_b}: a binary head predicts per base")
+        x_bin[name_b] = int(val_b)
     if xhead:
         if not (ntv3_dir or xhead_split) or whole_contigs or world > 1 or arch not in ("v2", "v2l"):
             raise typer.BadParameter("--xhead needs --ntv3-dir or --xhead-split (the training split), arch v2 or v2l, "
@@ -1774,7 +1786,8 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
         raise typer.BadParameter(f"--mito tags windows with genetic-code ids up to 33: --n-contexts must be at least "
                                  f"{G.N_CONTEXTS_ORGANELLE}")
     config = G.KronGenomeConfig(d_model=d_model, n_layers=n_layers, stem_channels=stem_channels, n_down=n_down,
-                                xheads=[[n_x, k_x] for n_x, k_x in xhead_sizes.items()], xhead_hidden=xhead_hidden,
+                                xheads=[[n_x, k_x] + ([x_bin[n_x]] if x_bin.get(n_x, 1) > 1 else [])
+                                        for n_x, k_x in xhead_sizes.items()], xhead_hidden=xhead_hidden,
                                 xhead_kind=xhead_kind, xhead_layers=xhead_layers, xhead_bin=xhead_step_bases,
                                 xhead_width=xhead_width,
                                 n_tracks=len(G.TRACKS) if labels else 0, arch=arch, head_hidden=head_hidden,
@@ -1891,6 +1904,13 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
     if ckpt.exists() and not bench:
         state = torch.load(ckpt, map_location="cpu")
         kind_saved = (state.get("config") or {}).get("xhead_kind", "mlp")
+        rows_saved = {str(h[0]): (int(h[1]), int(h[2]) if len(h) > 2 else 1)
+                      for h in (state.get("config") or {}).get("xheads", [])}
+        moved = [n_ for n_, (k_, b_) in rows_saved.items()
+                 if n_ in xhead_sizes and (xhead_sizes[n_], x_bin.get(n_, 1)) != (k_, b_)]
+        if xhead and moved:
+            raise typer.BadParameter(f"refusing to resume {ckpt}: heads {moved} were trained with other outputs or "
+                                     f"bins ({ {n_: rows_saved[n_] for n_ in moved} }); add a new head instead")
         if xhead and kind_saved != xhead_kind:
             raise typer.BadParameter(f"refusing to resume {ckpt}: its --xhead heads are of kind {kind_saved}, this "
                                      f"run asks {xhead_kind}; start a new run directory with --init (the heads then "
@@ -1990,7 +2010,8 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
     x_step: set = set()                               # heads with supervised positions in the current step
     x_rates: dict = {}                                # the last step's rate per role
     x_losses: dict = {n_: [] for n_ in xhead_sizes}
-    x_pearson: dict = {n_: (xstores[n_].scorer() if n_ in xstores else XH.Pearson(k_)) for n_, k_ in xhead_sizes.items()}
+    x_pearson: dict = {n_: (xstores[n_].scorer(x_bin.get(n_, 1)) if n_ in xstores else XH.Pearson(k_))
+                       for n_, k_ in xhead_sizes.items()}
     x_consts: dict = {}
 
     def x_consts_on(name_):
@@ -2307,15 +2328,18 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
             if model.training:
                 kind_x = xstores[n_].kind
                 lo_x, hi_x = (0, 0) if split_now else model.last_x_at
-                loss_x = (XH.split_head_loss(pieces, n_, want_x, x_ok, x_consts_on(n_), dev, kind_x) if split_now else
+                bin_x = x_bin.get(n_, 1)
+                loss_x = (XH.split_head_loss(pieces, n_, want_x, x_ok, x_consts_on(n_), dev, kind_x, bin_x)
+                          if split_now else
                           XH.head_loss(model.last_x[n_], want_x[:, lo_x:hi_x].to(dev), x_ok[:, lo_x:hi_x].to(dev),
-                                       x_consts_on(n_)(dev), kind_x))
+                                       x_consts_on(n_)(dev), kind_x, bin_x))
                 mlm = mlm + xhead_weight * loss_x
                 x_losses[n_].append(float(loss_x.detach()))
                 x_step.add(n_)
             else:                       # held-out rows whole: log1p signal at 128 bp, or logits against labels
                 rows_x = (x_ok.sum(1) > 0).to(dev)
-                p_x, w_x = XH.eval_pair(xstores[n_], model.last_x[n_], want_x.to(dev), x_consts_on(n_)(dev))
+                p_x, w_x = XH.eval_pair(xstores[n_], model.last_x[n_], want_x.to(dev), x_consts_on(n_)(dev),
+                                        x_bin.get(n_, 1))
                 x_pearson[n_].add(p_x[rows_x], w_x[rows_x])
         reg_t = None                    # the anti-collapse term of this micro-batch (JEPA_TRACE)
         if target is not None and model.training and model.last_jepa is not None:
@@ -2858,7 +2882,8 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                                      f"{x_rates.get('inherited', 0.0):.3e},{tl_x:.5f},{met_x.split('(')[0].strip().replace(' ', '_')},"
                                      f"{mean_x:.5f},{x_pearson[n_].n},"
                                      + " ".join(f"{v_:.5f}" for v_ in r_x) + "\n")
-                    x_pearson[n_] = xstores[n_].scorer() if n_ in xstores else XH.Pearson(xhead_sizes[n_])
+                    x_pearson[n_] = (xstores[n_].scorer(x_bin.get(n_, 1)) if n_ in xstores
+                                     else XH.Pearson(xhead_sizes[n_]))
                     x_losses[n_].clear()
             if epi_keep:
                 sc = torch.cat([k[0] for k in epi_keep])

@@ -47,8 +47,9 @@ class TrackStore:
         """(scales, non-zero means, RNA flags) on ``device``."""
         return tuple(torch.as_tensor(np.asarray(v)).to(device) for v in (self.scales, self.nonzero_mean, self.is_rna))
 
-    def scorer(self):
-        return Pearson(len(self.ids))
+    def scorer(self, bin: int = 1):
+        """Pearson at 128 bp; a head predicting at ``bin`` bases gives bins already (``bin`` divides 128)."""
+        return Pearson(len(self.ids), max(1, 128 // bin))
 
     @classmethod
     def open(cls, path: str | Path) -> "TrackStore":
@@ -165,7 +166,9 @@ class LabelStore:
         w = np.clip(np.sqrt((1 - share) / np.maximum(share, 1e-12)), 1, 100).astype(np.float32)
         return (torch.as_tensor(w).to(device),)
 
-    def scorer(self):
+    def scorer(self, bin: int = 1):
+        if bin != 1:
+            raise ValueError("a binary head predicts per base")
         return AveragePrecision(len(self.ids))
 
 
@@ -228,24 +231,50 @@ def span_of(ok: torch.Tensor, unit: int) -> tuple[int, int] | None:
     return lo, min(hi, ok.shape[1])
 
 
+def pool_bins(x: torch.Tensor, bin: int) -> torch.Tensor:
+    """``[B, L, T]`` -> ``[B, L / bin, T]``: the mean over each bin (``bin`` divides L, as spans are whole core steps)."""
+    if bin == 1:
+        return x
+    b, length, t = x.shape
+    return x.reshape(b, length // bin, bin, t).mean(2)
+
+
+def pool_ok(ok: torch.Tensor, bin: int) -> torch.Tensor:
+    """``[B, L]`` -> ``[B, L / bin]``: a bin is supervised when all its bases are."""
+    if bin == 1:
+        return ok
+    b, length = ok.shape
+    return ok.reshape(b, length // bin, bin).amin(2)
+
+
+def binned_targets(want: torch.Tensor, ok: torch.Tensor, consts: tuple, bin: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """A track head's training targets and mask at ``bin`` bases: the per-base targets (:func:`targets_of`) averaged
+    over each bin, so a binned head learns the bin's mean signal in the same units as a per-base head."""
+    return pool_bins(targets_of(want, *consts), bin), pool_ok(ok, bin)
+
+
 def head_loss(pred: torch.Tensor, want: torch.Tensor, ok: torch.Tensor, consts: tuple,
-              kind: str = "tracks") -> torch.Tensor:
+              kind: str = "tracks", bin: int = 1) -> torch.Tensor:
     """The head's loss on a whole window: ``pred`` [B, L, T] raw outputs, ``want`` [B, L, T] stored targets, ``ok``
     [B, L] from :func:`supervised`, ``consts`` the store's on ``pred``'s device. ``kind`` "tracks": the NTv3 head's
     Poisson-multinomial on scaled signal; "binary": weighted BCE, the mean over supervised values."""
     if kind == "binary":
+        if bin != 1:
+            raise ValueError("a binary head predicts per base")
         return _bce_sum(pred, want, ok, consts) / (ok.sum() * pred.shape[-1]).clamp_min(1)
-    return G.poisson_multinomial_loss(F.softplus(pred.float()), targets_of(want, *consts), ok.unsqueeze(-1))
+    y, m = binned_targets(want, ok, consts, bin)
+    return G.poisson_multinomial_loss(F.softplus(pred.float()), y, m.unsqueeze(-1))
 
 
-def head_loss_parts(pred: torch.Tensor, want: torch.Tensor, ok: torch.Tensor, consts: tuple) -> dict:
+def head_loss_parts(pred: torch.Tensor, want: torch.Tensor, ok: torch.Tensor, consts: tuple, bin: int = 1) -> dict:
     """The same for one piece of a split window, on the piece's card: the sums
     :func:`kron_dna.genome.poisson_multinomial_combine` joins on the first card into :func:`head_loss`'s value."""
-    return G.poisson_multinomial_parts(F.softplus(pred.float()), targets_of(want, *consts), ok.unsqueeze(-1))
+    y, m = binned_targets(want, ok, consts, bin)
+    return G.poisson_multinomial_parts(F.softplus(pred.float()), y, m.unsqueeze(-1))
 
 
 def split_head_loss(pieces: list, name: str, want: torch.Tensor, ok: torch.Tensor, consts_on, device,
-                    kind: str = "tracks") -> torch.Tensor:
+                    kind: str = "tracks", bin: int = 1) -> torch.Tensor:
     """:func:`head_loss` of head ``name`` from the pieces of ``forward_split``: targets go from the host to each
     piece's card, only per-(row, track) sums cross to ``device``. ``consts_on(device)`` gives that card's constants.
     Each piece's outputs cover its ``x_at`` bases (the model's ``x_span`` within the piece); ``ok`` must be zero
@@ -256,7 +285,7 @@ def split_head_loss(pieces: list, name: str, want: torch.Tensor, ok: torch.Tenso
                   for p in pieces)
         return tot / (ok.sum() * want.shape[-1]).clamp_min(1).to(device)
     parts = [(p.rows, head_loss_parts(p.x[name], want[p.rows, p.x_at[0]:p.x_at[1]].to(p.device),
-                                      ok[p.rows, p.x_at[0]:p.x_at[1]].to(p.device), consts_on(p.device)))
+                                      ok[p.rows, p.x_at[0]:p.x_at[1]].to(p.device), consts_on(p.device), bin))
              for p in pieces]
     return G.poisson_multinomial_combine(parts, want.shape[0], device)
 
@@ -340,12 +369,14 @@ class AveragePrecision:
         return out
 
 
-def eval_pair(store, pred: torch.Tensor, want: torch.Tensor, consts: tuple) -> tuple[torch.Tensor, torch.Tensor]:
+def eval_pair(store, pred: torch.Tensor, want: torch.Tensor, consts: tuple, bin: int = 1
+              ) -> tuple[torch.Tensor, torch.Tensor]:
     """What the store's scorer is given for held-out rows: predicted and measured log1p signal for tracks, logits and
     labels for binary heads."""
     if store.kind == "binary":
         return pred.float(), want
-    return signal_of(F.softplus(pred.float()), consts[1], consts[2]), want.float() / 255.0 * consts[0]
+    # a binned head's prediction is its bin's mean; the target side is the bin's mean of log1p signal
+    return signal_of(F.softplus(pred.float()), consts[1], consts[2]), pool_bins(want.float() / 255.0 * consts[0], bin)
 
 
 # ------------------------------------------------------------------------------------------------ the stage

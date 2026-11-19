@@ -191,5 +191,35 @@ def test_kron_heads_read_context_beyond_one_step_and_run_on_the_span(device):
 def test_kron_head_settings_are_checked(kw):
     with pytest.raises(ValueError):
         kron_heads(small("v2"), [["x", 2]], **kw)
-    with pytest.raises(ValueError):                                  # a bin of 8 times a step of 4 exceeds 16 bases
-        kron_heads(small("v2"), [["x", 2, 8]])
+    with pytest.raises(ValueError):                                  # a bin wider than the 16-base core step
+        kron_heads(small("v2"), [["x", 2, 32]])
+
+
+
+def test_a_binned_kron_head_steps_once_per_bin_when_the_bin_is_wide(device):
+    m = kron_heads(small("v2"), [["dnase", 3, 16], ["splice", 4]], xhead_bin=4).to(device).eval()
+    assert m.xheads["dnase"].bin == 1 and m.xheads["splice"].bin == 4
+    seq, seg, ctx, extra = batch_for(2, 1024, device)
+    with torch.no_grad():
+        m(seq, seg, ctx, extra)
+    assert m.last_x["dnase"].shape == (2, 64, 3) and m.last_x["splice"].shape == (2, 1024, 4)
+
+
+def test_binned_loss_and_eval_use_bin_means_of_the_per_base_targets():
+    from kron_dna import xheads as X
+    g = torch.Generator().manual_seed(0)
+    want = torch.randint(0, 256, (2, 64, 3), generator=g, dtype=torch.uint8)
+    ok = torch.ones(2, 64)
+    ok[0, 5] = 0                                                       # one base off: its whole bin is unsupervised
+    consts = (torch.full((3,), 3.0), torch.ones(3), torch.zeros(3, dtype=torch.bool))
+    pred = torch.randn(2, 4, 3, generator=g)
+    y, m = X.binned_targets(want, ok, consts, 16)
+    assert torch.allclose(y, X.targets_of(want, *consts).reshape(2, 4, 16, 3).mean(2))
+    assert m[0].tolist() == [0, 1, 1, 1] and m[1].tolist() == [1, 1, 1, 1]
+    want_loss = G.poisson_multinomial_loss(torch.nn.functional.softplus(pred), y, m.unsqueeze(-1))
+    assert torch.allclose(X.head_loss(pred, want, ok, consts, "tracks", 16), want_loss)
+    p_log, w_log = X.eval_pair(type("S", (), {"kind": "tracks"})(), pred, want, consts, 16)
+    assert p_log.shape == w_log.shape == (2, 4, 3)
+    assert torch.allclose(w_log, (want.float() / 255 * 3.0).reshape(2, 4, 16, 3).mean(2))
+    with pytest.raises(ValueError):
+        X.head_loss(pred, want, ok, (torch.ones(3),), "binary", 16)

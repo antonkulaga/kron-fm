@@ -22,14 +22,18 @@ class StubWithHeads(MGT.StubGenome):
 
     def __init__(self, config):
         super().__init__(config)
-        self.xheads = torch.nn.ModuleDict({n: torch.nn.Linear(4, k) for n, k in config.xheads})
+        self.xheads = torch.nn.ModuleDict({h[0]: torch.nn.Linear(4, h[1]) for h in config.xheads})
+        self.xhead_bin = {h[0]: (h[2] if len(h) > 2 else 1) for h in config.xheads}
         self.x_active, self.x_span, self.last_x, self.last_x_at = None, None, {}, (0, 0)
 
     def forward(self, seq, segments=None, context=None):
         h = self.emb(seq.long())
         lo, hi = (0, h.shape[1]) if self.x_span is None else self.x_span      # as KronGenome: the heads' stretch
         SPANS.append((self.training, lo, hi, h.shape[1]))
-        self.last_x = {n: m(h[:, lo:hi]) for n, m in self.xheads.items() if self.x_active is None or n in self.x_active}
+        def pooled(n):                                                     # as KronGenome: a binned head reads bin means
+            x, b = h[:, lo:hi], self.xhead_bin[n]
+            return x if b == 1 else x.reshape(x.shape[0], -1, b, x.shape[-1]).mean(2)
+        self.last_x = {n: m(pooled(n)) for n, m in self.xheads.items() if self.x_active is None or n in self.x_active}
         self.last_x_at = (lo, hi)
         return h, None, None
 
@@ -307,3 +311,24 @@ def test_another_head_kind_starts_from_init_and_never_on_a_plain_resume(genomes,
     assert "mlp heads are not loaded" in MGT.flat(res.output)
     end = torch.load(tmp_path / "kron" / "checkpoint.pt", map_location="cpu", weights_only=False)
     assert end["config"]["xhead_kind"] == "kron" and end["xstage"]["plan"]["heads"] == ["dnase", "splice"]
+
+
+def test_a_binned_head_trains_on_bin_means_and_its_bin_is_fixed_for_life(genomes, tmp_path, monkeypatch):
+    """--xhead-bin dnase=128: the head predicts per 128 bases, its loss and its held-out Pearson run on bins; a resume
+    that changes the bin is refused; a binary head cannot be binned."""
+    root, parent, store, child = setup(genomes, tmp_path, monkeypatch)
+    out = tmp_path / "child"
+    res, _ = run(cli, monkeypatch, root, out, child + ["--xhead-bin", "dnase=128", "--stop-step", "8"])
+    assert res.exit_code == 0, res.output + repr(res.exception)
+    mid = torch.load(out / "checkpoint.pt", map_location="cpu", weights_only=False)
+    assert mid["config"]["xheads"] == [["dnase", 3, 128], ["splice", 2]]
+    d = pl.read_csv(out / "xheads.csv").filter(pl.col("head") == "dnase")
+    loss = d["train_loss"].cast(pl.Float64, strict=False).drop_nulls()
+    assert loss.len() > 0 and loss.is_finite().all() and (d["heldout_n"].cast(pl.Int64, strict=False) > 0).any()
+    again = [a for a in child if a not in ("--init", str(parent / "checkpoint.pt"), "--start-step", "4")]
+    res, _ = run(cli, monkeypatch, root, out, again)                              # without the bin
+    assert res.exit_code != 0 and "other outputs or bins" in MGT.flat(res.output + repr(res.exception))
+    res, _ = run(cli, monkeypatch, root, out, again + ["--xhead-bin", "dnase=128"])
+    assert res.exit_code == 0, res.output + repr(res.exception)
+    res, _ = run(cli, monkeypatch, root, tmp_path / "bad", child + ["--xhead-bin", "nohead=128"])
+    assert res.exit_code != 0 and "--xhead-bin" in MGT.flat(res.output + repr(res.exception))
