@@ -132,7 +132,8 @@ def pearson_stats(pred: torch.Tensor, want: torch.Tensor, bin: int = 128) -> tor
     keep = n - n % bin
     x = pred[:keep].double().reshape(-1, bin, t).mean(1)
     y = want[:keep].double().reshape(-1, bin, t).mean(1)
-    return torch.stack([torch.full((t,), float(x.shape[0]), dtype=torch.float64), x.sum(0), y.sum(0), (x * y).sum(0),
+    return torch.stack([torch.full((t,), float(x.shape[0]), dtype=torch.float64, device=x.device), x.sum(0), y.sum(0),
+                        (x * y).sum(0),
                         (x * x).sum(0), (y * y).sum(0)]).cpu()
 
 
@@ -257,18 +258,26 @@ def run(checkpoint: Path, out: Path, tracks: Path, labels: Path, name: str = "hg
     x0, (w0, s0) = features(probe_starts), targets(probe_starts)
     ok0 = X.supervised(s0, center).to(dev)
     def alone(v: str) -> dict:
-        """Three training steps of variant ``v`` alone on one batch: its seconds per step and peak memory."""
+        """Training steps of variant ``v`` alone on one batch: its peak memory over all of them, and its seconds per
+        step over the last three; the first step is a warm-up, since it holds kernel compilation and autotuning."""
         twin = nn.ModuleDict({k: make_head(v, width, len(st.ids)) for k, st in stores.items()}).to(dev)
         o = torch.optim.AdamW(twin.parameters(), lr=0.0)
         if dev.type == "cuda":
             torch.cuda.synchronize()
             torch.cuda.reset_peak_memory_stats(dev)
             before = torch.cuda.memory_allocated(dev)
-        t0 = time.time()
-        for _ in range(3):
+
+        def step() -> None:
             o.zero_grad()
             sum(X.head_loss(twin[k](x0).transpose(1, 2), w0[k], ok0, consts[k], stores[k].kind) for k in stores).backward()
             o.step()
+
+        step()
+        if dev.type == "cuda":
+            torch.cuda.synchronize()
+        t0 = time.time()
+        for _ in range(3):
+            step()
         if dev.type == "cuda":
             torch.cuda.synchronize()
         got = dict(seconds_per_step=(time.time() - t0) / 3,
