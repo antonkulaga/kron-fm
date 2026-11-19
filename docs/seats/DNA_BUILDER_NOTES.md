@@ -137,6 +137,15 @@ cores, each store assembled by one job after them (`afterany`; it converts what 
 and 2 passes are done over the 13,275 held-out variants (unanswered: 1-3.5 % per score for v2, 0.3-2 % for v1,
 counted not dropped); no score read, per `PREREG.md`.
 
+**19 Nov, 06:15: the head comparison is final** (6522985, 27,819 steps, 4.0 h; `head-compare/E400k-v2/results.json`).
+Held-out DNase r / splice AP, difference to MLP 128 with 95 % window-bootstrap intervals: KronLSTM 1 layer 0.639 /
+0.384 (+0.074 [0.061, 0.088] / +0.058 [0.045, 0.074]); 2 layers 0.642 / 0.384 (+0.077 / +0.057); 256 wide over
+128-base steps 0.638 / 0.332 (splice gain gone); conv 9 0.584 / 0.378; MLP 3 layers 0.580 / 0.344; KAN 0.575 / 0.337;
+MLP 512 0.569 / 0.338; MLP 128 0.565 / 0.327; linear 0.475 / 0.253. One and two KronLSTM layers tie; I recommended
+one (less memory and time) to the trainer, who restarts A then E with `--xhead-kind kron`. The conversion jobs on the
+uncapped account have not started (no job of that account runs; one moved to another partition pends too); asked
+the rigger seat for a route, waiting meanwhile.
+
 ## Items
 
 | item | state |
