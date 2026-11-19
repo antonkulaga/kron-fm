@@ -72,9 +72,12 @@ class PlainKronMixer(nn.Module):
         beta = layer.b_proj(x).sigmoid() if layer.use_beta else x.new_ones(batch, steps, heads)
         g = F.softplus(layer.f_proj(x).float() + layer.dt_bias)
         if layer.decay_gate == "vector":
-            g = -layer.A_log.float().exp().unsqueeze(-1) * g.reshape(batch, steps, heads, kd)
+            # reshape with sizes, not unsqueeze(-1): the TorchScript exporter gave that unsqueeze the wrong axis
+            # (2 for a 1-D A_log) inside the KronGenome graph, which ONNX Runtime then refused to load
+            a_log = layer.A_log.float()
+            g = -a_log.exp().reshape(*(int(s) for s in a_log.shape), 1) * g.reshape(batch, steps, heads, kd)
         else:
-            g = (-layer.A_log.float().exp() * g).unsqueeze(-1)
+            g = (-layer.A_log.float().exp() * g).unsqueeze(3)                  # (B, T, H, 1)
         target_gate = layer.c_proj(x).float().sigmoid() if layer.use_target_gate else None
         if layer.decouple_erase and target_gate is None:
             raise ValueError("decouple_erase needs the target gate")
@@ -186,17 +189,19 @@ class ChunkedKronMixer(PlainKronMixer):
         a, b = chunks(a), chunks(b)                                          # (B, H, N, C)
         G = g.cumsum(3)                                                     # (B, H, N, C, Kg)
         upper = torch.ones(c, c, dtype=torch.bool, device=x.device).triu(1)
-        diff = (G.unsqueeze(4) - G.unsqueeze(3)).masked_fill(upper.unsqueeze(-1), float("-inf"))
+        # positive dims throughout: with a second KronLSTM model in one graph the TorchScript exporter resolved a
+        # negative dim against a stale rank (transpose(-1, -2) of a 5-D tensor became the permutation 0 3 2 1 4)
+        diff = (G.unsqueeze(4) - G.unsqueeze(3)).masked_fill(upper.unsqueeze(2), float("-inf"))
         decay = diff.exp()                                                  # Gamma_{s->t}, zero for s > t
         if decay.size(-1) == 1:
-            kk = (k @ k.transpose(-1, -2)) * decay[..., 0]
-            qk = (q @ k.transpose(-1, -2)) * decay[..., 0]
+            kk = (k @ k.transpose(3, 4)) * decay.select(5, 0)
+            qk = (q @ k.transpose(3, 4)) * decay.select(5, 0)
         else:
             kk = torch.einsum("bhntd,bhnsd,bhntsd->bhnts", k, k, decay)
             qk = torch.einsum("bhntd,bhnsd,bhntsd->bhnts", q, k, decay)
         strict = upper.transpose(0, 1)                                      # s < t
-        m = kk * (v @ v.transpose(-1, -2)) * strict
-        nil = -b.unsqueeze(-1) * m                                          # strictly lower, nilpotent
+        m = kk * (v @ v.transpose(3, 4)) * strict
+        nil = -b.unsqueeze(4) * m                                          # strictly lower, nilpotent
         eye = torch.eye(c, dtype=nil.dtype, device=x.device)
         inverse, power = eye + nil, nil
         for _ in range(c.bit_length() - 2):                                 # (I-N)^-1 = prod (I + N^(2^j))
@@ -207,11 +212,12 @@ class ChunkedKronMixer(PlainKronMixer):
         for i in range(n):
             gi, ki, vi = G[:, :, i], k[:, :, i], v[:, :, i]
             y0 = torch.einsum("bhck,bhkv,bhcv->bhc", ki * gi.exp(), state, vi)
-            u = (inverse[:, :, i] @ (a[:, :, i] - b[:, :, i] * y0).unsqueeze(-1)).squeeze(-1)
-            o = (q[:, :, i] * gi.exp()) @ state + (qk[:, :, i] * u.unsqueeze(-2)) @ vi
-            last = gi[:, :, -1:]                                            # (B, H, 1, Kg)
-            written = ki * (last - gi).exp() * u.unsqueeze(-1)              # (B, H, C, K)
-            state = last.transpose(-1, -2).exp() * state + written.transpose(-1, -2) @ vi
+            u = (inverse[:, :, i] @ (a[:, :, i] - b[:, :, i] * y0).unsqueeze(3)).squeeze(3)
+            o = (q[:, :, i] * gi.exp()) @ state + (qk[:, :, i] * u.unsqueeze(2)) @ vi
+            last = gi[:, :, c - 1:c]                                        # (B, H, 1, Kg); a negative start
+            # exported as a Slice without axes (it cut the batch dim) inside the KronGenome graph
+            written = ki * (last - gi).exp() * u.unsqueeze(3)              # (B, H, C, K)
+            state = last.transpose(2, 3).exp() * state + written.transpose(2, 3) @ vi
             outs.append(o)
         o = torch.stack(outs, dim=2).reshape(-1, layer.num_heads, n * c, layer.v_head_dim)[:, :, :steps]
         return self.output(o.transpose(1, 2).to(x.dtype), x), state, conv

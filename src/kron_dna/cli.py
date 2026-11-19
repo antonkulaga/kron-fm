@@ -3077,5 +3077,25 @@ def export_onnx_cmd(run: Path = typer.Argument(..., help="a `kron-dna train` run
     typer.echo(json.dumps(meta["verification"], indent=2))
 
 
+@app.command("export-genome-onnx")
+def export_genome_onnx_cmd(run: Path = typer.Argument(..., help="a `genome-train` run directory or checkpoint"),
+                           out: Path | None = typer.Option(None, help="output directory (default: <run>/onnx-<window>)"),
+                           window: int = typer.Option(131072, help="bases the graph reads per row (a multiple of the "
+                                                                   "core step); the recurrence is unrolled, so the "
+                                                                   "graph and the export time grow with it"),
+                           opset: int = typer.Option(18, help="ONNX opset"),
+                           ntv3: bool = typer.Option(True, help="include the NTv3 tracks output"),
+                           check_kernels: bool = typer.Option(True, help="compare with the Triton kernels when CUDA "
+                                                                         "is present")) -> None:
+    """Export a KronGenome checkpoint to ONNX (base logits, NTv3 tracks, further heads) and check ONNX Runtime
+    against PyTorch; see kron_dna.genome_onnx."""
+    from kron_dna.genome_onnx import export_genome_onnx
+
+    out = out or (run if run.is_dir() else run.parent) / f"onnx-{window}"
+    meta = export_genome_onnx(run, out, window=window, opset=opset, check_kernels=check_kernels, with_ntv3=ntv3)
+    typer.echo(f"wrote {out / meta['graph']} ({meta['bytes'] / 1e6:,.1f} MB, {meta['export_seconds']} s)")
+    typer.echo(json.dumps(meta["verification"], indent=2))
+
+
 if __name__ == "__main__":
     app()
