@@ -134,3 +134,62 @@ def test_a_binned_head_reads_the_mean_state_of_each_bin(device, monkeypatch, arc
 def test_a_bin_must_be_a_power_of_two_within_the_core_step(bad):
     with pytest.raises(ValueError):                                  # small(): n_down 4, so bins up to 16
         with_heads(small("v2"), [["x", 2, bad]])
+
+
+# ---------------------------------------------------------------------------------------- KronLSTM heads (kind kron)
+
+def kron_heads(parent: G.KronGenome, heads: list, **kw) -> G.KronGenome:
+    """``parent`` with KronLSTM heads; small() has n_down 4, so a step of 4 bases fits a 16-base core step."""
+    cfg = G.KronGenomeConfig(**{**parent.config.to_dict(), "xheads": heads, "xhead_kind": "kron", "xhead_bin": 4,
+                                "xhead_width": 64, **kw})
+    torch.manual_seed(1)
+    return G.KronGenome(cfg)
+
+
+@pytest.mark.parametrize("layers", [1, 2])
+def test_kron_heads_predict_per_base_and_learn_with_the_trunk(device, layers):
+    parent = small("v2")
+    m = kron_heads(parent, [["dnase", 13], ["splice", 4]], xhead_layers=layers).to(device).train()
+    missing, unexpected = m.load_state_dict(parent.state_dict(), strict=False)
+    assert not unexpected and all(k.startswith("xheads.") for k in missing)
+    assert len(m.xheads["dnase"].blocks) == layers
+    seq, seg, ctx, extra = batch_for(2, 1024, device)
+    m(seq, seg, ctx, extra)
+    assert m.last_x["dnase"].shape == (2, 1024, 13) and m.last_x["splice"].shape == (2, 1024, 4)
+    (m.last_x["dnase"].sum() + m.last_x["splice"].sum()).backward()
+    # A_log only on the card: the CPU stand-in for the KronLSTM layer does not use it (the trunk's alike)
+    used = [p for n, p in m.xheads.named_parameters() if device.type == "cuda" or not n.endswith("A_log")]
+    assert all(p.grad is not None and torch.isfinite(p.grad).all() for p in used)
+    assert m.stem.weight.grad is not None and float(m.stem.weight.grad.abs().sum()) > 0
+    again = G.KronGenome(G.KronGenomeConfig(**m.config.to_dict()))
+    again.load_state_dict(m.state_dict())                            # the config rebuilds the same kron heads
+
+
+def test_kron_heads_read_context_beyond_one_step_and_run_on_the_span(device):
+    m = kron_heads(small("v2"), [["dnase", 3]]).to(device).eval()
+    seq, seg, ctx, extra = batch_for(1, 1024, device)
+    with torch.no_grad():
+        m(seq, seg, ctx, extra)
+        base = m.last_x["dnase"].clone()
+        far = seq.clone()
+        far[:, 900:] = (far[:, 900:] + 1) % 4                       # bases far from the first step change
+        m(far, seg, ctx, extra)
+    # the per-position MLP head sees only its own decoder state; the KronLSTM head reads along the stretch, so its
+    # first step can change although its own states hardly do (the trunk's own reach is the same for both kinds)
+    assert not torch.equal(base[:, :4], m.last_x["dnase"][:, :4])
+    m.x_span = (256, 768)
+    with torch.no_grad():
+        m(seq, seg, ctx, extra)
+    assert m.last_x["dnase"].shape == (1, 512, 3) and m.last_x_at == (256, 768)
+    m.x_span = (512, 512)                                            # an empty span: an empty output of the right width
+    with torch.no_grad():
+        m(seq, seg, ctx, extra)
+    assert m.last_x["dnase"].shape == (1, 0, 3)
+
+
+@pytest.mark.parametrize("kw", [dict(xhead_bin=3), dict(xhead_bin=32), dict(xhead_layers=0), dict(xhead_width=32), dict(xhead_kind="kan")])
+def test_kron_head_settings_are_checked(kw):
+    with pytest.raises(ValueError):
+        kron_heads(small("v2"), [["x", 2]], **kw)
+    with pytest.raises(ValueError):                                  # a bin of 8 times a step of 4 exceeds 16 bases
+        kron_heads(small("v2"), [["x", 2, 8]])

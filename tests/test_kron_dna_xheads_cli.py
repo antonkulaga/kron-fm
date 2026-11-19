@@ -288,3 +288,22 @@ def test_a_head_is_added_on_a_plain_resume(genomes, tmp_path, monkeypatch):
     swapped = again[:k - 1] + again[k + 1:] + ["--xhead", f"splice:{d}", "--xhead", f"dnase:{store}"]
     res, _ = run(cli, monkeypatch, root, out, swapped)
     assert res.exit_code != 0 and "must come first" in MGT.flat(res.output + repr(res.exception))
+
+
+def test_another_head_kind_starts_from_init_and_never_on_a_plain_resume(genomes, tmp_path, monkeypatch):
+    """--xhead-kind kron on a checkpoint whose heads are MLPs: --init drops their weights (the new heads start
+    untrained, the trunk is the checkpoint's); a plain resume refuses, since the stage's heads would change kind."""
+    root, parent, store, child = setup(genomes, tmp_path, monkeypatch)
+    out = tmp_path / "child"
+    res, _ = run(cli, monkeypatch, root, out, child + ["--stop-step", "8"])
+    assert res.exit_code == 0, res.output + repr(res.exception)
+    again = [a for a in child if a not in ("--init", str(parent / "checkpoint.pt"), "--start-step", "4")]
+    res, _ = run(cli, monkeypatch, root, out, again + ["--xhead-kind", "kron"])
+    assert res.exit_code != 0 and "of kind mlp" in MGT.flat(res.output + repr(res.exception))
+    k = child.index("--init")
+    switched = child[:k + 1] + [str(out / "checkpoint.pt"), "--start-step", "8"] + child[k + 4:] + ["--xhead-kind", "kron"]
+    res, _ = run(cli, monkeypatch, root, tmp_path / "kron", switched)
+    assert res.exit_code == 0, res.output + repr(res.exception)
+    assert "mlp heads are not loaded" in MGT.flat(res.output)
+    end = torch.load(tmp_path / "kron" / "checkpoint.pt", map_location="cpu", weights_only=False)
+    assert end["config"]["xhead_kind"] == "kron" and end["xstage"]["plan"]["heads"] == ["dnase", "splice"]

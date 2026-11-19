@@ -121,6 +121,22 @@ span cut, my estimate: about 1 GiB per card for 196 per-base outputs, so A and E
 bench has room; otherwise it waits for binned heads. The head comparison job 6517859 has been held by the group's
 CPU cap since the E probe ended at 00:03, with the card idle.
 
+**19 Nov, about 03:00.** The head comparison's first run (6517859) died at its first evaluation on a device bug of
+mine (fixed `9bed2b4`; CPU tests miss CUDA-only faults, so the job script now runs a 2-step smoke run with one
+evaluation first). The rerun, 6522985, runs from about 02:00 into `$SCRATCH/kron-dna-build/head-compare/E400k-v2/`.
+At step 8000 of about 29,000: KronLSTM heads lead on both tasks (DNase r 0.620, splice AP 0.369 for one layer;
+0.621 and 0.365 for two) against the current MLP 128 (0.560, 0.310), conv 9 next (0.577, 0.357). Measured memory
+above the features at batch 2 x 131 kb: KronLSTM 2.46 GiB (1 layer) and 2.71 (2 layers), MLP 128 2.06, KAN 6.25.
+Anton, 19 Nov: "let's put KronLSTM heads if they are the best" and "we also have to extend training set with
+whatever we downloaded and processed"; he reads two layers as the better one so far, "but maybe further evaluation
+will change". So: B12 below, built while the comparison finishes; the layer count is a setting, chosen from the
+final table. Data: the 196-track DNase conversion and a new stranded RNA-seq selection (one experiment per
+biosample with exactly one plus and one minus file: 231 biosamples, 462 channels as `<experiment>_P/_M`, 78.8 GB;
+`$SCRATCH/kron-dna-build/tracks/rnaseq-stranded-v1/`) run as kill-safe `--convert-only` jobs, four and six of 4
+cores, each store assembled by one job after them (`afterany`; it converts what a killed job left). AlphaGenome 1
+and 2 passes are done over the 13,275 held-out variants (unanswered: 1-3.5 % per score for v2, 0.3-2 % for v1,
+counted not dropped); no score read, per `PREREG.md`.
+
 ## Items
 
 | item | state |
@@ -135,6 +151,7 @@ CPU cap since the E probe ended at 00:03, with the card idle.
 | B6 DNase pilot track store (new versioned path, never over the prepared hg38) | done 18 Nov: one CPU job, 2 cores, 9 min 19 s (a second queued copy cancelled unstarted). `$KRON_FM_DATA/interim/tracks/hg38/dnase-pilot-v1/` (`dense.u8` 38.2 GB, 13 channels, `dense.json`). Checks below |
 | B7 Extra track head + phases, per-group LR, per-head counters in the checkpoint | done on CPU, `58a25de` on top of trainer main `7fdd30a`: `genome-train --xhead NAME:STORE` (or `NAME:N`), `--xhead-only`, `--xhead-lr`, `--inherit-lr`, warmups; `src/kron_dna/xheads.py`; tests `test_kron_dna_xheads{,_stage,_cli}.py`. Rates scale `genome_lr` (agreed with the trainer). Head-only keeps the inherited rate at 0 (weights stand still; AdamW's moments for them do warm up, by design). Not yet done: the CUDA test cases and the 1 Mb memory check, which need a card (F peaks at 34.2 and 31.7 GiB per card of a 37.5 limit; a 13-output head with a 512-wide hidden layer at 1 Mb is the open risk, `--head-hidden` is shared with the inherited heads so it cannot be lowered for the new one alone) |
 | B8 Splice head | labels done 18 Nov: `scripts/kron_dna/prep_splice_labels.py` wrote `$KRON_FM_DATA/interim/tracks/hg38/splice-sites-v1/` (`splice.u8`, four bits: donor +, acceptor +, donor -, acceptor -; one base each, the intron's first base for a donor and its last for an acceptor in the transcript's direction; GENCODE v50 basic). 504,780 of 504,846 introns placed, 734,330 distinct sites. Motif check from `bases.u8`: donors GT 0.972 + GC 0.019 on +, 0.971 + 0.019 on -; acceptors AG 0.991 and 0.990. The prepared genome's own `labels.u8` definition (unstranded, two bases) is untouched and stays the baseline. Head done on CPU 18 Nov: `xheads.LabelStore` and a binary kind (BCE, positive weight sqrt(neg/pos) capped at 100, strand bits exchanged under `--rc`, the training split's code 1 as for the tracks); `--xhead splice:<dir>` picks the kind from the folder; the held-out score is average precision per channel on chr8/chr9 (`xheads.csv`, column `heldout_metric`). Tests in `test_kron_dna_xheads_stage.py` and `_cli.py`. Not on main yet: it is on the branch after the commit the trainer merged, so it goes into a restart only if the trainer takes it and its bench passes. Still to do: near-splice ClinVar from this head against the distance baseline (a splice-delta score from the new head) |
+| B12 KronLSTM heads in training | Anton's word, 19 Nov. `genome-train --xhead-kind kron` (`--xhead-layers`, default 2; `--xhead-step-bases` 32; `--xhead-width` 128): each further head a per-base readout plus bidirectional KronLSTM layers over 32-base means of the decoder states (`genome.KronHead`, the comparison's head). Its context is the stretch it runs on: the supervised span in training, each card's piece on a split arm. An arm switches by a new run directory with `--init` (the checkpoint's MLP heads are not loaded; a fresh head-only stage), never by a plain resume (refused). CPU-tested; next: the CUDA cases and a 1 Mb bench by the trainer, then the restarts with the new stores as further heads |
 | B9 Teacher outputs (AlphaGenome 2 API terms; NTv3_tracks licence is Anton's call) | not started; measured data goes first |
 
 ## B1/B2 — the ClinVar cohort, 18 Nov

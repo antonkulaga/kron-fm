@@ -868,6 +868,12 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                  xhead_hidden: int = typer.Option(0, help="hidden width of the --xhead heads (0: as the other heads, "
                                                   "2 x stem channels); lower it when a 1 Mb window runs out of "
                                                   "memory"),
+                 xhead_kind: str = typer.Option("mlp", help="the --xhead heads' kind: mlp (per position) or kron "
+                                                "(a per-base readout plus bidirectional KronLSTM layers over "
+                                                "--xhead-step-bases means; context is the supervised span)"),
+                 xhead_layers: int = typer.Option(2, help="with --xhead-kind kron: KronLSTM layers per head"),
+                 xhead_step_bases: int = typer.Option(32, help="with --xhead-kind kron: bases per KronLSTM step"),
+                 xhead_width: int = typer.Option(128, help="with --xhead-kind kron: the heads' KronLSTM width"),
                  xhead_only: int = typer.Option(200, help="with --xhead: labelled updates of the first head before "
                                                 "the inherited weights train too (their rate is 0 until then)"),
                  xhead_lr: float = typer.Option(4e-4, help="peak rate of each --xhead, reached over --xhead-warmup "
@@ -1769,6 +1775,8 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                                  f"{G.N_CONTEXTS_ORGANELLE}")
     config = G.KronGenomeConfig(d_model=d_model, n_layers=n_layers, stem_channels=stem_channels, n_down=n_down,
                                 xheads=[[n_x, k_x] for n_x, k_x in xhead_sizes.items()], xhead_hidden=xhead_hidden,
+                                xhead_kind=xhead_kind, xhead_layers=xhead_layers, xhead_bin=xhead_step_bases,
+                                xhead_width=xhead_width,
                                 n_tracks=len(G.TRACKS) if labels else 0, arch=arch, head_hidden=head_hidden,
                                 n_contexts=n_contexts, n_in_extra=n_in_extra, jepa=jepa_weight > 0,
                                 n_epigenomes=n_epi if epigenome_weight > 0 else 0, chunk_ratio=chunk_ratio,
@@ -1882,6 +1890,11 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
     step, hours = 0, 0.0
     if ckpt.exists() and not bench:
         state = torch.load(ckpt, map_location="cpu")
+        kind_saved = (state.get("config") or {}).get("xhead_kind", "mlp")
+        if xhead and kind_saved != xhead_kind:
+            raise typer.BadParameter(f"refusing to resume {ckpt}: its --xhead heads are of kind {kind_saved}, this "
+                                     f"run asks {xhead_kind}; start a new run directory with --init (the heads then "
+                                     "start untrained, every other weight is the checkpoint's)")
         if state.get("run_record") is not None:
             diffs = RR.identity_differences(state["run_record"], record)
         else:                         # older code: the multi-genome branch stored only the further genomes
@@ -1946,6 +1959,13 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
         # reserved room (stem input channels, context rows) is zero-padded explicitly, function-preserving; new
         # heads stay missing (strict=False) as before, and any other shape mismatch still raises
         init_state = torch.load(init, map_location="cpu")
+        kind_init = (init_state.get("config") or {}).get("xhead_kind", "mlp")
+        if kind_init != config.xhead_kind:            # another kind of head: none of its weights is this run's
+            dropped_x = [k_ for k_ in init_state["model"] if k_.startswith("xheads.")]
+            init_state["model"] = {k_: v_ for k_, v_ in init_state["model"].items() if not k_.startswith("xheads.")}
+            if dropped_x:
+                say(f"--xhead: the checkpoint's {kind_init} heads are not loaded ({len(dropped_x)} tensors); "
+                    f"the {config.xhead_kind} heads start untrained")
         grown, notes = G.expand_state_dict(init_state["model"], model, new_contexts=new_contexts)
         missing, unexpected = model.load_state_dict(grown, strict=False)
         say(f"initialised from {init}; new: {missing}; dropped: {unexpected}; padded: {notes or 'nothing'}")

@@ -95,6 +95,11 @@ class KronGenomeConfig:
                                 # A head added to a trained model is new parameters only; the inherited heads keep
                                 # their keys, shapes and outputs
     xhead_hidden: int = 0       # hidden width of the further heads (0: as the other MLP heads), their memory knob
+    xhead_kind: str = "mlp"     # the further heads' kind: "mlp" (MLPHead, per position) or "kron" (KronHead: a
+                                # per-base readout plus bidirectional KronLSTM layers over xhead_bin-base means)
+    xhead_layers: int = 2       # kron: KronLSTM layers per head
+    xhead_bin: int = 32         # kron: bases per step of the heads' KronLSTM
+    xhead_width: int = 128      # kron: the heads' KronLSTM width
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -249,6 +254,33 @@ class MLPHead(nn.Module):
         return self.fc2(F.gelu(self.fc1(self.norm(x))))
 
 
+class KronHead(nn.Module):
+    """A per-base linear readout plus ``layers`` bidirectional KronLSTM layers over ``bin``-base means of the states
+    (each row its own document), whose outputs are added back at every base of their bin. Its context is the stretch
+    it is given: in training the supervised span, in a split forward each card's piece."""
+
+    def __init__(self, c: int, t: int, bin: int = 32, d: int = 128, layers: int = 2) -> None:
+        super().__init__()
+        self.bin, self.n_out = bin, t
+        self.norm, self.local, self.down = ChannelRMSNorm(c), nn.Conv1d(c, t, 1), nn.Conv1d(c, d, 1)
+        self.blocks = nn.ModuleList(BiKronLSTMBlock(d, 4, 2 * d, 0.0, i) for i in range(layers))
+        self.out = nn.Conv1d(d, t, 1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        z = self.norm(x)
+        p = F.avg_pool1d(self.down(z), self.bin)                       # [B, d, n]
+        b, d, n = p.shape
+        if n == 0:                                                     # shorter than one step: the readout alone
+            return self.local(z)
+        cu = torch.arange(0, b * n + 1, n, device=x.device, dtype=torch.int32)
+        h = p.transpose(1, 2).reshape(1, b * n, d)
+        for block in self.blocks:
+            h = block(h, cu)
+        h = h.reshape(b, n, d).transpose(1, 2)
+        wide = torch.repeat_interleave(self.out(h), self.bin, dim=-1)
+        return self.local(z) + F.pad(wide, (0, x.shape[-1] - wide.shape[-1]))
+
+
 class KronGenome(nn.Module):
     """``[B, L]`` bases (L a multiple of ``2**n_down``) -> ``[B, L, 4]`` masked-base logits, the core states and, with
     ``n_tracks``, ``[B, L, n_tracks]`` track logits (else None).
@@ -345,8 +377,20 @@ class KronGenome(nn.Module):
         for n, _, b in rows:
             if b < 1 or b & (b - 1) or b > 2 ** c.n_down:
                 raise ValueError(f"xhead {n}: bin {b} must be a power of two up to {2 ** c.n_down}")
-        hidden = c.xhead_hidden or c.head_hidden or 2 * width
-        self.xheads = nn.ModuleDict({n: MLPHead(width, hidden, k) for n, k, _ in rows})
+        if c.xhead_kind == "mlp":
+            hidden = c.xhead_hidden or c.head_hidden or 2 * width
+            self.xheads = nn.ModuleDict({n: MLPHead(width, hidden, k) for n, k, _ in rows})
+        elif c.xhead_kind == "kron":
+            kb = c.xhead_bin
+            if kb < 1 or kb & (kb - 1) or c.xhead_layers < 1 or c.xhead_width % 4 or not 64 <= c.xhead_width <= 1024:
+                raise ValueError(f"kron xheads: step {kb} must be a power of two, layers {c.xhead_layers} at least 1, "
+                                 f"width {c.xhead_width} a multiple of 4 in [64, 1024] (4 KronLSTM heads of 16-256)")
+            for n, _, b in rows:                      # a span is a multiple of 2**n_down: whole steps in every bin
+                if b * kb > 2 ** c.n_down:
+                    raise ValueError(f"xhead {n}: bin {b} x KronLSTM step {kb} exceeds {2 ** c.n_down} bases")
+            self.xheads = nn.ModuleDict({n: KronHead(width, k, kb, c.xhead_width, c.xhead_layers) for n, k, _ in rows})
+        else:
+            raise ValueError(f"xhead_kind must be mlp or kron, got {c.xhead_kind!r}")
         self.xhead_bin = {n: b for n, _, b in rows}
         self.x_active: set[str] | None = None
         self.x_span: tuple[int, int] | None = None    # window bases the heads run on (not saved; a multiple of
@@ -372,7 +416,7 @@ class KronGenome(nn.Module):
                 continue
             b = self.xhead_bin[n]
             if hi == lo:                                  # nothing of the span in this stretch
-                out[n] = x.new_zeros(x.shape[0], 0, h.fc2.out_channels)
+                out[n] = x.new_zeros(x.shape[0], 0, h.n_out if isinstance(h, KronHead) else h.fc2.out_channels)
                 continue
             if b not in pooled:
                 pooled[b] = F.avg_pool1d(x, b)

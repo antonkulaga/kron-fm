@@ -69,30 +69,7 @@ class KANLayer(nn.Module):
         return self.mix(phi) + self.base(F.silu(x))
 
 
-class KronHead(nn.Module):
-    """A per-base linear readout plus one bidirectional KronLSTM layer over ``bin``-base means of the states (each
-    window its own document), whose outputs are added back at every base of the bin."""
-
-    def __init__(self, c: int, t: int, bin: int = 32, d: int = 128, layers: int = 1) -> None:
-        super().__init__()
-        from kron_core.bidirectional import BiKronLSTMBlock
-
-        self.bin = bin
-        self.norm, self.local, self.down = G.ChannelRMSNorm(c), nn.Conv1d(c, t, 1), nn.Conv1d(c, d, 1)
-        self.blocks = nn.ModuleList(BiKronLSTMBlock(d, 4, 2 * d, 0.0, i) for i in range(layers))
-        self.out = nn.Conv1d(d, t, 1)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        z = self.norm(x)
-        p = F.avg_pool1d(self.down(z), self.bin)                       # [B, d, n]
-        b, d, n = p.shape
-        cu = torch.arange(0, b * n + 1, n, device=x.device, dtype=torch.int32)
-        h = p.transpose(1, 2).reshape(1, b * n, d)
-        for block in self.blocks:
-            h = block(h, cu)
-        h = h.reshape(b, n, d).transpose(1, 2)
-        wide = torch.repeat_interleave(self.out(h), self.bin, dim=-1)
-        return self.local(z) + F.pad(wide, (0, x.shape[-1] - wide.shape[-1]))
+KronHead = G.KronHead                     # the comparison's KronLSTM head, now the model's own kind
 
 
 def make_head(kind: str, c: int, t: int) -> nn.Module:
