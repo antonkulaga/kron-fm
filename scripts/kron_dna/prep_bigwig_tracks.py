@@ -126,7 +126,7 @@ def main(select: Path, bigwigs: Path, out: Path, name: str = "hg38", provenance:
     ids = [r.get("channel") or r["file"] for r in sel]
     assert len(set(files)) == len(files), "a file is listed twice"
     assert len(set(ids)) == len(ids), "a channel id is listed twice"
-    for i in ids:
+    for i in ids if not convert_only else []:         # a part of the list may hold one strand of a pair
         if i.endswith(("_P", "_M")) and i[:-1] + ("M" if i.endswith("_P") else "P") not in ids:
             raise typer.BadParameter(f"stranded channel {i} has no partner")
     stranded = any(i.endswith(("_P", "_M")) for i in ids)
