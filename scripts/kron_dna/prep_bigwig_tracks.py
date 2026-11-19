@@ -148,28 +148,43 @@ def main(select: Path, bigwigs: Path, out: Path, name: str = "hg38", provenance:
     src = [np.memmap(out / "tracks" / f"{i}.u8", dtype=np.uint8, mode="r") for i in files]
     dense_path = out / "dense.u8"
     if not (dense_path.exists() and dense_path.stat().st_size == total * T):
-        dst = np.memmap(str(dense_path) + PART, dtype=np.uint8, mode="w+", shape=(total, T))
+        # resumable: one fixed temporary file, flushed block by block, and a marker of the blocks done, so a run
+        # killed at a time limit is continued by the next (a block written but not yet marked is written again)
+        part, mark = Path(str(dense_path) + ".part"), Path(str(dense_path) + ".part.blocks")
         step = 1 << 25
-        for a in range(0, total, step):
+        start = int(mark.read_text()) if part.exists() and mark.exists() else 0
+        if start and part.stat().st_size != total * T:
+            start = 0
+        dst = np.memmap(part, dtype=np.uint8, mode="r+" if start else "w+", shape=(total, T))
+        if start:
+            typer.echo(f"continuing the store at block {start} of {-(-total // step)}")
+        for i, a in enumerate(range(0, total, step)):
+            if i < start:
+                continue
             b = min(a + step, total)
             blk = np.empty((b - a, T), dtype=np.uint8)
             for k, s_ in enumerate(src):
                 blk[:, k] = s_[a:b]
             dst[a:b] = blk
-        dst.flush()
+            dst.flush()
+            Path(str(mark) + PART).write_text(str(i + 1))
+            os.replace(str(mark) + PART, mark)
         del dst
-        os.replace(str(dense_path) + PART, dense_path)
+        os.replace(part, dense_path)
+        mark.unlink(missing_ok=True)
     dense = np.memmap(dense_path, dtype=np.uint8, mode="r", shape=(total, T))
     scales = np.array([infos[i]["log1p_scale"] for i in files])
 
-    # non-zero mean of the decoded signal on the genome's training split, 1 base in 64 (as the NTv3 store)
+    # non-zero mean of the decoded signal on the genome's training split, over 1 run of 4,096 bases in 64 (a run,
+    # not a base: a strided read of single bases touches every page of a store this wide)
     split = np.memmap(genome / "ntv3" / "split.u8", dtype=np.uint8, mode="r")
     tot, cnt = np.zeros(T), np.zeros(T)
-    for a in range(0, total, 1 << 25):
-        b = min(a + (1 << 25), total)
-        m = np.asarray(split[a:b:64]) == 1
+    run = 4096
+    for a in range(0, total, run * 64):
+        b = min(a + run, total)
+        m = np.asarray(split[a:b]) == 1
         if m.any():
-            q = np.asarray(dense[a:b:64])[m].astype(np.float64)
+            q = np.asarray(dense[a:b])[m].astype(np.float64)
             nz = q > 0
             tot += np.where(nz, np.expm1(q / 255.0 * scales), 0).sum(0)
             cnt += nz.sum(0)
@@ -198,6 +213,7 @@ def main(select: Path, bigwigs: Path, out: Path, name: str = "hg38", provenance:
 
     meta = {"ids": ids, "total_bases": total, "n_tracks": T, "scales": scales.tolist(),
             "assays": [r["assay"] for r in sel], "nonzero_mean": nzmean.tolist(), "mean_stride": 64,
+            "mean_sample": "1 run of 4096 bases in 64",
             "encoding": ENCODING, "scale_percentile": scale_percentile, "genome": name, "split": f"interim/genome/{name}/ntv3/split.u8 (1 = train; the "
             "held-out chromosomes are 0 there)",
             "strand": "stranded pairs by channel id (_P plus, _M minus)" if stranded else "unstranded",
