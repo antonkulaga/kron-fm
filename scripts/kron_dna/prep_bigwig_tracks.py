@@ -4,8 +4,13 @@
         [--name hg38] [--provenance provenance.jsonl] [--workers 4]
 
 ``SELECT.tsv`` lists the tracks in channel order (columns ``experiment``, ``file``, ``assay``, ``biosample``,
-``output_type``); the channel id is the file accession, and the order of the rows is the order of the channels,
-fixed from then on. Each ``BIGWIG_DIR/<file>.bigWig`` becomes ``OUT_DIR/tracks/<file>.u8``, one byte per contig base
+``output_type``, optionally ``channel``); the channel id is ``channel`` when given, else the file accession, and the
+order of the rows is the order of the channels, fixed from then on. Stranded signal comes as two rows whose channel
+ids end ``_P`` and ``_M`` (plus and minus strand): the store's loader exchanges such a pair on a window read on the
+other strand.
+
+``--convert-only`` writes the per-track files and stops: several jobs, each given part of the rows, convert in
+parallel into one ``OUT_DIR``, and a last run on the whole list assembles the store (converting what is missing). Each ``BIGWIG_DIR/<file>.bigWig`` becomes ``OUT_DIR/tracks/<file>.u8``, one byte per contig base
 laid out exactly like the genome's ``bases.u8``, in the encoding of the NTv3 benchmark store so one loader reads
 both: ``uint8 = log1p(signal) / log1p_scale * 255``, clipped, the scale being the track's own 99.9th percentile of
 non-zero log1p signal. Then ``OUT_DIR/dense.u8`` (base-major, all channels) and ``dense.json``.
@@ -105,7 +110,8 @@ def _init(g: dict) -> None:
 
 def main(select: Path, bigwigs: Path, out: Path, name: str = "hg38", provenance: Path = typer.Option(None),
          workers: int = 4, check_windows: int = 40,
-         scale_percentile: float = typer.Option(99.9, help="percentile of non-zero signal the encoding clips at")) -> None:
+         scale_percentile: float = typer.Option(99.9, help="percentile of non-zero signal the encoding clips at"),
+         convert_only: bool = typer.Option(False, help="write the per-track files only, no store")) -> None:
     import pyBigWig
 
     genome = interim_dir("genome", name)
@@ -116,8 +122,14 @@ def main(select: Path, bigwigs: Path, out: Path, name: str = "hg38", provenance:
     total = int((idx["end"] - idx["start"]).sum())
     with open(select) as f:
         sel = list(csv.DictReader(f, delimiter="\t"))
-    ids = [r["file"] for r in sel]
-    assert len(set(ids)) == len(ids), "a file is listed twice"
+    files = [r["file"] for r in sel]
+    ids = [r.get("channel") or r["file"] for r in sel]
+    assert len(set(files)) == len(files), "a file is listed twice"
+    assert len(set(ids)) == len(ids), "a channel id is listed twice"
+    for i in ids:
+        if i.endswith(("_P", "_M")) and i[:-1] + ("M" if i.endswith("_P") else "P") not in ids:
+            raise typer.BadParameter(f"stranded channel {i} has no partner")
+    stranded = any(i.endswith(("_P", "_M")) for i in ids)
     prov = {}
     if provenance and provenance.exists():
         prov = {r["file"]: r for r in map(json.loads, provenance.read_text().splitlines())}
@@ -125,12 +137,15 @@ def main(select: Path, bigwigs: Path, out: Path, name: str = "hg38", provenance:
     g = dict(rows=rows, total=total, src=bigwigs, out=out, percentile=scale_percentile)
     with Pool(workers, initializer=_init, initargs=(g,)) as p:
         infos = {}
-        for info in p.imap_unordered(one, ids):
+        for info in p.imap_unordered(one, files):
             infos[info["file"]] = info
             typer.echo(f"  {info['file']} scale={info['log1p_scale']:.4f} nan={info['nan_share']:.3f} "
-                       f"unobserved contigs={len(info['unobserved_contigs'])}")
+                       f"unobserved contigs={len(info['unobserved_contigs'])}", )
+    if convert_only:
+        typer.echo(f"converted {len(infos)} tracks into {out / 'tracks'}; no store assembled (--convert-only)")
+        return
     T = len(ids)
-    src = [np.memmap(out / "tracks" / f"{i}.u8", dtype=np.uint8, mode="r") for i in ids]
+    src = [np.memmap(out / "tracks" / f"{i}.u8", dtype=np.uint8, mode="r") for i in files]
     dense_path = out / "dense.u8"
     if not (dense_path.exists() and dense_path.stat().st_size == total * T):
         dst = np.memmap(str(dense_path) + PART, dtype=np.uint8, mode="w+", shape=(total, T))
@@ -145,7 +160,7 @@ def main(select: Path, bigwigs: Path, out: Path, name: str = "hg38", provenance:
         del dst
         os.replace(str(dense_path) + PART, dense_path)
     dense = np.memmap(dense_path, dtype=np.uint8, mode="r", shape=(total, T))
-    scales = np.array([infos[i]["log1p_scale"] for i in ids])
+    scales = np.array([infos[i]["log1p_scale"] for i in files])
 
     # non-zero mean of the decoded signal on the genome's training split, 1 base in 64 (as the NTv3 store)
     split = np.memmap(genome / "ntv3" / "split.u8", dtype=np.uint8, mode="r")
@@ -163,7 +178,7 @@ def main(select: Path, bigwigs: Path, out: Path, name: str = "hg38", provenance:
     # decoded bins against the source: random 128 bp bins on random contigs, each channel
     rng = np.random.default_rng(1)
     worst, pear = np.zeros(T), np.zeros(T)
-    for k, fid in enumerate(ids):
+    for k, fid in enumerate(files):
         bw = pyBigWig.open(str(bigwigs / f"{fid}.bigWig"))
         have = bw.chroms()
         a_src, a_dec = [], []
@@ -184,8 +199,9 @@ def main(select: Path, bigwigs: Path, out: Path, name: str = "hg38", provenance:
     meta = {"ids": ids, "total_bases": total, "n_tracks": T, "scales": scales.tolist(),
             "assays": [r["assay"] for r in sel], "nonzero_mean": nzmean.tolist(), "mean_stride": 64,
             "encoding": ENCODING, "scale_percentile": scale_percentile, "genome": name, "split": f"interim/genome/{name}/ntv3/split.u8 (1 = train; the "
-            "held-out chromosomes are 0 there)", "strand": "unstranded",
-            "tracks": [dict(channel=k, **{c: r.get(c) for c in ("experiment", "file", "assay", "biosample",
+            "held-out chromosomes are 0 there)",
+            "strand": "stranded pairs by channel id (_P plus, _M minus)" if stranded else "unstranded",
+            "tracks": [dict(channel=k, id=ids[k], **{c: r.get(c) for c in ("experiment", "file", "assay", "biosample",
                                                                "output_type")},
                             **{c: infos[r["file"]][c] for c in ("log1p_scale", "nan_share", "observed_bases",
                                                                 "negative_values", "unobserved_contigs")},
