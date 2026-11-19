@@ -146,6 +146,25 @@ one (less memory and time) to the trainer, who restarts A then E with `--xhead-k
 uncapped account have not started (no job of that account runs; one moved to another partition pends too); asked
 the rigger seat for a route, waiting meanwhile.
 
+**19 Nov, evening.** KronLSTM heads (1 layer) are on main and in every arm (A from 296k, D, F; E's probe). Short
+kill-safe CPU work goes to the uncapped account's 3-hour short-job partition (the preemptible partition started
+nothing all day); a store's assembly now resumes block by block (`78fd7aa`), so it is chained in 3-hour jobs.
+- DNase subset v1 (196 tracks, one per biosample, no overlap with the pilot): `$KRON_FM_DATA/interim/tracks/hg38/
+  dnase-biosamples-v1`, validated: decoded 128-bp bins vs source r median 0.9995, min 0.963; no contig missing; 12
+  older tracks leave >50 % of bases without a value (stored 0); GAPDH/ACTB promoters open in all 196; CD19 highest in
+  four B-cell lines; POU5F1 in iPS and H7; ALB highest in pancreas (no liver sample in this set). In A's training
+  since 19:16 (head `dnase196`, added on a plain resume at 318k); D and F wait on A's memory at its first eval.
+- Stranded RNA-seq v1 (231 biosamples, 462 channels `_P/_M`, 1.36 TB): assembling, resumed at block 36 of 88 at
+  19:10; four chained jobs. Then the same checks plus a memory check before any arm takes it.
+- Head benchmark against AlphaGenome (Anton, through the trainer): `scripts/kron_dna/xhead_bench.py` and
+  `xhead_bench_ag.py`, data in `$SCRATCH/kron-dna-build/xhead-bench/v1` (96 trackeval windows; 13 pilot DNase
+  channels matched to AlphaGenome by ENCODE biosample term; 4 splice channels). AlphaGenome marks splice sites on
+  the exon's boundary base, ours on the intron's: its output is read one base off (`bb9a1ee`). Result, AlphaGenome
+  fold model minus A 312k on windows the fold never saw: chr8 (23) DNase +0.028 [-0.007, 0.069], splice AP +0.207
+  [0.143, 0.260]; chr9 (18) +0.055 [0.024, 0.097], +0.198 [0.118, 0.266]. D and F trail A. AlphaGenome's own
+  all-folds model gains about 0.05 on windows it trained on. The trainer draws the charts for Anton.
+- Open: ClinVar scoring of A, D, F (needs a card; AlphaGenome 1 and 2 scores are done, unread per `PREREG.md`).
+
 ## Items
 
 | item | state |
