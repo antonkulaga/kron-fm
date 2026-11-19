@@ -1311,17 +1311,39 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
         except (OSError, ValueError, KeyError) as err:
             raise typer.BadParameter(f"--xhead {name_x}: {err}") from None
         xhead_sizes[name_x] = len(xstores[name_x].ids)
-        if xstores[name_x].dense.shape[0] != len(bases):
-            raise typer.BadParameter(f"--xhead {name_x}: the store covers {xstores[name_x].dense.shape[0]:,} bases, "
+        covers_ = (xstores[name_x].total_bases if xstores[name_x].kind == "tracks_binned"
+                   else xstores[name_x].dense.shape[0])
+        if covers_ != len(bases):
+            raise typer.BadParameter(f"--xhead {name_x}: the store covers {covers_:,} bases, "
                                      f"the primary genome {name} has {len(bases):,}")
     x_bin: dict[str, int] = {}                        # head -> bases per output (1: per base)
     for spec_b in xhead_bin:
         name_b, _, val_b = spec_b.partition("=")
         if name_b not in xhead_sizes or not val_b.isdigit():
             raise typer.BadParameter(f"--xhead-bin {spec_b!r}: give NAME=B for a NAME of --xhead")
-        if name_b in xstores and xstores[name_b].kind != "tracks":
+        if name_b in xstores and xstores[name_b].kind == "binary":
             raise typer.BadParameter(f"--xhead-bin {name_b}: a binary head predicts per base")
         x_bin[name_b] = int(val_b)
+    for n_b, st_b in xstores.items():               # a pre-binned store sets its head's bin
+        if st_b.kind == "tracks_binned":
+            if x_bin.get(n_b, st_b.bin) != st_b.bin:
+                raise typer.BadParameter(f"--xhead-bin {n_b}={x_bin[n_b]}: its store is binned at {st_b.bin} bases")
+            x_bin[n_b] = st_b.bin
+    # primary-genome windows start on the coarsest pre-binned store's grid (cells are global, a window must match)
+    x_grid = max([st_b.bin for st_b in xstores.values() if st_b.kind == "tracks_binned"], default=1)
+
+    def on_grid(at_: int, take_: int, off_: int, len_: int) -> tuple[int, int]:
+        """``at_``/``take_`` moved onto the ``x_grid`` grid inside the contig ``[off_, off_ + len_)``: the start down
+        (or up, if that leaves the contig) to a multiple of the grid, the length cut to whole cells. A contig too
+        short for one cell keeps its window; its cells are then all padding, never supervised."""
+        if x_grid == 1:
+            return at_, take_
+        a_ = at_ - at_ % x_grid
+        if a_ < off_:
+            a_ += x_grid
+        t_ = min(take_, off_ + len_ - a_)
+        t_ -= t_ % x_grid
+        return (a_, t_) if t_ > 0 else (at_, take_)
     if xhead:
         if not (ntv3_dir or xhead_split) or whole_contigs or world > 1 or arch not in ("v2", "v2l"):
             raise typer.BadParameter("--xhead needs --ntv3-dir or --xhead-split (the training split), arch v2 or v2l, "
@@ -1659,6 +1681,7 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                 lo = max(c_off, int(annot_pos[k]) - take + 1)             # the block stays inside the window,
                 hi = min(c_off + c_len - take, int(annot_pos[k]))         # the window inside its contig
                 at = int(gen.integers(lo, max(lo, hi) + 1))
+                at, take = on_grid(at, take, c_off, c_len)
                 codes = np.full(wrow, 4, dtype=np.int64)
                 codes[:take] = bases[at:at + take]
                 ctxs.append(0)                                            # nuclear (context 0)
@@ -1669,6 +1692,7 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                     wrow, more, cell = short(("primary", window), table["len"], p, r["len"])
                 take = min(wrow, r["len"])
                 at = r["offset"] + int(gen.integers(0, r["len"] - take + 1))
+                at, take = on_grid(at, take, r["offset"], r["len"])
                 codes = np.full(wrow, 4, dtype=np.int64)
                 codes[:take] = bases[at:at + take]
                 ctxs.append(0)                                            # nuclear (context 0)
@@ -1715,7 +1739,7 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                     sp_[:take] = sp_[:take][::-1]
                 for n_, st_ in xstores.items():           # primary-genome rows only; elsewhere unsupervised zeros
                     xh_t[n_].append(st_.window(at, take, wrow, flip_row) if xs is None and not from_mito and fg is None
-                                    else np.zeros((wrow, len(st_.ids)), dtype=np.uint8))
+                                    else st_.empty(wrow))
                 nt_t.append(nt)
                 nt_s.append(sp_)
                 nt_c.append(cm_)
@@ -1729,7 +1753,7 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                         sp_[:take] = sp_[:take][::-1]
                 for n_, st_ in xstores.items():
                     xh_t[n_].append(st_.window(at, take, wrow, flip_row) if primary_
-                                    else np.zeros((wrow, len(st_.ids)), dtype=np.uint8))
+                                    else st_.empty(wrow))
                 nt_t.append(np.zeros((wrow, 0), dtype=np.uint8))
                 nt_s.append(sp_)
                 nt_c.append(np.zeros(0, dtype=bool))
@@ -2329,10 +2353,11 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                 kind_x = xstores[n_].kind
                 lo_x, hi_x = (0, 0) if split_now else model.last_x_at
                 bin_x = x_bin.get(n_, 1)
+                cell_x = bin_x if kind_x == "tracks_binned" else 1   # a pre-binned store's targets are per cell
                 loss_x = (XH.split_head_loss(pieces, n_, want_x, x_ok, x_consts_on(n_), dev, kind_x, bin_x)
                           if split_now else
-                          XH.head_loss(model.last_x[n_], want_x[:, lo_x:hi_x].to(dev), x_ok[:, lo_x:hi_x].to(dev),
-                                       x_consts_on(n_)(dev), kind_x, bin_x))
+                          XH.head_loss(model.last_x[n_], want_x[:, lo_x // cell_x:hi_x // cell_x].to(dev),
+                                       x_ok[:, lo_x:hi_x].to(dev), x_consts_on(n_)(dev), kind_x, bin_x))
                 mlm = mlm + xhead_weight * loss_x
                 x_losses[n_].append(float(loss_x.detach()))
                 x_step.add(n_)

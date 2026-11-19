@@ -82,11 +82,15 @@ class TrackStore:
     def window(self, at: int, take: int, width: int, flip: bool = False) -> np.ndarray:
         """Targets ``[width, T]`` uint8 of bases ``at:at + take`` (zero-padded to ``width``); ``flip``: the other
         strand, reversed with the strand partners swapped, as the window's bases are reverse-complemented."""
-        out = np.zeros((width, len(self.ids)), dtype=np.uint8)
+        out = self.empty(width)
         out[:take] = self.dense[at:at + take]
         if flip:
             out[:take] = out[:take][::-1][:, self.swap]
         return out
+
+    def empty(self, width: int) -> np.ndarray:
+        """The targets of a row with no supervision (another genome's window): zeros of a window's shape."""
+        return np.zeros((width, len(self.ids)), dtype=np.uint8)
 
     def differences(self, saved: dict) -> list[str]:
         """What differs between this store and the identity a checkpoint recorded (empty: the same targets)."""
@@ -154,6 +158,9 @@ class LabelStore:
             out[:take] = out[:take][::-1][:, self.swap]
         return out
 
+    def empty(self, width: int) -> np.ndarray:
+        return np.zeros((width, len(self.ids)), dtype=np.uint8)
+
     def differences(self, saved: dict) -> list[str]:
         return [f"{k}: checkpoint {saved.get(k)!r}, now {self.identity.get(k)!r}"
                 for k in ("ids", "encoding", "genome", "total_bases", "definition", "labels_sha256")
@@ -172,9 +179,87 @@ class LabelStore:
         return AveragePrecision(len(self.ids))
 
 
+@dataclass
+class BinnedTrackStore:
+    """A pre-binned track store (``scripts/kron_dna/bin_track_store.py``): per cell of ``bin`` bases on the global
+    grid, the mean training target and the mean log1p signal of each channel. For a head that predicts at ``bin``
+    bases; a window must start on the grid (``genome-train`` snaps primary-genome windows to it)."""
+    path: Path
+    ids: list[str]
+    target: np.ndarray                # [cells, T] float16: mean of targets_of over the cell
+    log1p: np.ndarray                 # [cells, T] float16: mean of log1p signal over the cell
+    bin: int
+    scales: np.ndarray
+    nonzero_mean: np.ndarray
+    is_rna: np.ndarray
+    swap: np.ndarray
+    genome: str
+    identity: dict = field(default_factory=dict)
+    kind = "tracks_binned"
+
+    def consts(self, device) -> tuple:
+        return tuple(torch.as_tensor(np.asarray(v)).to(device) for v in (self.scales, self.nonzero_mean, self.is_rna))
+
+    def scorer(self, bin: int = 1):
+        """Pearson over the cells as given (at ``self.bin`` bases already)."""
+        return Pearson(len(self.ids), max(1, 128 // self.bin) if self.bin < 128 else 1)
+
+    @classmethod
+    def open(cls, path: str | Path) -> "BinnedTrackStore":
+        path = Path(path)
+        raw = (path / "binned.json").read_bytes()
+        j = json.loads(raw)
+        ids, cells, b = list(j["ids"]), int(j["cells"]), int(j["bin"])
+        at = {i: k for k, i in enumerate(ids)}
+        swap = np.arange(len(ids))
+        for k, i in enumerate(ids):
+            if i.endswith(("_P", "_M")):
+                swap[k] = at.get(i[:-1] + ("M" if i.endswith("_P") else "P"), k)
+        identity = dict(ids=ids, encoding=f"float16 cell means at {b} bp (target, log1p)", bin=b,
+                        scales=[float(v) for v in j["scales"]], nonzero_mean=[float(v) for v in j["nonzero_mean"]],
+                        genome=j.get("genome"), total_bases=int(j["total_bases"]),
+                        record_sha256=hashlib.sha256(raw).hexdigest())
+        mm = lambda n: np.memmap(path / f"{n}.f16", dtype=np.float16, mode="r", shape=(cells, len(ids)))
+        return cls(path=path, ids=ids, target=mm("target"), log1p=mm("log1p"), bin=b,
+                   scales=np.asarray(j["scales"], dtype=np.float32),
+                   nonzero_mean=np.asarray(j["nonzero_mean"], dtype=np.float32),
+                   is_rna=np.array(["RNA-seq" in a for a in j["assays"]], dtype=bool), swap=swap,
+                   genome=str(j.get("genome")), identity=identity)
+
+    @property
+    def total_bases(self) -> int:
+        return int(self.identity["total_bases"])
+
+    def empty(self, width: int) -> np.ndarray:
+        return np.zeros((width // self.bin, len(self.ids), 2), dtype=np.float16)
+
+    def window(self, at: int, take: int, width: int, flip: bool = False) -> np.ndarray:
+        """``[width / bin, T, 2]`` float16 (target, log1p) of the cells in bases ``at:at + take``. The window must
+        start on the grid; cells past ``take // bin`` stay zero (their bases are padding, never supervised)."""
+        out = self.empty(width)
+        n = take // self.bin
+        if not n:
+            return out
+        if at % self.bin:
+            raise ValueError(f"a window at base {at} is off the store's {self.bin}-base grid")
+        c = at // self.bin
+        out[:n, :, 0] = self.target[c:c + n]
+        out[:n, :, 1] = self.log1p[c:c + n]
+        if flip:
+            out[:n] = out[:n][::-1][:, self.swap]
+        return out
+
+    def differences(self, saved: dict) -> list[str]:
+        return [f"{k}: checkpoint {saved.get(k)!r}, now {self.identity.get(k)!r}"
+                for k in ("ids", "encoding", "bin", "genome", "total_bases") if saved.get(k) != self.identity.get(k)]
+
+
 def open_store(path: str | Path):
-    """The store at ``path``: measured tracks (``dense.json``) or 0/1 labels (``splice.json``)."""
+    """The store at ``path``: measured tracks (``dense.json``), pre-binned tracks (``binned.json``) or 0/1 labels
+    (``splice.json``)."""
     path = Path(path)
+    if (path / "binned.json").exists():
+        return BinnedTrackStore.open(path)
     if (path / "dense.json").exists():
         return TrackStore.open(path)
     if (path / "splice.json").exists():
@@ -262,14 +347,15 @@ def head_loss(pred: torch.Tensor, want: torch.Tensor, ok: torch.Tensor, consts: 
         if bin != 1:
             raise ValueError("a binary head predicts per base")
         return _bce_sum(pred, want, ok, consts) / (ok.sum() * pred.shape[-1]).clamp_min(1)
-    y, m = binned_targets(want, ok, consts, bin)
+    y, m = (want[..., 0].float(), pool_ok(ok, bin)) if kind == "tracks_binned" else binned_targets(want, ok, consts, bin)
     return G.poisson_multinomial_loss(F.softplus(pred.float()), y, m.unsqueeze(-1))
 
 
-def head_loss_parts(pred: torch.Tensor, want: torch.Tensor, ok: torch.Tensor, consts: tuple, bin: int = 1) -> dict:
+def head_loss_parts(pred: torch.Tensor, want: torch.Tensor, ok: torch.Tensor, consts: tuple, bin: int = 1,
+                    kind: str = "tracks") -> dict:
     """The same for one piece of a split window, on the piece's card: the sums
     :func:`kron_dna.genome.poisson_multinomial_combine` joins on the first card into :func:`head_loss`'s value."""
-    y, m = binned_targets(want, ok, consts, bin)
+    y, m = (want[..., 0].float(), pool_ok(ok, bin)) if kind == "tracks_binned" else binned_targets(want, ok, consts, bin)
     return G.poisson_multinomial_parts(F.softplus(pred.float()), y, m.unsqueeze(-1))
 
 
@@ -284,8 +370,9 @@ def split_head_loss(pieces: list, name: str, want: torch.Tensor, ok: torch.Tenso
                            ok[p.rows, p.x_at[0]:p.x_at[1]].to(p.device), consts_on(p.device)).to(device)
                   for p in pieces)
         return tot / (ok.sum() * want.shape[-1]).clamp_min(1).to(device)
-    parts = [(p.rows, head_loss_parts(p.x[name], want[p.rows, p.x_at[0]:p.x_at[1]].to(p.device),
-                                      ok[p.rows, p.x_at[0]:p.x_at[1]].to(p.device), consts_on(p.device), bin))
+    cell = bin if kind == "tracks_binned" else 1      # a pre-binned store's targets are per cell, not per base
+    parts = [(p.rows, head_loss_parts(p.x[name], want[p.rows, p.x_at[0] // cell:p.x_at[1] // cell].to(p.device),
+                                      ok[p.rows, p.x_at[0]:p.x_at[1]].to(p.device), consts_on(p.device), bin, kind))
              for p in pieces]
     return G.poisson_multinomial_combine(parts, want.shape[0], device)
 
@@ -375,6 +462,8 @@ def eval_pair(store, pred: torch.Tensor, want: torch.Tensor, consts: tuple, bin:
     labels for binary heads."""
     if store.kind == "binary":
         return pred.float(), want
+    if store.kind == "tracks_binned":                 # the cell means of log1p signal, stored
+        return signal_of(F.softplus(pred.float()), consts[1], consts[2]), want[..., 1].float()
     # a binned head's prediction is its bin's mean; the target side is the bin's mean of log1p signal
     return signal_of(F.softplus(pred.float()), consts[1], consts[2]), pool_bins(want.float() / 255.0 * consts[0], bin)
 

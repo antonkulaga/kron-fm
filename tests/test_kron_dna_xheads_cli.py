@@ -332,3 +332,32 @@ def test_a_binned_head_trains_on_bin_means_and_its_bin_is_fixed_for_life(genomes
     assert res.exit_code == 0, res.output + repr(res.exception)
     res, _ = run(cli, monkeypatch, root, tmp_path / "bad", child + ["--xhead-bin", "nohead=128"])
     assert res.exit_code != 0 and "--xhead-bin" in MGT.flat(res.output + repr(res.exception))
+
+
+def test_a_pre_binned_store_trains_its_head_on_cells_with_windows_on_the_grid(genomes, tmp_path, monkeypatch):
+    """--xhead dnase:<binned store>: the head's bin comes from the store, every primary window starts on the store's
+    grid (the loader refuses one that does not), training and held-out scoring run on cells; another bin is refused."""
+    import importlib.util
+    from pathlib import Path as P_
+    spec = importlib.util.spec_from_file_location(
+        "bin_track_store", P_(__file__).resolve().parents[1] / "scripts" / "kron_dna" / "bin_track_store.py")
+    BT = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(BT)
+    root, parent, store, child = setup(genomes, tmp_path, monkeypatch)
+    binned = tmp_path / "binned"
+    with monkeypatch.context() as mp:                  # the harness records reads; building the store writes
+        mp.setattr(np, "memmap", MGT.REAL_MEMMAP)
+        BT.main(store, binned, bin=128, part=0, parts=1, block_cells=2048)
+    args = [a if a != f"dnase:{store}" else f"dnase:{binned}" for a in child]
+    out = tmp_path / "child"
+    res, _ = run(cli, monkeypatch, root, out, args)
+    assert res.exit_code == 0, res.output + repr(res.exception)
+    end = torch.load(out / "checkpoint.pt", map_location="cpu", weights_only=False)
+    assert end["config"]["xheads"][0] == ["dnase", 3, 128]
+    d = pl.read_csv(out / "xheads.csv").filter(pl.col("head") == "dnase")
+    # a step with no whole supervised cell makes no update; its row's train_loss is NaN (no loss to average)
+    upd = d.with_columns(pl.col("updates").diff().fill_null(pl.col("updates")).alias("new"))
+    loss = upd.filter(pl.col("new") > 0)["train_loss"].cast(pl.Float64, strict=False)
+    assert loss.len() > 0 and loss.is_finite().all() and (d["heldout_n"].cast(pl.Int64, strict=False) > 0).any()
+    res, _ = run(cli, monkeypatch, root, tmp_path / "bad", args + ["--xhead-bin", "dnase=64"])
+    assert res.exit_code != 0 and "binned at 128" in MGT.flat(res.output + repr(res.exception))
