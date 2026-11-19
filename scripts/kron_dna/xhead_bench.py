@@ -241,6 +241,17 @@ def report(bench: Path, n_boot: int = 1000, n_boot_ap: int = 200, seed: int = 0,
         preds[d.parent.name] = dict(info=info, rows=np.asarray(info["windows"]), dnase=np.load(d.parent / "dnase_128.npy"),
                                     splice=np.load(d.parent / "splice.npy", mmap_mode="r"),
                                     dnase_channels=info.get("dnase_channels"))
+    # a source scored on every window is also shown on each smaller set another source covers (an AlphaGenome fold
+    # model's held-out windows), so each chart compares every model on the same windows
+    every = [lab for lab, p in preds.items() if len(p["rows"]) == win.height]
+    for lab_s, ps in [(lab, p) for lab, p in preds.items() if len(p["rows"]) < win.height]:
+        for lab in every:
+            if lab.startswith("alphagenome-"):
+                continue
+            idx = np.searchsorted(preds[lab]["rows"], ps["rows"])
+            tag = lab_s.split("__", 1)[-1] if "__" in lab_s else lab_s
+            preds[f"{lab} on {tag}"] = dict(info=dict(preds[lab]["info"], windows=ps["rows"].tolist()), rows=ps["rows"],
+                                            dnase=preds[lab]["dnase"][idx], splice=np.asarray(preds[lab]["splice"][idx]))
     rng = np.random.default_rng(seed)
     rows_out, pairs = [], []
     dn_ids = [c["id"] for c in meta["dnase_channels"]]
@@ -275,7 +286,9 @@ def report(bench: Path, n_boot: int = 1000, n_boot_ap: int = 200, seed: int = 0,
     labs = list(preds)
     for i, a in enumerate(labs):
         for b in labs[i + 1:]:
-            shared = np.intersect1d(preds[a]["rows"], preds[b]["rows"])
+            if not np.array_equal(preds[a]["rows"], preds[b]["rows"]):     # paired only on the same window set
+                continue
+            shared = preds[a]["rows"]
             if len(shared) < min_shared:
                 continue
             ia = np.searchsorted(preds[a]["rows"], shared)
@@ -326,6 +339,7 @@ def charts(bench: Path, res: pl.DataFrame, preds: dict) -> None:
         fig, axes = plt.subplots(1, 2, figsize=(14, 4.8), gridspec_kw=dict(width_ratios=[3.2, 1]))
         for ax, task in zip(axes, ("dnase", "splice")):
             sub = res.filter((pl.col("task") == task) & pl.col("source").is_in(labs))
+            sub_s = {lab: res.filter((pl.col("task") == "splice") & (pl.col("source") == lab))["value"].to_numpy() for lab in labs}
             names = sub.filter(pl.col("source") == labs[0])["biosample" if task == "dnase" else "id"].to_list()
             x = np.arange(len(names))
             w = 0.8 / len(labs)
@@ -335,13 +349,16 @@ def charts(bench: Path, res: pl.DataFrame, preds: dict) -> None:
                 err = None
                 if task == "dnase":
                     err = np.abs(np.stack([v - s["lo"].to_numpy(), s["hi"].to_numpy() - v]))
-                ax.bar(x + (j - (len(labs) - 1) / 2) * w, v, w, label=f"{lab} (mean {np.nanmean(v):.3f})", yerr=err, capsize=2)
+                ax.bar(x + (j - (len(labs) - 1) / 2) * w, v, w, yerr=err, capsize=2,
+                       label=f"{lab}" + (f" (DNase {np.nanmean(v):.3f}, splice {np.nanmean(sub_s[lab]):.3f})" if task == "dnase" else ""))
             ax.set_xticks(x, names, rotation=45, ha="right", fontsize=8)
             ax.set_ylabel("Pearson r, 128-bp log1p" if task == "dnase" else "average precision")
-            ax.set_title(f"{'DNase' if task == 'dnase' else 'splice sites'}: held-out chr8/chr9, {n} windows")
+            ax.set_title(f"DNase, {n} held-out chr8/chr9 windows" if task == "dnase" else "splice sites")
             ax.grid(axis="y", alpha=0.3)
-            ax.legend(fontsize=7, loc="lower right" if task == "dnase" else "upper right")
-        fig.tight_layout()
+            ax.set_ylim(0, 1)
+        handles, names_ = axes[0].get_legend_handles_labels()
+        fig.legend(handles, names_, fontsize=8, loc="lower center", ncol=min(len(labs), 4), frameon=False)
+        fig.tight_layout(rect=(0, 0.06 + 0.035 * ((len(labs) - 1) // 4), 1, 1))
         fig.savefig(bench / f"chart_{n}windows.png", dpi=130)
         plt.close(fig)
 
