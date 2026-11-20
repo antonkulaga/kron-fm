@@ -165,6 +165,21 @@ nothing all day); a store's assembly now resumes block by block (`78fd7aa`), so 
   all-folds model gains about 0.05 on windows it trained on. The trainer draws the charts for Anton.
 - Open: ClinVar scoring of A, D, F (needs a card; AlphaGenome 1 and 2 scores are done, unread per `PREREG.md`).
 
+**20 Nov, 05:00.** Per-base wide stores stalled training on disk reads (the trainer: D 2.7 -> 6-7 s/step with the
+196-track per-base store, 600 GB, read 196 MB per 1 Mb window). Fix, all on main (81a48c7): binned heads
+(`--xhead-bin`, 710609e), pre-binned stores (`scripts/kron_dna/bin_track_store.py`: per 128-bp cell the mean
+training target and mean log1p, float16) read by `xheads.BinnedTrackStore`, primary windows snapped to the 128-bp
+grid (32fae75). Stores, validated against their per-base sources (cells within float16 rounding of bin means):
+`dnase-biosamples-v1-bin128` (196 channels, 15.4 GB) in A and D since 02:34 as `dnase196b`;
+`rnaseq-stranded-v1-bin128` (231 biosamples, 462 stranded channels, 9 GB) in A since about 04:50 as `rna462b`;
+the trainer adds D and F after reading A's peak. Per-base RNA store checks: r128 vs source median 0.9995; strands
+right (GAPDH own strand 34 vs 0.17, ACTB 30 vs 0.09); ALB top 3 liver.
+ONNX (Anton: the default publishing format): `kron-dna export-genome-onnx` (41987e1, 9f42ef9), through torch.export
+at opset 18 without the exporter's optimisation pass; F 96k at 131 kb exported in 16 min on the card, 373 MB, ORT vs
+graph 8.6e-6, Triton vs graph 0.004; on F's Hugging Face repo (the trainer). kron_core/onnx.py's chunked scan now uses
+positive dims (the TorchScript exporter resolved negative dims against stale ranks).
+Open: ClinVar scoring of A, D, F (needs a card); stage 2 ChIP-seq download; the rest of stage 1's RNA-seq.
+
 ## Items
 
 | item | state |
