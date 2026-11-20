@@ -233,7 +233,7 @@ def _sha256(path: Path) -> str:
 
 
 def export_genome_onnx(checkpoint: str | Path, out_dir: str | Path, window: int = 131072, opset: int = 18,
-                       interim=None, check_kernels: bool = True, with_ntv3: bool = True) -> dict:
+                       interim=None, check_kernels: bool = True, with_ntv3: bool = True, optimize: bool = False) -> dict:
     """Export a ``genome-train`` checkpoint (or run directory) to ``out_dir/model.onnx`` reading ``window`` bases,
     check it with ONNX Runtime, write ``onnx_meta.json``."""
     import onnxruntime as ort
@@ -259,12 +259,14 @@ def export_genome_onnx(checkpoint: str | Path, out_dir: str | Path, window: int 
     names = graph.output_names
     example = example_bases(2, window, seed=0)          # two rows: an example batch of one would fix it at one
     started = time.time()
+    # optimize=False by default: the exporter's ONNX optimisation pass did not finish in 3 h on F at 131 kb (the
+    # unrolled recurrence is a large graph); ONNX Runtime optimises a graph itself when it loads it
     # the torch.export route: the TorchScript exporter mis-resolved ranks and shapes in this graph (negative dims
     # against stale ranks, a reshape constant written wrong, a crash in its shape arithmetic with a free batch)
     with torch.no_grad():
         torch.onnx.export(graph, (example,), out / "model.onnx", input_names=["bases"], output_names=names,
                           dynamic_shapes=({0: torch.export.Dim("batch", min=1, max=1024)},),
-                          opset_version=opset, dynamo=True, external_data=False)
+                          opset_version=opset, dynamo=True, external_data=False, optimize=optimize)
     export_seconds = time.time() - started
 
     check = example_bases(2, window, seed=1)
@@ -297,7 +299,7 @@ def export_genome_onnx(checkpoint: str | Path, out_dir: str | Path, window: int 
                         "units": "natural units, mean over each bin" if tracks else "probability",
                         "bin": b, "channels": xids.get(n, [])})
     meta = {"graph": path.name, "sha256": _sha256(path), "bytes": path.stat().st_size, "opset": opset,
-            "export_route": "torch.export (dynamo)", "export_seconds": round(export_seconds, 1),
+            "export_route": "torch.export (dynamo)", "exporter_optimize": optimize, "export_seconds": round(export_seconds, 1),
             "ort_two_rows_seconds_with_load": round(ort_seconds, 1), "window": window,
             "inputs": [{"name": "bases", "shape": ["batch", window], "dtype": "int64",
                         "meaning": "hg38-style base codes 0-3 = A, C, G, T, 4 = N; one window per row, forward strand"}],
