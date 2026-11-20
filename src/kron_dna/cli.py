@@ -3111,13 +3111,17 @@ def export_genome_onnx_cmd(run: Path = typer.Argument(..., help="a `genome-train
                            opset: int = typer.Option(18, help="ONNX opset"),
                            ntv3: bool = typer.Option(True, help="include the NTv3 tracks output"),
                            check_kernels: bool = typer.Option(True, help="compare with the Triton kernels when CUDA "
-                                                                         "is present")) -> None:
+                                                                         "is present"),
+                           optimize: bool = typer.Option(False, help="run the exporter's ONNX optimisation pass "
+                                                                     "(slow at full windows; ONNX Runtime optimises "
+                                                                     "on load anyway)")) -> None:
     """Export a KronGenome checkpoint to ONNX (base logits, NTv3 tracks, further heads) and check ONNX Runtime
     against PyTorch; see kron_dna.genome_onnx."""
     from kron_dna.genome_onnx import export_genome_onnx
 
     out = out or (run if run.is_dir() else run.parent) / f"onnx-{window}"
-    meta = export_genome_onnx(run, out, window=window, opset=opset, check_kernels=check_kernels, with_ntv3=ntv3)
+    meta = export_genome_onnx(run, out, window=window, opset=opset, check_kernels=check_kernels, with_ntv3=ntv3,
+                              optimize=optimize)
     typer.echo(f"wrote {out / meta['graph']} ({meta['bytes'] / 1e6:,.1f} MB, {meta['export_seconds']} s)")
     typer.echo(json.dumps(meta["verification"], indent=2))
 
