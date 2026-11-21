@@ -607,6 +607,48 @@ def read_aurora_bp(folder: Path) -> SourceData:
     return SourceData(subjects, gen())
 
 
+# ---- DREAMT (restricted) ----------------------------------------------------------------------
+DREAMT_FS = 64.0
+DREAMT_RATE_DIR = "data_64Hz"
+
+
+def _dreamt_root(folder: Path) -> Path:
+    """The release folder (``dreamt-<version>``) inside ``folder``, or ``folder`` itself when it holds the data."""
+    found = sorted(folder.glob("dreamt-*/participant_info.csv"))
+    return found[-1].parent if found else folder
+
+
+def dreamt_flags(row: dict[str, str]) -> dict[str, str]:
+    """Disease labels of one ``participant_info.csv`` row: hypertension, diabetes, depression and arrhythmia from
+    its medical history, obstructive sleep apnea as AHI >= 15 (``1``/``0``, empty when the field is empty)."""
+    history = {h.strip().lower() for h in row.get("MEDICAL_HISTORY", "").split(",") if h.strip()}
+    out = {k: str(int(k in history)) for k in ("hypertension", "diabetes", "depression", "arrhythmia")}
+    ahi = _float(row.get("AHI", ""))
+    out["osa"] = "" if not np.isfinite(ahi) else str(int(ahi >= 15))
+    return out
+
+
+def read_dreamt(folder: Path) -> SourceData:
+    """The Empatica E4 wrist BVP (64 Hz) of each overnight recording, ``data_64Hz/S*_whole_df.csv`` (only its
+    ``TIMESTAMP`` and ``BVP`` columns are read); age, sex, BMI, AHI and the disease labels of
+    :func:`dreamt_flags` from ``participant_info.csv``. Restricted (PhysioNet credentialed access): written
+    owner-only, research only, never redistributed."""
+    root = _dreamt_root(folder)
+    subjects = [{"subject": r["SID"], "age": r.get("AGE", ""), "sex": r.get("GENDER", "").upper(),
+                 "bmi": r.get("BMI", ""), "ahi": r.get("AHI", ""), **dreamt_flags(r)}
+                for r in pl.read_csv(root / "participant_info.csv", infer_schema=False).to_dicts()
+                if r.get("SID", "").strip()]
+
+    def gen() -> Iterator[Recording]:
+        for path in sorted((root / DREAMT_RATE_DIR).glob("S*_whole_df.csv")):
+            sid = path.name.split("_", 1)[0]
+            df = pl.read_csv(path, columns=["TIMESTAMP", "BVP"], infer_schema=False)
+            for j, part in sessions(_values(df["TIMESTAMP"]), _values(df["BVP"]), DREAMT_FS):
+                yield Recording(sid, f"{sid}/{j}", DREAMT_FS, part)
+
+    return SourceData(subjects, gen())
+
+
 def _table_tsv(path: Path) -> list[dict[str, str]]:
     return pl.read_csv(path, separator="\t", infer_schema=False).to_dicts()
 
@@ -616,7 +658,7 @@ READERS = {"wf_ppg": read_wf_ppg, "multisite_ppg": read_multisite_ppg, "galaxy_a
            "vilnius_af": read_vilnius_af, "utsa_ppg": read_utsa_ppg,
            "ppg_dalia": read_ppg_dalia, "wesad": read_wesad,
            "wildppg": read_wildppg, "ppg_sport": read_ppg_sport, "aurora_bp": read_aurora_bp,
-           "pulsewatch": read_pulsewatch}
+           "pulsewatch": read_pulsewatch, "dreamt": read_dreamt}
 PARSERS: dict[str, Callable[[Path], np.ndarray]] = {"multisite_watch": multisite_watch,
                                                     "galaxy_active2_day": galaxy_active2_day,
                                                     "galaxy_active2_device": galaxy_active2_device,

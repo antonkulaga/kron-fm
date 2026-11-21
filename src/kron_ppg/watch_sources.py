@@ -47,6 +47,11 @@ and only sets that download without an account, a data-use agreement or a click-
   granted access and downloads it. Treated as restricted until its own terms are known: no terms were found in
   the shared folder (its code is MIT). Its fetch only records the files placed.
 
+* ``dreamt`` (restricted): DREAMT 2.2.0 (PhysioNet), Empatica E4 wrist BVP at 64 Hz over one night in a sleep lab,
+  100 people aged 21-87 with sleep apnea indices and medical history. **PhysioNet Restricted Health Data License
+  1.5.0** under the owner's credentialed access: research only, never shared or redistributed. Its fetch only
+  records the files the owner downloaded.
+
 A source with ``notes["restricted"]`` true is never exported, uploaded or committed, and is written owner-only; one
 with ``notes["no_join"]`` (Aurora-BP) is also never joined with another source in a training or probe set.
 """
@@ -225,6 +230,19 @@ def fetch_pulsewatch(source: Source, folder: Path, force: bool) -> dict:
     return write_manifest(folder, source, entries)
 
 
+def fetch_dreamt(source: Source, folder: Path, force: bool) -> dict:
+    """Never downloads (PhysioNet credentialed access, the owner's login): records the release files the owner
+    placed, with their sizes, in an owner-only ``SOURCE.json``."""
+    os.umask(0o077)
+    found = sorted(p for p in folder.rglob("*") if p.is_file() and p.suffix in (".csv", ".txt")
+                   and p.name != "SOURCE.json")
+    if not found:
+        raise FileNotFoundError(f"{folder}: DREAMT is downloaded by its owner under PhysioNet credentialed access; "
+                                "place the release there first")
+    entries = [{"file": str(p.relative_to(folder)), "bytes": p.stat().st_size} for p in found]
+    return write_manifest(folder, source, entries)
+
+
 def fetch_files(source: Source, folder: Path, force: bool) -> dict:
     """The source's own file list, one by one, with ``SOURCE.json`` written after each (large single files)."""
     return fetch_tree(source, folder, force, [(f.url, f.filename, f.size) for f in source.files])
@@ -373,5 +391,17 @@ SOURCES: dict[str, Source] = {
                 "restricted": True, "terms": "unknown until the authors' terms are read; treated like a DUA set",
                 "approx_mb": 946_000},
                fetch=fetch_pulsewatch),
+        Source("dreamt", DOMAIN,
+               "DREAMT: Empatica E4 wrist BVP (64 Hz) with accelerometer, EDA and temperature over one night beside "
+               "polysomnography, 100 people aged 21-87, sleep apnea indices and medical history; restricted "
+               "(PhysioNet credentialed access)",
+               (), "PhysioNet Restricted Health Data License 1.5.0: research only, never shared or redistributed",
+               "Wang et al. (2025) DREAMT: Dataset for Real-time sleep stage EstimAtion using Multisensor wearable "
+               "Technology (version 2.2.0). PhysioNet. Goldberger et al. (2000) PhysioNet. Circulation 101:e215.",
+               "https://physionet.org/content/dreamt/2.2.0/",
+               {"format": "csv", "fs": 64, "sites": ["wrist"], "device": "Empatica E4", "restricted": True,
+                "terms": "research only; never shared, uploaded or committed; owner-only files; report results only",
+                "approx_mb": 115_000},
+               fetch=fetch_dreamt),
     )
 }

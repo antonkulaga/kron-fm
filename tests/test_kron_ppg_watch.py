@@ -491,3 +491,33 @@ def test_pulsewatch_reads_each_subject_day_inverted_with_labels(tmp_path, monkey
     monkeypatch.setattr(watch_readers, "CHUNK_S", None)
     grid = list(READERS["pulsewatch"](tmp_path / "pw").recordings)[0].load()
     assert len(grid) == 3000 and np.allclose(grid, y)  # index x 30 s continues the session without a gap
+
+
+def fake_dreamt(folder):
+    root = folder / "dreamt-2.2.0"
+    (root / "data_64Hz").mkdir(parents=True)
+    (root / "participant_info.csv").write_text(
+        "SID,AGE,GENDER,BMI,OAHI,AHI,Mean_SaO2,Arousal Index,MEDICAL_HISTORY,Sleep_Disorders\n"
+        'S900,50.0,M,20,30,30,90%,10,"Hypertension, Other",X\n'
+        "S901,40.0,F,20,1,1,90%,10,None,X\n")
+    for sid, seconds in (("S900", 60.0), ("S901", 72.0)):
+        x = synthetic_ppg(seconds, 64.0)
+        t = np.arange(len(x)) / 64.0
+        rows = "\n".join(f"{a},{b:.6f},0,0,0,0,0,0,,W,,,," for a, b in zip(t, x, strict=True))
+        (root / "data_64Hz" / f"{sid}_whole_df.csv").write_text(
+            "TIMESTAMP,BVP,ACC_X,ACC_Y,ACC_Z,TEMP,EDA,HR,IBI,Sleep_Stage,Obstructive_Apnea,Central_Apnea,"
+            "Hypopnea,Multiple_Events\n" + rows + "\n")
+
+
+def test_dreamt_reads_e4_bvp_with_ages_and_disease_labels_and_is_restricted(tmp_path):
+    from kron_ppg.watch_sources import is_restricted
+
+    fake_dreamt(tmp_path / "dreamt")
+    data = READERS["dreamt"](tmp_path / "dreamt")
+    assert [s["age"] for s in data.subjects] == ["50.0", "40.0"]
+    assert data.subjects[0]["hypertension"] == "1" and data.subjects[0]["osa"] == "1"
+    assert data.subjects[1]["hypertension"] == "0" and data.subjects[1]["osa"] == "0"
+    recs = list(data.recordings)
+    assert [r.recording for r in recs] == ["S900/0", "S901/0"] and recs[0].fs == 64.0
+    assert np.allclose(recs[0].signal, synthetic_ppg(60.0, 64.0), atol=1e-4)
+    assert is_restricted("dreamt")
