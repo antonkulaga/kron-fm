@@ -396,6 +396,7 @@ class KronGenome(nn.Module):
             raise ValueError(f"xhead_kind must be mlp or kron, got {c.xhead_kind!r}")
         self.xhead_bin = {n: b for n, _, b in rows}
         self.x_active: set[str] | None = None
+        self.checkpoint_xheads = False                # recompute each head's inside in backward (not saved)
         self.x_span: tuple[int, int] | None = None    # window bases the heads run on (not saved; a multiple of
         self.last_x: dict[str, torch.Tensor] = {}     # 2**n_down at both ends); last_x_at: the bases last_x covers
         self.last_x_at: tuple[int, int] = (0, 0)
@@ -423,7 +424,10 @@ class KronGenome(nn.Module):
                 continue
             if b not in pooled:
                 pooled[b] = F.avg_pool1d(x, b)
-            out[n] = h(pooled[b]).transpose(1, 2)
+            if self.checkpoint_xheads and torch.is_grad_enabled():    # keep the input and output, recompute inside
+                out[n] = torch.utils.checkpoint.checkpoint(h, pooled[b], use_reentrant=False).transpose(1, 2)
+            else:
+                out[n] = h(pooled[b]).transpose(1, 2)
         return out, (lo, hi)
 
     def _stem_conv(self, width: int) -> nn.Conv1d:

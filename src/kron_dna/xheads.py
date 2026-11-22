@@ -107,9 +107,10 @@ class TrackStore:
 
 @dataclass
 class LabelStore:
-    """Per-base 0/1 labels on a prepared genome's layout, one bit of ``labels[at]`` per channel (written by
-    ``scripts/kron_dna/prep_splice_labels.py``: donor and acceptor per strand). ``pairs`` are the channels exchanged
-    when a window is read on the other strand."""
+    """Per-base 0/1 labels on a prepared genome's layout, one bit of ``labels[at]`` per channel: ``splice.json`` +
+    ``splice.u8`` (``scripts/kron_dna/prep_splice_labels.py``: donor and acceptor per strand), or ``labels.json`` +
+    ``labels.u8``/``labels.u16`` (its ``dtype``; ``prep_gene_structure_labels.py``). Every channel id ends in
+    ``_plus`` or ``_minus`` (or neither, unstranded); ``swap`` gives the channel a window read on the other strand uses."""
     path: Path
     ids: list[str]
     labels: np.ndarray                # [total_bases] uint8, bit k = channel k
@@ -122,15 +123,22 @@ class LabelStore:
     @classmethod
     def open(cls, path: str | Path) -> "LabelStore":
         path = Path(path)
-        raw = (path / "splice.json").read_bytes()
+        stem = "labels" if (path / "labels.json").exists() else "splice"
+        raw = (path / f"{stem}.json").read_bytes()
         j = json.loads(raw)
+        dtype = np.dtype(j.get("dtype", "uint8"))
+        if dtype not in (np.dtype("uint8"), np.dtype("uint16")):
+            raise ValueError(f"{path}: label dtype {dtype} (uint8 or uint16)")
+        data = path / (f"{stem}.u8" if dtype == np.uint8 else f"{stem}.u16")
         ids = sorted(j["bits"], key=j["bits"].get)
+        if len(ids) > 8 * dtype.itemsize:
+            raise ValueError(f"{path}: {len(ids)} channels do not fit {dtype}")
         if [j["bits"][i] for i in ids] != list(range(len(ids))):
             raise ValueError(f"{path}: label bits must be 0..{len(ids) - 1}, got {j['bits']}")
         total = int(j["total_bases"])
-        size = (path / "splice.u8").stat().st_size
-        if size != total:
-            raise ValueError(f"{path / 'splice.u8'} has {size:,} bytes, its record says {total:,}")
+        size = data.stat().st_size
+        if size != total * dtype.itemsize:
+            raise ValueError(f"{data} has {size:,} bytes, its record says {total:,} bases of {dtype}")
         at = {i: k for k, i in enumerate(ids)}
         swap = np.arange(len(ids))
         for k, i in enumerate(ids):
@@ -140,9 +148,9 @@ class LabelStore:
             swap[k] = at[other]
         positives = np.array([int(j["check"][i]["sites"]) for i in ids], dtype=np.int64)
         identity = dict(ids=ids, encoding="one bit per channel", genome=j.get("genome"), total_bases=total,
-                        definition=j.get("definition"), labels_sha256=j.get("splice_sha256"),
+                        definition=j.get("definition"), labels_sha256=j.get(f"{stem}_sha256"),
                         record_sha256=hashlib.sha256(raw).hexdigest())
-        return cls(path=path, ids=ids, labels=np.memmap(path / "splice.u8", dtype=np.uint8, mode="r"), swap=swap,
+        return cls(path=path, ids=ids, labels=np.memmap(data, dtype=dtype, mode="r"), swap=swap,
                    positives=positives, genome=str(j.get("genome")), identity=identity)
 
     @property
@@ -153,7 +161,7 @@ class LabelStore:
         """Targets ``[width, T]`` uint8 (0 or 1) of bases ``at:at + take``; ``flip``: the other strand."""
         out = np.zeros((width, len(self.ids)), dtype=np.uint8)
         bits = np.asarray(self.labels[at:at + take])
-        out[:take] = (bits[:, None] >> np.arange(len(self.ids))[None, :]) & 1
+        out[:take] = (bits[:, None] >> np.arange(len(self.ids), dtype=bits.dtype)[None, :]) & 1
         if flip:
             out[:take] = out[:take][::-1][:, self.swap]
         return out
@@ -262,9 +270,9 @@ def open_store(path: str | Path):
         return BinnedTrackStore.open(path)
     if (path / "dense.json").exists():
         return TrackStore.open(path)
-    if (path / "splice.json").exists():
+    if (path / "splice.json").exists() or (path / "labels.json").exists():
         return LabelStore.open(path)
-    raise ValueError(f"{path} holds neither dense.json (measured tracks) nor splice.json (labels)")
+    raise ValueError(f"{path} holds none of binned.json, dense.json (tracks), splice.json or labels.json (labels)")
 
 
 # ------------------------------------------------------------------------------------------------- the loss
@@ -609,6 +617,19 @@ def param_groups(model: G.KronGenome, weight_decay: float = 0.1) -> list[dict]:
             (h, [(n, p) for n, p in named if n.startswith(f"xheads.{h}.")]) for h in model.xheads]:
         groups.append(dict(params=[p for n, p in rows if decays(n, p)], weight_decay=weight_decay, role=role))
         groups.append(dict(params=[p for n, p in rows if not decays(n, p)], weight_decay=0.0, role=role))
+    return groups
+
+
+def parse_cycle(spec: str, heads: list[str]) -> list[set[str]]:
+    """``--xhead-cycle``: groups split by ';', heads by ','. Every name a registered head, every head in a group."""
+    groups = [{h.strip() for h in g.split(",") if h.strip()} for g in spec.split(";")]
+    if any(not g for g in groups):
+        raise ValueError(f"--xhead-cycle {spec!r}: an empty group")
+    unknown = sorted(set().union(*groups) - set(heads))
+    missing = [h for h in heads if not any(h in g for g in groups)]
+    if unknown or missing:
+        raise ValueError(f"--xhead-cycle {spec!r}: " + "; ".join(
+            ([f"not a head: {unknown}"] if unknown else []) + ([f"in no group: {missing}"] if missing else [])))
     return groups
 
 

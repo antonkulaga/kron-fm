@@ -361,3 +361,59 @@ def test_a_pre_binned_store_trains_its_head_on_cells_with_windows_on_the_grid(ge
     assert loss.len() > 0 and loss.is_finite().all() and (d["heldout_n"].cast(pl.Int64, strict=False) > 0).any()
     res, _ = run(cli, monkeypatch, root, tmp_path / "bad", args + ["--xhead-bin", "dnase=64"])
     assert res.exit_code != 0 and "binned at 128" in MGT.flat(res.output + repr(res.exception))
+
+
+def splice_labels(tmp_path, primary):
+    total = int(np.fromfile(primary / "bases.u8", dtype=np.uint8).size)
+    d = tmp_path / "labels"
+    d.mkdir()
+    rng = np.random.default_rng(4)
+    lab = np.zeros(total, dtype=np.uint8)
+    bits = {"donor_plus": 0, "acceptor_plus": 1, "donor_minus": 2, "acceptor_minus": 3}
+    for b in bits.values():
+        lab[rng.random(total) < 0.02] |= 1 << b
+    lab.tofile(d / "splice.u8")
+    (d / "splice.json").write_text(json.dumps(dict(
+        genome="hgt", total_bases=total, bits=bits, definition="one base per site, per strand", splice_sha256="x",
+        check={k: dict(sites=int(((lab >> b) & 1).sum())) for k, b in bits.items()})))
+    return d
+
+
+def test_a_head_cycle_trains_one_group_per_step_and_reads_only_its_stores(genomes, tmp_path, monkeypatch):
+    """--xhead-cycle 'dnase;splice': each optimizer step updates one head, in turn; both train; the loader reads the
+    DNase store less than without the cycle (only on its steps and in evaluation); a bad cycle is refused."""
+    from kron_dna import xheads as XH
+    root, parent, store, child = setup(genomes, tmp_path, monkeypatch)
+    args = [a if a != "splice:2" else f"splice:{splice_labels(tmp_path, genomes['hgt'])}" for a in child]
+    reads: list = []
+    real = XH.TrackStore.window
+
+    def counted(self, *a, **k):
+        reads.append(1)
+        return real(self, *a, **k)
+
+    monkeypatch.setattr(XH.TrackStore, "window", counted)
+    res, _ = run(cli, monkeypatch, root, tmp_path / "all", args)
+    assert res.exit_code == 0, res.output + repr(res.exception)
+    n_all = len(reads)
+    reads.clear()
+    out = tmp_path / "cycle"
+    res, _ = run(cli, monkeypatch, root, out, args + ["--xhead-cycle", "dnase;splice", "--xhead-recompute"])
+    assert res.exit_code == 0, res.output + repr(res.exception)
+    assert 0 < len(reads) < n_all
+    x = pl.read_csv(out / "xheads.csv")
+    new = {h: np.diff(np.concatenate([[0], x.filter(pl.col("head") == h).sort("step")["updates"].to_numpy()]))
+           for h in ("dnase", "splice")}
+    assert not (new["dnase"] & new["splice"]).any()                  # never both heads in one step
+    assert new["dnase"].sum() > 0 and new["splice"].sum() > 0
+    steps = x.filter(pl.col("head") == "dnase").sort("step")["step"].to_numpy()
+    assert ((steps[new["dnase"] > 0] - 1) % 2 == 0).all() and ((steps[new["splice"] > 0] - 1) % 2 == 1).all()
+    for bad, why in (("dnase", "in no group"), ("dnase;splice;nohead", "not a head"), ("dnase;;splice", "empty")):
+        res, _ = run(cli, monkeypatch, root, tmp_path / "bad", args + ["--xhead-cycle", bad])
+        assert res.exit_code != 0 and why in MGT.flat(res.output + repr(res.exception)), bad
+
+
+def test_a_head_in_fewer_groups_gets_its_loss_scaled():
+    from kron_dna import xheads as XH
+    g = XH.parse_cycle("a,b;a;c", ["a", "b", "c"])
+    assert g == [{"a", "b"}, {"a"}, {"c"}]

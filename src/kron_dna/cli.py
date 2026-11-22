@@ -878,6 +878,13 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                  xhead_layers: int = typer.Option(2, help="with --xhead-kind kron: KronLSTM layers per head"),
                  xhead_step_bases: int = typer.Option(32, help="with --xhead-kind kron: bases per KronLSTM step"),
                  xhead_width: int = typer.Option(128, help="with --xhead-kind kron: the heads' KronLSTM width"),
+                 xhead_cycle: str = typer.Option("", help="train one group of --xhead heads per optimizer step, in "
+                                                 "turn: groups split by ';', heads by ',' (e.g. 'dnase,splice;rna;chip'"
+                                                 "); every head in some group; a head's loss is scaled by groups / the "
+                                                 "groups that hold it; held-out scoring still runs every head. Peak "
+                                                 "memory is the largest group's, not the sum"),
+                 xhead_recompute: bool = typer.Option(False, help="recompute each --xhead head's inside in backward: "
+                                                      "only its input and output are kept"),
                  xhead_only: int = typer.Option(200, help="with --xhead: labelled updates of the first head before "
                                                 "the inherited weights train too (their rate is 0 until then)"),
                  xhead_lr: float = typer.Option(4e-4, help="peak rate of each --xhead, reached over --xhead-warmup "
@@ -1257,6 +1264,7 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
         n_epi = reg_active.shape[1]
         say(f"cell-type conditioning: {n_epi} epigenomes, {reg_active.shape[0]:,} regulatory elements")
     epi_batch: list = []                                                  # the last sample()'s bin targets
+    x_read: dict = {"heads": None}    # --xhead-cycle: the heads whose stores sample() reads now (None: every head)
     epi_unit = 128 if arch == "v3" else unit                               # v3 pools its 1-bp states per 128 bp
 
     annot_pos = annot_coff = annot_clen = None
@@ -1316,6 +1324,11 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
         if covers_ != len(bases):
             raise typer.BadParameter(f"--xhead {name_x}: the store covers {covers_:,} bases, "
                                      f"the primary genome {name} has {len(bases):,}")
+    try:                                              # --xhead-cycle: the head groups trained in turn
+        x_groups = XH.parse_cycle(xhead_cycle, list(xhead_sizes)) if xhead_cycle else []
+    except ValueError as e_:
+        raise typer.BadParameter(str(e_))
+    x_scale = {n_: len(x_groups) / sum(n_ in g_ for g_ in x_groups) for n_ in xhead_sizes} if x_groups else {}
     x_bin: dict[str, int] = {}                        # head -> bases per output (1: per base)
     for spec_b in xhead_bin:
         name_b, _, val_b = spec_b.partition("=")
@@ -1739,7 +1752,7 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                     sp_[:take] = sp_[:take][::-1]
                 for n_, st_ in xstores.items():           # primary-genome rows only; elsewhere unsupervised zeros
                     xh_t[n_].append(st_.window(at, take, wrow, flip_row) if xs is None and not from_mito and fg is None
-                                    else st_.empty(wrow))
+                                    and (x_read["heads"] is None or n_ in x_read["heads"]) else st_.empty(wrow))
                 nt_t.append(nt)
                 nt_s.append(sp_)
                 nt_c.append(cm_)
@@ -1752,8 +1765,8 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                     if flip_row:
                         sp_[:take] = sp_[:take][::-1]
                 for n_, st_ in xstores.items():
-                    xh_t[n_].append(st_.window(at, take, wrow, flip_row) if primary_
-                                    else st_.empty(wrow))
+                    xh_t[n_].append(st_.window(at, take, wrow, flip_row)
+                                    if primary_ and (x_read["heads"] is None or n_ in x_read["heads"]) else st_.empty(wrow))
                 nt_t.append(np.zeros((wrow, 0), dtype=np.uint8))
                 nt_s.append(sp_)
                 nt_c.append(np.zeros(0, dtype=bool))
@@ -1829,6 +1842,8 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
     torch.manual_seed(seed)                       # initial weights from --seed (audit 2026-11-18, TR03)
     model = G.KronGenome(config).to(dev)
     model.checkpoint_core = checkpoint_core
+    if xhead:
+        model.checkpoint_xheads = xhead_recompute
     split_devs = None                                 # --split-cards: the cards one window is divided over
     split_by = "balanced" if pack_short else None     # packs may hold an odd number of short rows (genome.split_plan)
     if split_cards > 1:
@@ -2239,7 +2254,8 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                 else:                   # scored on the held-out chromosomes only (split code 4)
                     x_ok = (ntv3_batch[0][1] == 4).float()
                 if float(x_ok.sum()) > 0:
-                    x_now = xstage.active
+                    x_now = [h_ for h_ in xstage.active      # --xhead-cycle: this step's group in training
+                             if not model.training or x_read["heads"] is None or h_ in x_read["heads"]]
             model.x_active = set(x_now)
             # training: the heads run on the supervised stretch only (the window's centre): the same loss and
             # gradients, without their activations at every other base. Evaluation scores whole windows.
@@ -2358,7 +2374,7 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                           if split_now else
                           XH.head_loss(model.last_x[n_], want_x[:, lo_x // cell_x:hi_x // cell_x].to(dev),
                                        x_ok[:, lo_x:hi_x].to(dev), x_consts_on(n_)(dev), kind_x, bin_x))
-                mlm = mlm + xhead_weight * loss_x
+                mlm = mlm + xhead_weight * x_scale.get(n_, 1.0) * loss_x
                 x_losses[n_].append(float(loss_x.detach()))
                 x_step.add(n_)
             else:                       # held-out rows whole: log1p signal at 128 bp, or logits against labels
@@ -2662,6 +2678,7 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
         if mito_slice:          # base-proportional weights: the main draw's bases and the slice's
             main_bases = win * bat * grad_accum
             w_main, w_slice = main_bases / (main_bases + mito_slice), mito_slice / (main_bases + mito_slice)
+        x_read["heads"] = x_groups[step % len(x_groups)] if x_groups else None    # --xhead-cycle
         for _ in range(grad_accum):
             if whole_contigs:
                 loss, track = contig_loss(*sample_contig(train_idx, longest=bench))
@@ -2678,6 +2695,7 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
             ((loss + track_weight * track if track is not None else loss) / grad_accum).backward()
             if bench_grads is not None and step == 0:
                 bench_losses.append(float(loss.detach()))
+        x_read["heads"] = None          # every other draw (the --mito-slice part, evaluation) reads every store
         if mito_slice:          # after the main draw's backward: its activations are freed; one optimizer step
             if dev.type == "cuda":                          # time the slice alone (the main backward has finished)
                 torch.cuda.synchronize(dev)

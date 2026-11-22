@@ -223,3 +223,26 @@ def test_binned_loss_and_eval_use_bin_means_of_the_per_base_targets():
     assert torch.allclose(w_log, (want.float() / 255 * 3.0).reshape(2, 4, 16, 3).mean(2))
     with pytest.raises(ValueError):
         X.head_loss(pred, want, ok, (torch.ones(3),), "binary", 16)
+
+
+def test_recomputed_kron_heads_give_the_same_outputs_and_gradients(device):
+    torch.manual_seed(0)
+    m = kron_heads(small("v2"), [["dnase", 3], ["rna", 2, 16]], xhead_bin=4).to(device).train()
+    seq = torch.randint(0, 4, (2, 256), device=device)
+    grads = []
+    for ck in (False, True):
+        m.zero_grad(set_to_none=True)
+        m.checkpoint_xheads = ck
+        torch.manual_seed(2)                                          # the same draws (dropout, masks) in both passes
+        m(seq)
+        loss = sum((v.float() ** 2).mean() for v in m.last_x.values())
+        loss.backward()
+        grads.append({n: p.grad.clone() for n, p in m.named_parameters() if p.grad is not None})
+        outs = {n: v.detach().clone() for n, v in m.last_x.items()}
+        if not ck:
+            first = outs
+    assert grads[0].keys() == grads[1].keys() and any(n.startswith("xheads.") for n in grads[0])
+    for n in grads[0]:
+        torch.testing.assert_close(grads[1][n], grads[0][n], rtol=1e-4, atol=1e-6)
+    for n in first:
+        torch.testing.assert_close(outs[n], first[n])
