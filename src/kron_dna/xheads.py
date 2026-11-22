@@ -304,9 +304,11 @@ class SpeciesStores:
         self.ids = list(primary.ids)
         for g, st in extra.items():
             cols = np.empty(len(st.ids), dtype=np.int64)
-            for k, key in enumerate(channel_keys(st)):
-                if share and key in first:
+            taken = set()                             # a primary channel is shared with one channel of each genome:
+            for k, key in enumerate(channel_keys(st)):  # a second experiment of that biosample gets its own channel
+                if share and key in first and first[key] not in taken:
                     cols[k] = first[key]
+                    taken.add(first[key])
                 else:
                     cols[k] = len(self.ids)
                     self.ids.append(f"{g}:{st.ids[k]}")

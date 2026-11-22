@@ -323,6 +323,10 @@ def test_species_stores_share_matching_channels_and_append_the_rest(tmp_path):
     assert w.shape == (4, 5) and (w[:, [0, 2, 3, 4]] == 7).all() and (w[:, 1] == 0).all()
     assert s.consts("cpu")[0].tolist() == [0, 1, 2, 3, 101]           # the primary's on shared channels
     assert s.identity["species"]["mm"]["channels"] == [0, 4, 2, 3]
+    twice = _Part(tmp_path, "m2", ["F1", "F1b"], "tracks_binned",
+                  [dict(assay="DNase-seq", biosample="liver"), dict(assay="DNase-seq", biosample="liver")], genome="mm")
+    t2 = XH.SpeciesStores(hs, {"mm": twice})                      # two liver experiments: one shares, one is new
+    assert t2.cols["mm"].tolist() == [0, 4] and t2.ids[4] == "mm:F1b" and t2.shared == {"mm": 1}
     lab_h, lab_m = (_Part(tmp_path, n, ["donor_plus", "donor_minus"], "binary") for n in ("lh", "lm"))
     lab_h.swap = lab_m.swap = np.array([1, 0])
     b = XH.SpeciesStores(lab_h, {"mm": lab_m})
