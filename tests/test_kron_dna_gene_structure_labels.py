@@ -24,6 +24,7 @@ RC = str.maketrans("ACGT", "TGCA")
 
 
 def build(tmp_path, shift=0):
+    tmp_path.mkdir(parents=True, exist_ok=True)
     rng = np.random.default_rng(0)
     chrom = list(rng.choice(list("ACGT"), 3000))
     # + gene: tx 100..400 (0-based, end excl.); exon1 100-200, intron 200-300, exon2 300-400; CDS 150-350 incl. stop
@@ -99,3 +100,21 @@ def test_shifted_coordinates_are_refused(tmp_path, monkeypatch):
     with pytest.raises(typer.Exit):
         run(tmp_path, monkeypatch, shift=1)
     assert not (tmp_path / "labels" / "labels.u16").exists()
+
+
+def test_a_gff3_gives_the_same_labels(tmp_path, monkeypatch):
+    """The same annotation as GFF3 (transcripts by Parent=) gives the same label array as the GTF."""
+    out = run(tmp_path / "gtf", monkeypatch)
+    g, gtf = build(tmp_path / "gff")
+    lines = []
+    for line in gtf.read_text().splitlines():
+        c = line.split("\t")
+        tid = c[8].split('transcript_id "')[1].split('"')[0]
+        lines.append("\t".join(c[:8] + [f"ID={c[2]}{len(lines)};Parent=transcript:{tid}"]))
+    gff = tmp_path / "gff" / "toy.gff3"
+    gff.write_text("##gff-version 3\n" + "\n".join(lines) + "\n")
+    monkeypatch.setattr(GS, "interim_dir", lambda *a: g)
+    GS.main(tmp_path / "gff" / "labels", name="toy", gtf=gff, basic_only=False, chrom_prefix="")
+    a = np.fromfile(out / "labels.u16", dtype=np.uint16)
+    b = np.fromfile(tmp_path / "gff" / "labels" / "labels.u16", dtype=np.uint16)
+    assert np.array_equal(a, b) and a.any()
