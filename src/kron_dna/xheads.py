@@ -262,6 +262,140 @@ class BinnedTrackStore:
                 for k in ("ids", "encoding", "bin", "genome", "total_bases") if saved.get(k) != self.identity.get(k)]
 
 
+def channel_keys(store) -> list:
+    """What makes two stores' channels the same output: for a label store its channel id (the same definition in
+    every genome); for a track store (assay, target, biosample, strand) from its record, the assay folded so that
+    the RNA-seq kinds agree (biosample terms are ENCODE's ontology names, shared by human and mouse tissues)."""
+    if store.kind == "binary":
+        return list(store.ids)
+    rec = json.loads((Path(store.path) / ("binned.json" if store.kind == "tracks_binned" else "dense.json")).read_text())
+    keys = []
+    for i, t in zip(store.ids, rec.get("tracks") or [{}] * len(store.ids)):
+        assay = "RNA-seq" if "RNA-seq" in str(t.get("assay", "")) else str(t.get("assay", ""))
+        strand = i[-2:] if i.endswith(("_P", "_M")) else ""
+        keys.append((assay, str(t.get("target") or ""), str(t.get("biosample") or i), strand))
+    return keys
+
+
+class SpeciesStores:
+    """One further head's stores on several genomes (``--xhead-species``). The head's channels are the primary
+    store's, then each further genome's channels that match none of them (an ``<genome>:``-prefixed id); a channel
+    of a further genome that matches a primary one (:func:`channel_keys`: the same label, or the same assay, target,
+    biosample and strand, e.g. DNase in liver) is that channel, trained by both genomes' windows. A row of genome
+    ``g`` reads ``g``'s store into ``g``'s channels, zeros elsewhere; its channel mask (:meth:`mask`) is those
+    channels, so the loss and the held-out score see only what the row has. Every part is of one kind; channels are
+    shared only between stores whose targets are already normalised per track (pre-binned or label stores), since
+    a per-base store's bytes decode with its own track's scale."""
+
+    def __init__(self, primary, extra: dict, share: bool = True) -> None:
+        self.parts = [(None, primary)] + list(extra.items())
+        kinds = {st.kind for _, st in self.parts}
+        if len(kinds) != 1:
+            raise ValueError(f"the stores of one head must be of one kind, got {sorted(kinds)}")
+        self.kind = primary.kind
+        if self.kind == "tracks_binned" and len({st.bin for _, st in self.parts}) != 1:
+            raise ValueError("the pre-binned stores of one head must share a bin")
+        share = share and self.kind != "tracks"
+        self.primary, self.path, self.genome = primary, primary.path, primary.genome
+        first = {}
+        for k, key in enumerate(channel_keys(primary)):
+            first.setdefault(key, k)
+        self.cols = {None: np.arange(len(primary.ids))}
+        self.ids = list(primary.ids)
+        for g, st in extra.items():
+            cols = np.empty(len(st.ids), dtype=np.int64)
+            for k, key in enumerate(channel_keys(st)):
+                if share and key in first:
+                    cols[k] = first[key]
+                else:
+                    cols[k] = len(self.ids)
+                    self.ids.append(f"{g}:{st.ids[k]}")
+            self.cols[g] = cols
+        # each channel's strand partner, in head columns; a channel two genomes share must have one partner
+        sw = np.full(len(self.ids), -1)
+        for g, st in self.parts:
+            cols, mine = self.cols[g], self.cols[g][np.asarray(st.swap)]
+            clash = (sw[cols] >= 0) & (sw[cols] != mine)
+            if clash.any():
+                raise ValueError(f"--xhead-species {g}: a shared stranded channel's partner differs between genomes")
+            sw[cols] = mine
+        self.swap = sw
+        self.shared = {g: int((c < len(primary.ids)).sum()) for g, c in self.cols.items() if g is not None}
+        if self.kind == "binary":
+            pos = np.zeros(len(self.ids), dtype=np.int64)
+            for g, st in self.parts:
+                np.add.at(pos, self.cols[g], st.positives)
+            self.positives = pos
+        if self.kind == "tracks_binned":
+            self.bin = primary.bin
+        self.identity = dict(primary.identity, species={g: dict(st.identity, path=str(st.path),
+                                                                channels=self.cols[g].tolist())
+                                                       for g, st in self.parts if g is not None})
+
+    @property
+    def dense(self):                                  # the primary's, for the size check against the primary genome
+        return self.primary.dense
+
+    @property
+    def total_bases(self) -> int:
+        return self.primary.total_bases
+
+    def store_of(self, genome: str | None):
+        return dict(self.parts)[genome]
+
+    def mask(self, genome: str | None) -> np.ndarray:
+        """``[T]`` bool: the channels a row of ``genome`` (None: the primary) supervises."""
+        m = np.zeros(len(self.ids), dtype=bool)
+        m[self.cols[genome]] = True
+        return m
+
+    def _place(self, part: np.ndarray, genome: str | None) -> np.ndarray:
+        out = np.zeros(part.shape[:1] + (len(self.ids),) + part.shape[2:], dtype=part.dtype)
+        out[:, self.cols[genome]] = part
+        return out
+
+    def window(self, at: int, take: int, width: int, flip: bool = False, genome: str | None = None) -> np.ndarray:
+        return self._place(self.store_of(genome).window(at, take, width, flip), genome)
+
+    def empty(self, width: int) -> np.ndarray:
+        return self._place(self.primary.empty(width), None) * 0
+
+    def consts(self, device) -> tuple:
+        """Per channel, the primary store's constants where it has the channel, else the further genome's."""
+        out = None
+        for g, st in reversed(self.parts):            # the primary written last, so its values stand on shared channels
+            c = st.consts(device)
+            if out is None:
+                out = [torch.zeros((len(self.ids),) + tuple(v.shape[1:]), dtype=v.dtype, device=v.device) for v in c]
+            cols = torch.as_tensor(self.cols[g], device=c[0].device)
+            for o, v in zip(out, c):
+                o[cols] = v
+        return tuple(out)
+
+    def scorer(self, bin: int = 1):
+        sc = self.primary.scorer(bin)
+        return Pearson(len(self.ids), sc.bin) if isinstance(sc, Pearson) else AveragePrecision(len(self.ids))
+
+    def differences(self, saved: dict) -> list[str]:
+        out = self.primary.differences({k: v for k, v in saved.items() if k != "species"})
+        if saved.get("species") != self.identity.get("species"):
+            out.append(f"species: checkpoint {sorted(saved.get('species') or {})}, now {sorted(self.identity['species'])}")
+        return out
+
+
+def store_of_record(entry: dict):
+    """A head's store as a run record lists it (``xheads.stores[name]``): the store at its path, or, for a head
+    with further genomes, the same :class:`SpeciesStores` (the channel map is checked against the record)."""
+    st = open_store(entry["path"])
+    if not entry.get("species"):
+        return st
+    out = SpeciesStores(st, {g: open_store(e["path"]) for g, e in entry["species"].items()})
+    for g, e in entry["species"].items():
+        if out.cols[g].tolist() != list(e["channels"]):
+            raise ValueError(f"{entry['path']}: genome {g}'s channels moved since the run ({e['channels'][:6]} ...)")
+    return out
+
+
 def open_store(path: str | Path):
     """The store at ``path``: measured tracks (``dense.json``), pre-binned tracks (``binned.json``) or 0/1 labels
     (``splice.json``)."""
@@ -309,9 +443,20 @@ def supervised(split: torch.Tensor, center: float = 1.0, skip: torch.Tensor | No
     return ok
 
 
-def _bce_sum(pred: torch.Tensor, want: torch.Tensor, ok: torch.Tensor, consts: tuple) -> torch.Tensor:
+def _bce_sum(pred: torch.Tensor, want: torch.Tensor, ok: torch.Tensor, consts: tuple,
+             cmask: torch.Tensor | None = None) -> torch.Tensor:
     per = F.binary_cross_entropy_with_logits(pred.float(), want.float(), pos_weight=consts[0], reduction="none")
-    return (per * ok.unsqueeze(-1)).sum()
+    return (per * _values(ok.unsqueeze(-1), cmask)).sum()
+
+
+def _values(m: torch.Tensor, cmask: torch.Tensor | None) -> torch.Tensor:
+    """A position mask ``[B, L, 1]`` times the rows' channel mask ``[B, T]`` (None: every channel)."""
+    return m if cmask is None else m * cmask.to(m.dtype).unsqueeze(1)
+
+
+def _n_values(ok: torch.Tensor, t: int, cmask: torch.Tensor | None) -> torch.Tensor:
+    """The number of supervised (position, channel) values: ``ok`` [B, L] summed over the channels each row has."""
+    return (ok.sum() * t if cmask is None else (ok.sum(1) * cmask.to(ok.dtype).sum(1)).sum()).clamp_min(1)
 
 
 def span_of(ok: torch.Tensor, unit: int) -> tuple[int, int] | None:
@@ -347,40 +492,43 @@ def binned_targets(want: torch.Tensor, ok: torch.Tensor, consts: tuple, bin: int
 
 
 def head_loss(pred: torch.Tensor, want: torch.Tensor, ok: torch.Tensor, consts: tuple,
-              kind: str = "tracks", bin: int = 1) -> torch.Tensor:
+              kind: str = "tracks", bin: int = 1, cmask: torch.Tensor | None = None) -> torch.Tensor:
     """The head's loss on a whole window: ``pred`` [B, L, T] raw outputs, ``want`` [B, L, T] stored targets, ``ok``
     [B, L] from :func:`supervised`, ``consts`` the store's on ``pred``'s device. ``kind`` "tracks": the NTv3 head's
-    Poisson-multinomial on scaled signal; "binary": weighted BCE, the mean over supervised values."""
+    Poisson-multinomial on scaled signal; "binary": weighted BCE, the mean over supervised values. ``cmask`` [B, T]:
+    the channels each row supervises (a further species' rows, ``SpeciesStores``); None: all."""
     if kind == "binary":
         if bin != 1:
             raise ValueError("a binary head predicts per base")
-        return _bce_sum(pred, want, ok, consts) / (ok.sum() * pred.shape[-1]).clamp_min(1)
+        return _bce_sum(pred, want, ok, consts, cmask) / _n_values(ok, pred.shape[-1], cmask)
     y, m = (want[..., 0].float(), pool_ok(ok, bin)) if kind == "tracks_binned" else binned_targets(want, ok, consts, bin)
-    return G.poisson_multinomial_loss(F.softplus(pred.float()), y, m.unsqueeze(-1))
+    return G.poisson_multinomial_loss(F.softplus(pred.float()), y, _values(m.unsqueeze(-1), cmask))
 
 
 def head_loss_parts(pred: torch.Tensor, want: torch.Tensor, ok: torch.Tensor, consts: tuple, bin: int = 1,
-                    kind: str = "tracks") -> dict:
+                    kind: str = "tracks", cmask: torch.Tensor | None = None) -> dict:
     """The same for one piece of a split window, on the piece's card: the sums
     :func:`kron_dna.genome.poisson_multinomial_combine` joins on the first card into :func:`head_loss`'s value."""
     y, m = (want[..., 0].float(), pool_ok(ok, bin)) if kind == "tracks_binned" else binned_targets(want, ok, consts, bin)
-    return G.poisson_multinomial_parts(F.softplus(pred.float()), y, m.unsqueeze(-1))
+    return G.poisson_multinomial_parts(F.softplus(pred.float()), y, _values(m.unsqueeze(-1), cmask))
 
 
 def split_head_loss(pieces: list, name: str, want: torch.Tensor, ok: torch.Tensor, consts_on, device,
-                    kind: str = "tracks", bin: int = 1) -> torch.Tensor:
+                    kind: str = "tracks", bin: int = 1, cmask: torch.Tensor | None = None) -> torch.Tensor:
     """:func:`head_loss` of head ``name`` from the pieces of ``forward_split``: targets go from the host to each
     piece's card, only per-(row, track) sums cross to ``device``. ``consts_on(device)`` gives that card's constants.
     Each piece's outputs cover its ``x_at`` bases (the model's ``x_span`` within the piece); ``ok`` must be zero
     outside the span, which :func:`span_of` guarantees."""
+    cm = (lambda p: None) if cmask is None else (lambda p: cmask[p.rows].to(p.device))
     if kind == "binary":
         tot = sum(_bce_sum(p.x[name], want[p.rows, p.x_at[0]:p.x_at[1]].to(p.device),
-                           ok[p.rows, p.x_at[0]:p.x_at[1]].to(p.device), consts_on(p.device)).to(device)
+                           ok[p.rows, p.x_at[0]:p.x_at[1]].to(p.device), consts_on(p.device), cm(p)).to(device)
                   for p in pieces)
-        return tot / (ok.sum() * want.shape[-1]).clamp_min(1).to(device)
+        return tot / _n_values(ok, want.shape[-1], cmask).to(device)
     cell = bin if kind == "tracks_binned" else 1      # a pre-binned store's targets are per cell, not per base
     parts = [(p.rows, head_loss_parts(p.x[name], want[p.rows, p.x_at[0] // cell:p.x_at[1] // cell].to(p.device),
-                                      ok[p.rows, p.x_at[0]:p.x_at[1]].to(p.device), consts_on(p.device), bin, kind))
+                                      ok[p.rows, p.x_at[0]:p.x_at[1]].to(p.device), consts_on(p.device), bin, kind,
+                                      cm(p)))
              for p in pieces]
     return G.poisson_multinomial_combine(parts, want.shape[0], device)
 
@@ -390,31 +538,34 @@ class Pearson:
     benchmark's resolution), over the positions given."""
 
     def __init__(self, n: int, bin: int = 128) -> None:
-        self.bin, self.n = bin, 0
+        self.bin = bin
+        self.n = torch.zeros(n, dtype=torch.float64)  # bins added, per channel
         self.s = [torch.zeros(n, dtype=torch.float64) for _ in range(5)]
 
-    def add(self, pred_log1p: torch.Tensor, want_log1p: torch.Tensor) -> None:
-        """``[B, L, T]`` each; whole bins only."""
+    def add(self, pred_log1p: torch.Tensor, want_log1p: torch.Tensor, cmask: torch.Tensor | None = None) -> None:
+        """``[B, L, T]`` each; whole bins only. ``cmask`` [B, T]: the channels each row counts for (None: all)."""
         b, length, t = pred_log1p.shape
         keep = length - length % self.bin
         if not keep:
             return
+        w = torch.ones(b, t, dtype=torch.float64) if cmask is None else cmask.double().cpu()
+        w = w.unsqueeze(1).expand(b, keep // self.bin, t).reshape(-1, t)
         x = pred_log1p[:, :keep].double().reshape(b, -1, self.bin, t).mean(2).reshape(-1, t).cpu()
         y = want_log1p[:, :keep].double().reshape(b, -1, self.bin, t).mean(2).reshape(-1, t).cpu()
-        self.n += x.shape[0]
-        for acc, v in zip(self.s, (x.sum(0), y.sum(0), (x * y).sum(0), (x * x).sum(0), (y * y).sum(0))):
+        self.n += w.sum(0)
+        for acc, v in zip(self.s, ((w * x).sum(0), (w * y).sum(0), (w * x * y).sum(0), (w * x * x).sum(0),
+                                   (w * y * y).sum(0))):
             acc += v
 
     def value(self) -> np.ndarray:
         """Per channel; NaN where either side is constant or nothing was added."""
-        if not self.n:
-            return np.full(len(self.s[0]), np.nan)
+        n = self.n.numpy()
         sx, sy, sxy, sxx, syy = (v.numpy() for v in self.s)
-        cov = sxy / self.n - sx * sy / self.n ** 2
-        vx, vy = sxx / self.n - (sx / self.n) ** 2, syy / self.n - (sy / self.n) ** 2
         with np.errstate(divide="ignore", invalid="ignore"):
+            cov = sxy / n - sx * sy / n ** 2
+            vx, vy = sxx / n - (sx / n) ** 2, syy / n - (sy / n) ** 2
             r = cov / np.sqrt(vx * vy)
-        return np.where((vx > 1e-12) & (vy > 1e-12), r, np.nan)
+        return np.where((n > 0) & (vx > 1e-12) & (vy > 1e-12), r, np.nan)
 
 
 class AveragePrecision:
@@ -430,12 +581,14 @@ class AveragePrecision:
         self.neg_total = [0] * n
         self.floor = [float("-inf")] * n              # above it every negative of every batch was kept
 
-    def add(self, pred: torch.Tensor, want: torch.Tensor) -> None:
-        """``[B, L, T]`` logits and 0/1 labels."""
-        t = pred.shape[-1]
+    def add(self, pred: torch.Tensor, want: torch.Tensor, cmask: torch.Tensor | None = None) -> None:
+        """``[B, L, T]`` logits and 0/1 labels; ``cmask`` [B, T]: the channels each row counts for (None: all)."""
+        b, length, t = pred.shape
         x, y = pred.detach().float().reshape(-1, t).cpu(), want.reshape(-1, t).cpu() > 0
+        w = (torch.ones(b, t, dtype=torch.bool) if cmask is None else cmask.bool().cpu()).unsqueeze(1)
+        w = w.expand(b, length, t).reshape(-1, t)
         for k in range(t):
-            p, q = x[y[:, k], k], x[~y[:, k], k]
+            p, q = x[y[:, k] & w[:, k], k], x[~y[:, k] & w[:, k], k]
             self.pos[k].append(p)
             self.neg_total[k] += int(q.numel())
             if q.numel():
@@ -462,6 +615,13 @@ class AveragePrecision:
             rank = torch.arange(1, p.numel() + 1, dtype=torch.float64)
             out[k] = float((rank / (rank + above)).mean())
         return out
+
+
+def scored_n(scorer) -> int:
+    """What a scorer counted, as one number: a Pearson's bins (of its most-counted channel; channels differ when rows
+    carry channel masks), an average precision's positives."""
+    n = scorer.n
+    return int(n.max()) if torch.is_tensor(n) else int(n)
 
 
 def eval_pair(store, pred: torch.Tensor, want: torch.Tensor, consts: tuple, bin: int = 1

@@ -363,10 +363,10 @@ def test_a_pre_binned_store_trains_its_head_on_cells_with_windows_on_the_grid(ge
     assert res.exit_code != 0 and "binned at 128" in MGT.flat(res.output + repr(res.exception))
 
 
-def splice_labels(tmp_path, primary):
+def splice_labels(tmp_path, primary, name="labels"):
     total = int(np.fromfile(primary / "bases.u8", dtype=np.uint8).size)
-    d = tmp_path / "labels"
-    d.mkdir()
+    d = tmp_path / name
+    d.mkdir(parents=True)
     rng = np.random.default_rng(4)
     lab = np.zeros(total, dtype=np.uint8)
     bits = {"donor_plus": 0, "acceptor_plus": 1, "donor_minus": 2, "acceptor_minus": 3}
@@ -417,3 +417,42 @@ def test_a_head_in_fewer_groups_gets_its_loss_scaled():
     from kron_dna import xheads as XH
     g = XH.parse_cycle("a,b;a;c", ["a", "b", "c"])
     assert g == [{"a", "b"}, {"a"}, {"c"}]
+
+
+def test_a_further_genome_trains_its_channels_and_an_init_widens_the_readout(genomes, tmp_path, monkeypatch):
+    """--xhead-species with --genome gB: the DNase head gains gB's 3 channels (per-base track stores never share a
+    channel, so they are appended), the splice head shares its 4 label channels; the run trains; a child run that
+    adds the species with --init widens the parent's readout, copying the old rows."""
+    root, parent, store, child = setup(genomes, tmp_path, monkeypatch)
+    lab_h = splice_labels(tmp_path, genomes["hgt"], "lab_h")
+    lab_b = splice_labels(tmp_path, genomes["gB"], "lab_b")
+    (tmp_path / "gb").mkdir()
+    gb_store = make_store(tmp_path / "gb", genomes["gB"])
+    base = [a if a != "splice:2" else f"splice:{lab_h}" for a in child] + ["--genome", "gB:0.3:0"]
+    first = tmp_path / "first"
+    res, _ = run(cli, monkeypatch, root, first, base + ["--stop-step", "8"])
+    assert res.exit_code == 0, res.output + repr(res.exception)
+    k = base.index("--init")
+    again = base[:k + 1] + [str(first / "checkpoint.pt"), "--start-step", "8"] + base[k + 4:] + [
+        "--xhead-only", "0", "--xhead-species", f"dnase=gB:{gb_store}", "--xhead-species", f"splice=gB:{lab_b}"]
+    out = tmp_path / "species"
+    res, _ = run(cli, monkeypatch, root, out, again)
+    assert res.exit_code == 0, res.output + repr(res.exception)
+    text = MGT.flat(res.output)
+    assert "--xhead-species dnase: 3 hgt channels + gB: 3 (0 shared) = 6 outputs" in text
+    assert "--xhead-species splice: 4 hgt channels + gB: 4 (4 shared) = 4 outputs" in text
+    assert "widened readouts (old channels kept, new rows fresh): dnase 3 -> 6" in text
+    f = torch.load(first / "checkpoint.pt", map_location="cpu", weights_only=False)
+    e = torch.load(out / "checkpoint.pt", map_location="cpu", weights_only=False)
+    assert e["config"]["xheads"] == [["dnase", 6], ["splice", 4]]
+    assert e["xstage"]["state"]["stores"]["dnase"]["species"]["gB"]["channels"] == [3, 4, 5]
+    x = pl.read_csv(out / "xheads.csv")
+    assert x.filter(pl.col("head") == "dnase")["updates"].max() > 0
+    w0 = f["model"]["xheads.dnase.weight"]
+    assert e["model"]["xheads.dnase.weight"].shape[0] == 6 and w0.shape[0] == 3
+    for bad, why in ((f"nohead=gB:{gb_store}", "for a NAME of --xhead"), (f"dnase=gA:{gb_store}", "not a --genome"),
+                     (f"dnase=gB:{store}", "the store covers")):
+        res, _ = run(cli, monkeypatch, root, tmp_path / "bad", again + ["--xhead-species", bad])
+        assert res.exit_code != 0 and why in MGT.flat(res.output + repr(res.exception)), bad
+    per = [float(v) for v in x.filter(pl.col("head") == "dnase")["heldout_per_channel"].to_list()[-1].split()]
+    assert len(per) == 6 and np.isfinite(per).all()             # gB's channels are scored on its held-out contig

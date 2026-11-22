@@ -162,10 +162,11 @@ def score(bench: Path, checkpoints: list[str] = typer.Argument(..., help="LABEL=
             with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16, enabled=dev.type == "cuda"):
                 model(seq[None], seg, ctx)
             assert model.last_x_at == (flank, flank + WIN), model.last_x_at
-            pd = model.last_x[dnase_head][0].float()                   # [WIN, 13] head output
+            pd = model.last_x[dnase_head][0].float()[:, :len(ds.ids)]  # [WIN, 13]: the primary channels come first
+                                                                          # (a head with --xhead-species has more)
             p_log, _ = X.eval_pair(ds, pd, torch.zeros_like(pd), consts)
             d128[k] = log1p_bins(p_log.cpu().numpy())
-            sp[k] = model.last_x[splice_head][0].float().clamp(-6e4, 6e4).cpu().numpy().astype(np.float16)
+            sp[k] = model.last_x[splice_head][0][:, :4].float().clamp(-6e4, 6e4).cpu().numpy().astype(np.float16)
             if k % 16 == 0:
                 typer.echo(f"{label}: window {k + 1}/{win.height}, {time.time() - t0:.0f} s")
         out.mkdir(parents=True, exist_ok=True)

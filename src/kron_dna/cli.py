@@ -885,6 +885,10 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                                                  "memory is the largest group's, not the sum"),
                  xhead_recompute: bool = typer.Option(False, help="recompute each --xhead head's inside in backward: "
                                                       "only its input and output are kept"),
+                 xhead_species: list[str] = typer.Option([], help="NAME=GENOME:STORE: head NAME also trains on windows "
+                                                         "of --genome GENOME from that genome's store; a channel that "
+                                                         "matches one of the primary store's (assay, target, biosample, "
+                                                         "strand; or a label) is shared, the rest are appended"),
                  xhead_only: int = typer.Option(200, help="with --xhead: labelled updates of the first head before "
                                                 "the inherited weights train too (their rate is 0 until then)"),
                  xhead_lr: float = typer.Option(4e-4, help="peak rate of each --xhead, reached over --xhead-warmup "
@@ -1324,6 +1328,47 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
         if covers_ != len(bases):
             raise typer.BadParameter(f"--xhead {name_x}: the store covers {covers_:,} bases, "
                                      f"the primary genome {name} has {len(bases):,}")
+    x_species: dict[str, set] = {}                    # --xhead-species: genome -> the heads that read it
+    if xhead_species:
+        by_head: dict = {}
+        g_len = {g_.name: len(g_.bases) for g_ in genomes}
+        for spec_s in xhead_species:
+            name_s, _, rest_s = spec_s.partition("=")
+            g_s, _, path_s = rest_s.partition(":")
+            if name_s not in xstores or not g_s or not path_s:
+                raise typer.BadParameter(f"--xhead-species {spec_s!r}: give NAME=GENOME:STORE for a NAME of --xhead "
+                                         "with a store")
+            if g_s not in g_len:
+                raise typer.BadParameter(f"--xhead-species {spec_s!r}: genome {g_s} is not a --genome of this run "
+                                         f"({sorted(g_len)})")
+            try:
+                st_s = XH.open_store(path_s)
+            except (OSError, ValueError, KeyError) as err:
+                raise typer.BadParameter(f"--xhead-species {name_s}={g_s}: {err}") from None
+            cov_s = st_s.total_bases if st_s.kind == "tracks_binned" else st_s.dense.shape[0]
+            if cov_s != g_len[g_s]:
+                raise typer.BadParameter(f"--xhead-species {name_s}={g_s}: the store covers {cov_s:,} bases, the "
+                                         f"genome has {g_len[g_s]:,}")
+            if g_s in by_head.setdefault(name_s, {}):
+                raise typer.BadParameter(f"--xhead-species {name_s}={g_s}: given twice")
+            by_head[name_s][g_s] = st_s
+            x_species.setdefault(g_s, set()).add(name_s)
+        for name_s, extra_s in by_head.items():
+            try:
+                xstores[name_s] = XH.SpeciesStores(xstores[name_s], extra_s)
+            except ValueError as err:
+                raise typer.BadParameter(f"--xhead-species {name_s}: {err}") from None
+            xhead_sizes[name_s] = len(xstores[name_s].ids)
+            say(f"--xhead-species {name_s}: {len(xstores[name_s].primary.ids)} {name} channels + "
+                + ", ".join(f"{g_}: {len(st_.ids)} ({xstores[name_s].shared[g_]} shared)" for g_, st_ in extra_s.items())
+                + f" = {len(xstores[name_s].ids)} outputs")
+
+    def x_mask(st_, g_name):
+        """The channels of head store ``st_`` a row of genome ``g_name`` supervises (None: the primary genome)."""
+        if isinstance(st_, XH.SpeciesStores):
+            return st_.mask(g_name) if g_name in st_.cols else np.zeros(len(st_.ids), dtype=bool)
+        return np.full(len(st_.ids), g_name is None, dtype=bool)
+
     try:                                              # --xhead-cycle: the head groups trained in turn
         x_groups = XH.parse_cycle(xhead_cycle, list(xhead_sizes)) if xhead_cycle else []
     except ValueError as e_:
@@ -1622,6 +1667,7 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
         epi_t, epi_v, epi_e = [], [], []
         nt_t, nt_s, nt_c, nt_x = [], [], [], []
         xh_t = {n_: [] for n_ in xstores}            # --xhead: each head's stored targets per row
+        xh_m = {n_: [] for n_ in xstores}            # and the channels each row supervises
         rep_rows = []
         row_len, row_wt = [], []                     # per row: its length, and its share of one window
         left, more, cell, wrow = batch, 0, None, window   # windows to draw; rows left in the pack being filled, their
@@ -1649,6 +1695,8 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                     wrow, more, cell = short(("genome", fg, window), tab_["len"], p_, r["len"])
                 take = min(wrow, r["len"])
                 at = r["offset"] + int(gen.integers(0, r["len"] - take + 1))
+                if g_.name in x_species:             # its windows start on the head stores' grid, as the primary's
+                    at, take = on_grid(at, take, r["offset"], r["len"])
                 codes = np.full(wrow, 4, dtype=np.int64)
                 codes[:take] = g_.bases[at:at + take]
                 ctxs.append(int(g_.context))
@@ -1747,26 +1795,38 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                             nt[:take, k_] = arr_[at:at + take]
                     sp_[:take] = ntv3["split"][at:at + take]
                     cm_[:n_h] = True
+                elif fg is not None and genomes[fg].name in x_species:   # a further genome with head stores: its
+                    sp_[:take] = 4 if force_genome is not None else 1    # held-out draw, else its training contigs
                 if flip_row and (xs is not None or not from_mito):        # reverse AND swap the strand partners
                     nt[:take] = nt[:take][::-1][:, ntv3["swap"]]
                     sp_[:take] = sp_[:take][::-1]
-                for n_, st_ in xstores.items():           # primary-genome rows only; elsewhere unsupervised zeros
-                    xh_t[n_].append(st_.window(at, take, wrow, flip_row) if xs is None and not from_mito and fg is None
-                                    and (x_read["heads"] is None or n_ in x_read["heads"]) else st_.empty(wrow))
+                g_row = genomes[fg].name if fg is not None else None
+                for n_, st_ in xstores.items():           # primary rows, and further-genome rows of a species store
+                    read_ = (xs is None and not from_mito and (x_read["heads"] is None or n_ in x_read["heads"])
+                             and (fg is None or n_ in x_species.get(g_row, ())))
+                    xh_t[n_].append((st_.window(at, take, wrow, flip_row, genome=g_row) if fg is not None else
+                                     st_.window(at, take, wrow, flip_row)) if read_ else st_.empty(wrow))
+                    xh_m[n_].append(x_mask(st_, g_row) if read_ else np.zeros(len(st_.ids), dtype=bool))
                 nt_t.append(nt)
                 nt_s.append(sp_)
                 nt_c.append(cm_)
                 nt_x.append(-1 if xs is None else xs)
             elif xstores:                            # --xhead without an NTv3 head (--xhead-split): the same side
                 primary_ = xs is None and not from_mito and fg is None    # tuple, with no NTv3 channel in it
+                g_row = genomes[fg].name if fg is not None else None
                 sp_ = np.zeros(wrow, dtype=np.uint8)
                 if primary_:
                     sp_[:take] = xsplit[at:at + take]
                     if flip_row:
                         sp_[:take] = sp_[:take][::-1]
+                elif fg is not None and g_row in x_species:
+                    sp_[:take] = 4 if force_genome is not None else 1
                 for n_, st_ in xstores.items():
-                    xh_t[n_].append(st_.window(at, take, wrow, flip_row)
-                                    if primary_ and (x_read["heads"] is None or n_ in x_read["heads"]) else st_.empty(wrow))
+                    read_ = ((primary_ or (fg is not None and n_ in x_species.get(g_row, ())))
+                             and (x_read["heads"] is None or n_ in x_read["heads"]))
+                    xh_t[n_].append((st_.window(at, take, wrow, flip_row, genome=g_row) if fg is not None else
+                                     st_.window(at, take, wrow, flip_row)) if read_ else st_.empty(wrow))
+                    xh_m[n_].append(x_mask(st_, g_row) if read_ else np.zeros(len(st_.ids), dtype=bool))
                 nt_t.append(np.zeros((wrow, 0), dtype=np.uint8))
                 nt_s.append(sp_)
                 nt_c.append(np.zeros(0, dtype=bool))
@@ -1800,7 +1860,8 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                      torch.from_numpy(rows(epi_e)))] if epi_t else []
             nt_ = [(torch.from_numpy(rows(nt_t)), torch.from_numpy(rows(nt_s)),
                     torch.from_numpy(rows(nt_c)), [nt_x[i] for i in ix],
-                    {n_: torch.from_numpy(rows(v_)) for n_, v_ in xh_t.items()})] if nt_t else []
+                    {n_: torch.from_numpy(rows(v_)) for n_, v_ in xh_t.items()},
+                    {n_: torch.from_numpy(rows(v_)) for n_, v_ in xh_m.items()})] if nt_t else []
             rep_ = [torch.from_numpy(rows(rep_rows))] if rep_rows else []
             out = [torch.from_numpy(rows(seqs)), torch.from_numpy(rows(segs)), torch.tensor([ctxs[i] for i in ix])]
             if labels:
@@ -2025,6 +2086,22 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
             if dropped_x:
                 say(f"--xhead: the checkpoint's {kind_init} heads are not loaded ({len(dropped_x)} tensors); "
                     f"the {config.xhead_kind} heads start untrained")
+        # --xhead-species: a head with more outputs than the checkpoint's (a further genome's channels appended): its
+        # readout rows of the old channels are copied, the new rows keep this model's fresh initialisation
+        own_ = model.state_dict()
+        widened_ = {}
+        for k_, v_ in list(init_state["model"].items()):
+            w_ = own_.get(k_)
+            if (k_.startswith("xheads.") and w_ is not None and v_.dim() >= 1 and w_.shape[1:] == v_.shape[1:]
+                    and w_.shape[0] > v_.shape[0]):
+                new_ = w_.clone()
+                new_[:v_.shape[0]] = v_
+                init_state["model"][k_] = new_
+                h_ = k_.split(".")[1]
+                widened_[h_] = (int(v_.shape[0]), int(w_.shape[0]))
+        if widened_:
+            say("--xhead: widened readouts (old channels kept, new rows fresh): "
+                + ", ".join(f"{h_} {a_} -> {b_}" for h_, (a_, b_) in widened_.items()))
         grown, notes = G.expand_state_dict(init_state["model"], model, new_contexts=new_contexts)
         missing, unexpected = model.load_state_dict(grown, strict=False)
         say(f"initialised from {init}; new: {missing}; dropped: {unexpected}; padded: {notes or 'nothing'}")
@@ -2365,15 +2442,17 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                         st_[4] += (x_ * x_).sum(0).cpu(); st_[5] += (y_ * y_).sum(0).cpu()
         for n_ in x_now:                # --xhead: each active head on its own store
             want_x = ntv3_batch[0][4][n_]
+            cm_x = ntv3_batch[0][5][n_]     # [B, T] the channels each row supervises
             if model.training:
                 kind_x = xstores[n_].kind
                 lo_x, hi_x = (0, 0) if split_now else model.last_x_at
                 bin_x = x_bin.get(n_, 1)
                 cell_x = bin_x if kind_x == "tracks_binned" else 1   # a pre-binned store's targets are per cell
-                loss_x = (XH.split_head_loss(pieces, n_, want_x, x_ok, x_consts_on(n_), dev, kind_x, bin_x)
+                loss_x = (XH.split_head_loss(pieces, n_, want_x, x_ok, x_consts_on(n_), dev, kind_x, bin_x, cm_x)
                           if split_now else
                           XH.head_loss(model.last_x[n_], want_x[:, lo_x // cell_x:hi_x // cell_x].to(dev),
-                                       x_ok[:, lo_x:hi_x].to(dev), x_consts_on(n_)(dev), kind_x, bin_x))
+                                       x_ok[:, lo_x:hi_x].to(dev), x_consts_on(n_)(dev), kind_x, bin_x,
+                                       cm_x.to(dev)))
                 mlm = mlm + xhead_weight * x_scale.get(n_, 1.0) * loss_x
                 x_losses[n_].append(float(loss_x.detach()))
                 x_step.add(n_)
@@ -2381,7 +2460,7 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                 rows_x = (x_ok.sum(1) > 0).to(dev)
                 p_x, w_x = XH.eval_pair(xstores[n_], model.last_x[n_], want_x.to(dev), x_consts_on(n_)(dev),
                                         x_bin.get(n_, 1))
-                x_pearson[n_].add(p_x[rows_x], w_x[rows_x])
+                x_pearson[n_].add(p_x[rows_x], w_x[rows_x], cm_x.to(dev)[rows_x])
         reg_t = None                    # the anti-collapse term of this micro-batch (JEPA_TRACE)
         if target is not None and model.training and model.last_jepa is not None:
             with torch.no_grad(), autocast:
@@ -2917,13 +2996,13 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                              "Pearson(log1p, 128 bp)")
                     say(f"--xhead {n_} [{xstage.state['phase']}]: {xstage.state['updates'][n_]} labelled updates, train "
                         f"{tl_x:.4f}, chr8/chr9 {met_x} mean {mean_x:.4f} over {len(ok_x)} of {len(r_x)} "
-                        f"channels, n {x_pearson[n_].n:,}")
+                        f"channels, n {XH.scored_n(x_pearson[n_]):,}")
                     if main:
                         with x_csv.open("a") as fh:
                             fh.write(f"{step},{n_},{xstage.state['phase']},{xstage.state['stage_step']},"
                                      f"{xstage.state['updates'][n_]},{x_rates.get(n_, 0.0):.3e},"
                                      f"{x_rates.get('inherited', 0.0):.3e},{tl_x:.5f},{met_x.split('(')[0].strip().replace(' ', '_')},"
-                                     f"{mean_x:.5f},{x_pearson[n_].n},"
+                                     f"{mean_x:.5f},{XH.scored_n(x_pearson[n_])},"
                                      + " ".join(f"{v_:.5f}" for v_ in r_x) + "\n")
                     x_pearson[n_] = (xstores[n_].scorer(x_bin.get(n_, 1)) if n_ in xstores
                                      else XH.Pearson(xhead_sizes[n_]))

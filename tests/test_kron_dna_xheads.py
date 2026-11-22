@@ -7,6 +7,7 @@ outputs.
 from __future__ import annotations
 
 import pytest
+import numpy as np
 import torch
 
 from kron_dna import genome as G
@@ -246,3 +247,85 @@ def test_recomputed_kron_heads_give_the_same_outputs_and_gradients(device):
         torch.testing.assert_close(grads[1][n], grads[0][n], rtol=1e-4, atol=1e-6)
     for n in first:
         torch.testing.assert_close(outs[n], first[n])
+
+
+# ------------------------------------------------------------------------- further genomes (--xhead-species)
+
+def test_a_channel_mask_scores_only_the_rows_channels():
+    """A masked loss equals the loss over the channels each row has; masked scorers count each channel's rows only."""
+    from kron_dna import xheads as XH
+    torch.manual_seed(0)
+    pred, want = torch.randn(2, 64, 4), torch.rand(2, 64, 4)
+    ok = torch.ones(2, 64)
+    cm = torch.tensor([[1, 1, 0, 0], [0, 0, 1, 1]], dtype=torch.bool)
+    m = ok.unsqueeze(-1) * cm.float().unsqueeze(1)
+    want_t = torch.stack([want[..., 0] * 0 + want[..., 0]], -1)       # pre-binned targets: [..., 0] is the target
+    got = XH.head_loss(pred, torch.stack([want, want], -1), ok, (), "tracks_binned", 1, cm)
+    ref = G.poisson_multinomial_loss(torch.nn.functional.softplus(pred), want, m)
+    torch.testing.assert_close(got, ref)
+    lab = (torch.rand(2, 64, 4) < 0.1).float()
+    pw = (torch.ones(4),)
+    bce = torch.nn.functional.binary_cross_entropy_with_logits(pred, lab, pos_weight=pw[0], reduction="none")
+    torch.testing.assert_close(XH.head_loss(pred, lab, ok, pw, "binary", 1, cm), (bce * m).sum() / m.sum())
+    p = XH.Pearson(4, bin=8)
+    p.add(pred, want, cm)
+    q = XH.Pearson(4, bin=8)
+    q.add(pred[:1], want[:1])
+    torch.testing.assert_close(torch.as_tensor(p.value()[:2]), torch.as_tensor(q.value()[:2]))
+    assert p.n.tolist() == [8.0, 8.0, 8.0, 8.0]
+    ap = XH.AveragePrecision(4)
+    ap.add(pred, lab, cm)
+    assert all(len(torch.cat(ap.pos[k])) == int(lab[1 if k >= 2 else 0, :, k].sum()) for k in range(4))
+    del want_t
+
+
+class _Part:
+    """A store stand-in for SpeciesStores: binary or pre-binned, with a record carrying each track's metadata."""
+
+    def __init__(self, tmp, name, ids, kind, meta=None, genome="g"):
+        import json as _j
+        self.path, self.ids, self.kind, self.genome = tmp / name, list(ids), kind, genome
+        self.path.mkdir(parents=True)
+        self.swap = np.arange(len(ids))
+        for k, i in enumerate(ids):
+            if i.endswith(("_P", "_M")):
+                self.swap[k] = self.ids.index(i[:-1] + ("M" if i.endswith("_P") else "P"))
+        self.positives = np.arange(1, len(ids) + 1)
+        self.bin = 128
+        self.identity = dict(ids=list(ids))
+        if kind == "tracks_binned":
+            (self.path / "binned.json").write_text(_j.dumps(dict(tracks=meta)))
+
+    def window(self, at, take, width, flip=False):
+        return np.full((width, len(self.ids)), 7, dtype=np.uint8)
+
+    def empty(self, width):
+        return np.zeros((width, len(self.ids)), dtype=np.uint8)
+
+    def consts(self, device):
+        return (torch.arange(len(self.ids), dtype=torch.float32) + (100 if self.genome == "mm" else 0),)
+
+
+def test_species_stores_share_matching_channels_and_append_the_rest(tmp_path):
+    from kron_dna import xheads as XH
+    hs = _Part(tmp_path, "h", ["E1", "E2", "R_P", "R_M"], "tracks_binned",
+               [dict(assay="DNase-seq", biosample="liver"), dict(assay="DNase-seq", biosample="K562"),
+                dict(assay="polyA plus RNA-seq", biosample="liver"), dict(assay="polyA plus RNA-seq", biosample="liver")])
+    ms = _Part(tmp_path, "m", ["F1", "F2", "S_P", "S_M"], "tracks_binned",
+               [dict(assay="DNase-seq", biosample="liver"), dict(assay="DNase-seq", biosample="forebrain"),
+                dict(assay="total RNA-seq", biosample="liver"), dict(assay="total RNA-seq", biosample="liver")],
+               genome="mm")
+    s = XH.SpeciesStores(hs, {"mm": ms})
+    assert s.ids == ["E1", "E2", "R_P", "R_M", "mm:F2"] and s.shared == {"mm": 3}
+    assert s.cols["mm"].tolist() == [0, 4, 2, 3] and s.swap.tolist() == [0, 1, 3, 2, 4]
+    assert s.mask("mm").tolist() == [True, False, True, True, True] and s.mask(None).tolist()[:4] == [True] * 4
+    w = s.window(0, 4, 4, genome="mm")
+    assert w.shape == (4, 5) and (w[:, [0, 2, 3, 4]] == 7).all() and (w[:, 1] == 0).all()
+    assert s.consts("cpu")[0].tolist() == [0, 1, 2, 3, 101]           # the primary's on shared channels
+    assert s.identity["species"]["mm"]["channels"] == [0, 4, 2, 3]
+    lab_h, lab_m = (_Part(tmp_path, n, ["donor_plus", "donor_minus"], "binary") for n in ("lh", "lm"))
+    lab_h.swap = lab_m.swap = np.array([1, 0])
+    b = XH.SpeciesStores(lab_h, {"mm": lab_m})
+    assert b.ids == ["donor_plus", "donor_minus"] and b.positives.tolist() == [2, 4]
+    with pytest.raises(ValueError, match="one kind"):
+        XH.SpeciesStores(hs, {"mm": lab_m})

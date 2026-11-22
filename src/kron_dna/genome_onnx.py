@@ -191,10 +191,11 @@ def x_constants(record: dict) -> tuple[dict, dict]:
     """Per further head of the run: (non-zero means, RNA flags) for a track head, and each head's channel ids."""
     consts, ids = {}, {}
     for n, st in (record.get("xheads") or {}).get("stores", {}).items():
-        ids[n] = list(st["ids"])
-        store = XH.open_store(st["path"])
+        store = XH.store_of_record(st)                       # with --xhead-species, every genome's channels
+        ids[n] = list(store.ids)
         if store.kind in ("tracks", "tracks_binned"):          # a pre-binned store is a track store too
-            consts[n] = (np.asarray(store.nonzero_mean), np.asarray(store.is_rna))
+            c = store.consts("cpu")                            # (scales, non-zero means, RNA flags) per channel
+            consts[n] = (c[1].numpy(), c[2].numpy())
     return consts, ids
 
 

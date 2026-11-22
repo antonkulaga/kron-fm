@@ -132,7 +132,9 @@ def _init(g: dict) -> None:
 def main(select: Path, bigwigs: Path, out: Path, name: str = "hg38", bin: int = 128, workers: int = 4,
          scale_percentile: float = typer.Option(99.99, help="percentile of non-zero signal the encoding clips at"),
          convert_only: bool = typer.Option(False, help="write the per-track cells only, no store"),
-         provenance: Path = typer.Option(None), check_cells: int = 2000) -> None:
+         provenance: Path = typer.Option(None), check_cells: int = 2000,
+         split: Path = typer.Option(None, help="uint8 per base of the layout, 1 = training (the non-zero mean is "
+                                                "sampled there); default: the genome's ntv3/split.u8")) -> None:
     import pyBigWig
 
     genome = interim_dir("genome", name)
@@ -148,7 +150,7 @@ def main(select: Path, bigwigs: Path, out: Path, name: str = "hg38", bin: int = 
     assert len(set(files)) == len(files) and len(set(ids)) == len(ids), "a file or channel is listed twice"
     (out / "cells").mkdir(parents=True, exist_ok=True)
     g = dict(rows=rows, total=total, src=bigwigs, out=out, bin=bin, percentile=scale_percentile,
-             split=np.memmap(genome / "ntv3" / "split.u8", dtype=np.uint8, mode="r"),
+             split=np.memmap(split or genome / "ntv3" / "split.u8", dtype=np.uint8, mode="r"),
              rna={r["file"]: "RNA-seq" in r["assay"] for r in sel})
     infos = {}
     with Pool(workers, initializer=_init, initargs=(g,)) as p:
