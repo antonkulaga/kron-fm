@@ -193,7 +193,7 @@ def x_constants(record: dict) -> tuple[dict, dict]:
     for n, st in (record.get("xheads") or {}).get("stores", {}).items():
         ids[n] = list(st["ids"])
         store = XH.open_store(st["path"])
-        if store.kind == "tracks":
+        if store.kind in ("tracks", "tracks_binned"):          # a pre-binned store is a track store too
             consts[n] = (np.asarray(store.nonzero_mean), np.asarray(store.is_rna))
     return consts, ids
 

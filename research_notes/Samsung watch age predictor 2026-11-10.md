@@ -160,8 +160,40 @@ c3 carries as much age as c1 (Aurora-fitted 6.03 vs 5.90; ranked by r, 0.70 vs 0
 open head reads Aurora 6 y old. Held out one at a time, the eight open sets are read off by 10.8 y on average for c3
 (median read against median age) and 10.2 y for c1; the large cases stay (PPG Sport +24, MultiSite +16, Vilnius -23).
 So the offset comes from the head, fitted across cohorts of different devices and ages, not from what the encoder saw
-in pretraining. c1 stays the encoder; the fix stays a few people of known age per watch (above). Scripts:
+in pretraining. c1 stays the encoder; the fix is people of known age on the watch (above; how many: next section). Scripts:
 `scripts/kron_ppg_device_offsets.py "c3 full" <open run> <Aurora run>`, run folders `c3-pretrain`, `wa11-*`.
+
+## A new wide-age device: the head does not hold its age scale (DREAMT, 2026-11-21)
+
+DREAMT 2.2.0 (Wang et al. 2025, PhysioNet, credentialed access; results only) records an Empatica E4 wristband
+overnight on 100 people aged 21-87, with sleep apnea indices and medical history. It is the first wide-age wrist set
+besides Aurora, on another device, and is used here as a test set only (research use).
+
+| Head on `c1` embeddings, fitted on | DREAMT MAE (y) | Mean error | Offset removed | r | Slope |
+|---|---|---|---|---|---|
+| Open wrist sets (214 people) | 13.1 (11.2-15.0) | -9.3 | 10.5 | 0.58 | 0.37 |
+| VitalDB finger (5,880 people) | 13.5 | +8.0 | 12.3 | 0.47 | 0.18 |
+| VitalDB + open wrist | 14.0 | -11.2 | 10.7 | 0.62 | 0.30 |
+| Median age (baseline) | 13.75 | | | | |
+| DREAMT itself, 10-fold CV | 8.7 (7.3-10.2) | | | 0.73 | |
+
+- The pulse on this device carries age (8.7 y fitted there vs 14.0 for the median), but no open head carries its
+  age scale to it: the open head compresses ages (slope 0.37), and finger heads do not reach the wrist at all.
+- The offset is the device or set, not sleep: awake windows read -9.0 y, asleep ones -9.3 y.
+- Calibration by an offset from k known-age DREAMT people (500 random draws, the rest scored): k = 3 11.2 y,
+  k = 5 11.0 (10th-90th percentile 10.5-13.0), k = 10 10.8, k = 30 10.6. An offset cannot repair the slope, so the
+  "4-7 y at k = 3-5" above holds only on narrow-age sets: on a wide-age device a handful of people is a sanity check,
+  not a calibration.
+- Wide-age wrist data on one device does not give a clock on another either: a head fitted on Aurora reads DREAMT at
+  14.5 y with its offset removed; one fitted on DREAMT reads Aurora at 7.6 y after a -13 y offset (Aurora windows
+  15 s, DREAMT 30 s).
+- Disease beyond age and sex (logistic, 10-fold CV, 100 people): no gain from the pulse (hypertension AUC 0.71 ->
+  0.67, diabetes 0.63 -> 0.57, sleep apnea AHI >= 15 at chance either way). Aurora's gain (1,220 people) is not
+  reproduced at this size; 100 people cannot rule one out.
+
+So a Galaxy Watch clock needs a few dozen people of known, varied age recorded on that watch, so that a head can be
+fitted there, or pretraining and heads across many wide-age devices, which no open data offers yet. Reader:
+`kron_ppg.watch_readers.read_dreamt` (restricted source, owner-only files).
 
 ## Limits
 

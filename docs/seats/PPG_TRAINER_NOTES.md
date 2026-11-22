@@ -40,6 +40,12 @@ secretary on the maintainer's word).
 - Every sbatch carries `--comment 'seat=kron-fm/ppg-trainer; what=<one line, no person or private data>;
   eta=<ISO-8601 with offset, or ?>; cuda=<card or ->'`; `scontrol update JobId=<id> Comment='...'` when the
   estimate moves (the rigger, agent-chat 2026-11-11).
+- CPU-only jobs carry `--nice=100`; GPU jobs never (the rigger, 2026-11-18).
+
+## Publishing (Anton, 2026-11-19, forwarded by dna-trainer)
+- ONNX is the default for any model published or handed over: `model.onnx` (here `stream.onnx`, from
+  `kron-ppg wrist-age-export`) with its meta file (inputs, outputs, ONNX Runtime vs PyTorch check) beside the
+  safetensors and config. No PPG model is published yet (2026-11-19 22:45); the exporter already writes both.
 
 ## Items to file
 - filed: kit #422 (until-event ends on watch-job's armed banner); a plain until-loop on squeue meanwhile.
