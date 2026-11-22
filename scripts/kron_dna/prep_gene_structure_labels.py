@@ -141,10 +141,12 @@ def main(out: Path, name: str = typer.Option(...), gtf: Path = typer.Option(...)
 
     # checks in the transcript's direction, on the layout
     def at_layout(chrom: np.ndarray, pos: np.ndarray) -> np.ndarray:
-        """Global positions of (chrom, pos); -1 outside the gap-free contigs."""
+        """Global positions of (chrom, pos); -1 outside the gap-free contigs (or on a chromosome the layout lacks)."""
         res = np.full(len(pos), -1, dtype=np.int64)
         for c in np.unique(chrom):
             pc = index.filter(pl.col("chrom") == c).sort("start")
+            if pc.is_empty():
+                continue
             st, en, off = pc["start"].to_numpy(), pc["end"].to_numpy(), pc["offset"].to_numpy()
             sel = np.where(chrom == c)[0]
             k = np.searchsorted(st, pos[sel], side="right") - 1
@@ -152,41 +154,33 @@ def main(out: Path, name: str = typer.Option(...), gtf: Path = typer.Option(...)
             res[sel[ok]] = off[k[ok]] + pos[sel][ok] - st[k[ok]]
         return res
 
-    def read2(chrom, first, strand, forward=True):
-        """The two bases from ``first`` along the transcript (5'->3') as codes; rows outside the layout dropped."""
-        plus = strand == "+"
-        p0 = np.where(plus, first, first)
-        p1 = np.where(plus, first + 1, first - 1) if forward else np.where(plus, first - 1, first + 1)
-        a, b = at_layout(chrom, p0), at_layout(chrom, p1)
-        ok = (a >= 0) & (b >= 0)
-        x, y = np.asarray(bases[a[ok]]), np.asarray(bases[b[ok]])
-        x = np.where(plus[ok], x, COMPLEMENT[x])
-        y = np.where(plus[ok], y, COMPLEMENT[y])
-        return (x, y) if forward else (y, x)
+    def along(chrom, first, strand, steps):
+        """Codes of the bases ``first + step`` along the transcript (5'->3', complemented on -) for each step, as
+        ``[n, len(steps)]``, and the rows whose bases all lie in the layout."""
+        sign = np.where(strand == "+", 1, -1)
+        at = np.stack([at_layout(chrom, first + sign * k) for k in steps], 1)
+        ok = (at >= 0).all(1)
+        x = np.asarray(bases[at[ok].reshape(-1)]).reshape(-1, len(steps))
+        x = np.where((strand[ok] == "+")[:, None], x, COMPLEMENT[x])
+        return x, ok
 
     intr = iv["intron"].unique()
     ch, st = intr["chrom"].to_numpy().astype(str), intr["strand"].to_numpy()
     s0, e0 = intr["s"].to_numpy(), intr["e"].to_numpy()
-    d1, d2 = read2(ch, np.where(st == "+", s0, e0 - 1), st)                 # donor: first two intron bases
-    a1, a2 = read2(ch, np.where(st == "+", e0 - 1, s0), st, forward=False)  # acceptor: last two
-    check = dict(introns=int(len(intr)),
-                 donor_GT=float(((d1 == CODE["G"]) & (d2 == CODE["T"])).mean()),
-                 donor_GC=float(((d1 == CODE["G"]) & (d2 == CODE["C"])).mean()),
-                 acceptor_AG=float(((a1 == CODE["A"]) & (a2 == CODE["G"])).mean()))
+    don, _ = along(ch, np.where(st == "+", s0, e0 - 1), st, (0, 1))          # donor: the first two intron bases
+    acc, _ = along(ch, np.where(st == "+", e0 - 1, s0), st, (-1, 0))        # acceptor: the last two
+    check = dict(introns=int(len(intr)), introns_checked=int(len(don)),
+                 donor_GT=float(((don[:, 0] == CODE["G"]) & (don[:, 1] == CODE["T"])).mean()),
+                 donor_GC=float(((don[:, 0] == CODE["G"]) & (don[:, 1] == CODE["C"])).mean()),
+                 acceptor_AG=float(((acc[:, 0] == CODE["A"]) & (acc[:, 1] == CODE["G"])).mean()))
     sc = g.filter(pl.col("type") == "start_codon").unique(["chrom", "start0", "strand"])
     if not sc.is_empty():
         cst = sc["strand"].to_numpy()
         first = np.where(cst == "+", sc["start0"].to_numpy(), sc["end"].to_numpy() - 1)
-        c_ch = sc["chrom"].to_numpy().astype(str)
-        x, y = read2(c_ch, first, cst)
-        third = np.where(cst == "+", first + 2, first - 2)
-        t = at_layout(c_ch, third)
-        okt = t >= 0
-        z = np.asarray(bases[t[okt]])
-        z = np.where(cst[okt] == "+", z, COMPLEMENT[z])
-        n_ = min(len(x), len(z))
-        check["start_codons"] = int(len(sc))
-        check["start_ATG"] = float(((x[:n_] == CODE["A"]) & (y[:n_] == CODE["T"]) & (z[:n_] == CODE["G"])).mean())
+        codon, _ = along(sc["chrom"].to_numpy().astype(str), first, cst, (0, 1, 2))
+        check["start_codons"] = int(len(codon))
+        check["start_ATG"] = float(((codon[:, 0] == CODE["A"]) & (codon[:, 1] == CODE["T"])
+                                    & (codon[:, 2] == CODE["G"])).mean())
     typer.echo(f"checks: {check}")
     worst = min(check["donor_GT"] + check["donor_GC"], check["acceptor_AG"], check.get("start_ATG", 1.0))
     if worst < 0.85:

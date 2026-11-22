@@ -52,6 +52,8 @@ def build(tmp_path, shift=0):
         ("chr1", "CDS", 1051 + s, 1100 + s, "-", "t2"), ("chr1", "CDS", 1201 + s, 1250 + s, "-", "t2"),
         ("chr1", "start_codon", 1248 + s, 1250 + s, "-", "t2"),
         ("chr1", "exon", 2001 + s, 2100 + s, "+", "t3"),
+        ("chrM", "exon", 11, 60, "+", "t4"), ("chrM", "exon", 71, 90, "+", "t4"),     # a chromosome the layout lacks
+        ("chrM", "start_codon", 21, 23, "+", "t4"),
     ]
     gtf = tmp_path / "toy.gtf"
     gtf.write_text("".join(f"{c}\tX\t{t}\t{a}\t{b}\t.\t{st}\t.\tgene_id \"g\"; transcript_id \"{tid}\";\n"
