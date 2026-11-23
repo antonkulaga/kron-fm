@@ -156,7 +156,7 @@ def assemble(meta: Path, work: Path, out: Path, gtf: Path = typer.Option(...), g
     N = pl.DataFrame(negs, infer_schema_length=None).select([c for c in cols if c != "max_pip"]).with_columns(
         max_pip=pl.lit(None, pl.Float32), label=pl.lit(0)) if negs else None
     t = pl.concat([P.select(cols).with_columns(pl.col("max_pip").cast(pl.Float32), label=pl.lit(1)),
-                   *([N.select([*cols, "label"])] if N is not None else [])]).sort("pair", "label", descending=[False, True])
+                   *([N.select([*cols, "label"])] if N is not None else [])], how="vertical_relaxed").sort("pair", "label", descending=[False, True])
     src = interim_dir("genome", genome)
     idx = pl.read_parquet(src / "contigs.parquet")
     bases = np.memmap(src / "bases.u8", dtype=np.uint8, mode="r")
