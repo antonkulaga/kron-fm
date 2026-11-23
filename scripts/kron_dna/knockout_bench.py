@@ -2,7 +2,8 @@
 Gasperini 2019, ...; ``prep_crispri_pairs.py``), as Enformer, Borzoi and AlphaGenome report them.
 
     uv run python scripts/kron_dna/knockout_bench.py score OUT LABEL=CHECKPOINT [...] [--pairs PAIRS.parquet]
-        [--max-pairs N] [--e5 200]
+        [--max-pairs N] [--e5 200] [--dtype bf16|fp16|fp32] [--shard i/n]
+    uv run python scripts/kron_dna/knockout_bench.py merge OUT LABEL --shards n      (after every --shard i/n)
     uv run python scripts/kron_dna/knockout_bench.py report OUT
 
 ``score``: one window of ``--context`` bases centred on each element (snapped to the 128-bp grid), read three times:
@@ -32,6 +33,7 @@ from __future__ import annotations
 import gzip
 import json
 import time
+import zlib
 from pathlib import Path
 
 import numpy as np
@@ -40,6 +42,7 @@ import torch
 import typer
 
 from kron_core.paths import interim_dir
+from kron_dna import evalkit as EK
 from kron_dna import genome as G
 from kron_dna import xheads as X
 
@@ -80,13 +83,13 @@ def channels_of(store) -> dict:
 class Runner:
     """A model's pieces, so a forward can be run whole or as encoder+core and decoder apart (E5)."""
 
-    def __init__(self, model, head: str, dev) -> None:
-        self.m, self.head, self.dev = model, head, dev
+    def __init__(self, model, head: str, dev, dtype: str = "bf16") -> None:
+        self.m, self.head, self.dev, self.dtype = model, head, dev, dtype
         self.unit = 2 ** model.config.n_down
         self.ctx = torch.zeros(1, dtype=torch.long, device=dev) if model.config.n_contexts > 0 else None
 
     def ac(self):
-        return torch.autocast("cuda", dtype=torch.bfloat16, enabled=self.dev.type == "cuda")
+        return EK.autocast(self.dev, self.dtype)
 
     def full(self, seq: torch.Tensor) -> torch.Tensor:
         L = seq.shape[-1]
@@ -130,7 +133,11 @@ def score(out: Path, checkpoints: list[str] = typer.Argument(..., help="LABEL=CH
           head: str = "rna462b", name: str = "hg38", context: int = 1048576, edge: int = 8192,
           tss_flank: int = 1024, max_pairs: int = typer.Option(0, help="all regulated pairs plus negatives up to N in "
                                                                        "all (whole elements kept); 0: every pair"),
-          e5: int = 0, block: int = 4096, seed: int = 0, device: str = "cuda") -> None:
+          e5: int = 0, block: int = 4096, seed: int = 0, device: str = "cuda",
+          dtype: str = typer.Option("bf16", help="bf16 | fp16 | fp32 (bf16 is emulated, slow, on Turing cards)"),
+          shard: str = typer.Option("", help="i/n: windows k % n == i only, written under OUT/shards/; then merge")
+          ) -> None:
+    sh = EK.parse_shard(shard)
     root = interim_dir("genome", name).parent.parent
     pairs = pairs or root / "eval" / "crispri-eg-v1" / "pairs.parquet"
     gtf = gtf or root.parent / "input" / "regulation" / "gencode" / "gencode.basic.gtf.gz"
@@ -171,8 +178,9 @@ def score(out: Path, checkpoints: list[str] = typer.Argument(..., help="LABEL=CH
     for item in checkpoints:
         label, where = item.split("=", 1)
         dest = out / "pred" / label
-        if (dest / "pairs.parquet").exists():
-            raise typer.BadParameter(f"{dest} exists; choose another label")
+        part = out / "shards" / label / f"{EK.tag(sh)}.parquet"
+        if (dest / "pairs.parquet").exists() or (sh[1] > 1 and part.exists()):
+            raise typer.BadParameter(f"{dest if not sh[1] > 1 else part} exists; choose another label")
         model, state = G.load_checkpoint(where)
         heads = [h[0] for h in model.config.xheads]
         if head not in heads:
@@ -185,7 +193,7 @@ def score(out: Path, checkpoints: list[str] = typer.Argument(..., help="LABEL=CH
             typer.echo(f"{label}: no JEPA predictor (or a chunked/v3 core): E5 skipped")
         model = model.to(dev).eval()
         model.x_active = {head}
-        R = Runner(model, head, dev)
+        R = Runner(model, head, dev, dtype)
         consts = store.consts(dev)
         n_ch = len(store.ids)
 
@@ -196,13 +204,15 @@ def score(out: Path, checkpoints: list[str] = typer.Argument(..., help="LABEL=CH
 
         rows, t0 = [], time.time()
         for k, e in enumerate(els.iter_rows(named=True)):
+            if not EK.mine(k, sh):
+                continue
             lo = e["w_lo"]
             ref = torch.from_numpy(codes_of(contigs, bases, e["chrom"], lo, lo + context)).to(dev)
             a, b = e["start"] - lo, e["end"] - lo
             ko_n = ref.clone()
             ko_n[a:b] = 4
             ko_s = ref.clone()
-            g = torch.Generator().manual_seed(hash((e["chrom"], e["start"], e["end"])) % (2 ** 31))
+            g = torch.Generator().manual_seed(zlib.crc32(f"{e['chrom']}:{e['start']}-{e['end']}:{seed}".encode()))
             ko_s[a:b] = ref[a:b][torch.randperm(b - a, generator=g).to(dev)]
             rel = [x - lo for x in e["tss"]]
             s_lo = max(((min(rel) - tss_flank - BIN) // BIN) * BIN, 0)
@@ -223,15 +233,22 @@ def score(out: Path, checkpoints: list[str] = typer.Argument(..., help="LABEL=CH
                 typer.echo(f"{label}: element {k + 1}/{els.height}, {len(rows)} pairs, {time.time() - t0:.0f} s")
         res = t.select("pair", "chrom", "start", "end", "gene", "tss", "strand", "cell_type", "study", "set",
                        "distance", "effect", "regulated", "held_out").join(pl.DataFrame(rows), on="pair")
-        dest.mkdir(parents=True, exist_ok=True)
-        res.write_parquet(dest / "pairs.parquet")
-        (dest / "index.json").write_text(json.dumps(dict(
-            label=label, source=str(where), step=int(state.get("step", -1)), context=context, head=head,
-            store=str(store.path), channels={f"{c}{s}": v for (c, s), v in chans.items()}, tss_flank=tss_flank,
-            edge=edge, max_pairs=max_pairs, seed=seed, e5=e5 if e5_ok else 0, block=block, pairs_table=str(pairs),
-            windows=els.height, pairs_scored=res.height, dropped=dropped, seconds=round(time.time() - t0, 1),
-            commit=((state.get("run_record") or {}).get("source") or {}).get("commit")), indent=1))
-        typer.echo(f"{label}: {res.height} pairs from {els.height} windows in {time.time() - t0:.0f} s -> {dest}")
+        info = dict(label=label, source=str(where), step=int(state.get("step", -1)), context=context, head=head,
+                    store=str(store.path), channels={f"{c}{s}": v for (c, s), v in chans.items()}, tss_flank=tss_flank,
+                    edge=edge, max_pairs=max_pairs, seed=seed, e5=e5 if e5_ok else 0, block=block,
+                    pairs_table=str(pairs), dtype=dtype, windows=els.height, pairs_scored=res.height, dropped=dropped,
+                    seconds=round(time.time() - t0, 1),
+                    commit=((state.get("run_record") or {}).get("source") or {}).get("commit"))
+        if sh[1] > 1:                                   # a shard: its part, joined by merge once all n are there
+            part.parent.mkdir(parents=True, exist_ok=True)
+            res.write_parquet(part)
+            part.with_suffix(".json").write_text(json.dumps(dict(info, shard=list(sh)), indent=1))
+            typer.echo(f"{label}: shard {EK.tag(sh)}, {res.height} pairs in {time.time() - t0:.0f} s -> {part}")
+        else:
+            dest.mkdir(parents=True, exist_ok=True)
+            res.write_parquet(dest / "pairs.parquet")
+            (dest / "index.json").write_text(json.dumps(info, indent=1))
+            typer.echo(f"{label}: {res.height} pairs from {els.height} windows in {time.time() - t0:.0f} s -> {dest}")
         del model
         torch.cuda.empty_cache() if dev.type == "cuda" else None
 
@@ -262,6 +279,34 @@ def e5_pair(R: Runner, ref, ko, rel_tss, a, b, block, s_lo, s_hi, ch, flank, sig
     rel = lambda m: float(((m - mu_a).norm(dim=-1) / mu_a.norm(dim=-1).clamp_min(1e-6)).mean())
     return dict(e5_skipped=0, rna_e5_ref=rd, rna_e5_cf=cf, e5_effect=float(np.log2((cf + EPS) / (rd + EPS))),
                 e5_latent=rel(mu_b), e5_placebo=rel(mu_p) if mu_p is not None else float("nan"))
+
+
+@app.command()
+def merge(out: Path, label: str, shards: int = typer.Option(..., help="n, as in --shard i/n")) -> None:
+    """Joins the n shards of LABEL into pred/LABEL (refuses while one is missing or they disagree on settings)."""
+    d = out / "shards" / label
+    parts = [d / f"{i}-of-{shards}.parquet" for i in range(shards)]
+    missing = [p.name for p in parts if not p.exists()]
+    if missing:
+        raise typer.BadParameter(f"{label}: {len(missing)} of {shards} shards missing: {missing[:5]}")
+    infos = [json.loads(p.with_suffix(".json").read_text()) for p in parts]
+    fixed = ("source", "step", "context", "head", "tss_flank", "edge", "max_pairs", "seed", "e5", "block", "dtype",
+             "pairs_table", "windows")
+    for k in fixed:
+        if len({json.dumps(i.get(k)) for i in infos}) > 1:
+            raise typer.BadParameter(f"{label}: shards differ in {k}")
+    res = pl.concat([pl.read_parquet(p) for p in parts], how="diagonal_relaxed").sort("pair")
+    if res["pair"].n_unique() != res.height:
+        raise typer.BadParameter(f"{label}: a pair is in two shards")
+    dest = out / "pred" / label
+    if (dest / "pairs.parquet").exists():
+        raise typer.BadParameter(f"{dest} exists")
+    dest.mkdir(parents=True, exist_ok=True)
+    res.write_parquet(dest / "pairs.parquet")
+    info = dict(infos[0], pairs_scored=res.height, shards=shards, seconds=sum(i["seconds"] for i in infos))
+    info.pop("shard", None)
+    (dest / "index.json").write_text(json.dumps(info, indent=1))
+    typer.echo(f"{label}: {shards} shards, {res.height} pairs -> {dest}")
 
 
 def ap(score: np.ndarray, y: np.ndarray) -> float:
