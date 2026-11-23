@@ -60,9 +60,18 @@ def test_genes_eval_scores_two_annotations(tmp_path, monkeypatch):
         monkeypatch.setattr(mod, "interim_dir", lambda *a: g)
     out = tmp_path / "eval"
     SZ.windows(out, name="toy", n=2, seed=0, context=131072, chroms="", keep=None, max_n=0.0)
-    GE.score(out, [f"m={tmp_path / 'ck.pt'}"], name="toy", labels=[f"old={tmp_path / 'old'}", f"new={tmp_path / 'new'}"],
-             windows_csv=None, head="genes", context=131072, device="cpu")
+    labs = [f"old={tmp_path / 'old'}", f"new={tmp_path / 'new'}"]
+    GE.score(out, [f"m={tmp_path / 'ck.pt'}"], name="toy", labels=labs,
+             windows_csv=None, head="genes", context=131072, device="cpu", dtype="bf16", shard="")
+    for i in (0, 1):                                    # the same in two shards, merged: the same logits and metrics
+        GE.score(out, [f"s={tmp_path / 'ck.pt'}"], name="toy", labels=labs, windows_csv=None, head="genes",
+                 context=131072, device="cpu", dtype="fp32", shard=f"{i}/2")
+    assert not (out / "s.genes.json").exists()
+    GE.merge(out, "s", shards=2, labels=labs, windows_csv=None)
+    assert np.array_equal(np.load(out / "s.genes.npy"), np.load(out / "m.genes.npy"))
+    rs = json.loads((out / "s.genes.json").read_text())
     r = json.loads((out / "m.genes.json").read_text())
+    assert rs["annotations"] == r["annotations"] and rs["shards"] == 2
     assert set(r["annotations"]) == {"old", "new"} and r["n_windows"] == 2 and r["step"] == 7
     assert 0 <= r["annotations"]["new"]["genic_f1"] <= 1 and 0 <= r["annotations"]["new"]["cds_exon_f1"] <= 1
     assert r["annotations"]["old"]["cds_exons"]["plus"]["annotated"] > 0

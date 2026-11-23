@@ -2,6 +2,8 @@
 
     uv run python scripts/kron_dna/xhead_bench.py targets BENCH --windows WINDOWS.csv --dnase STORE --splice STORE
     uv run python scripts/kron_dna/xhead_bench.py score BENCH LABEL=CHECKPOINT [...] [--context 1048576]
+        [--dtype bf16|fp16|fp32] [--shard i/n]     (a shard writes BENCH/shards/LABEL/i-of-n; then:)
+    uv run python scripts/kron_dna/xhead_bench.py merge BENCH LABEL --shards n
     (AlphaGenome: scripts/kron_dna/xhead_bench_ag.py, in AlphaGenome's own environment, writes the same files)
     uv run python scripts/kron_dna/xhead_bench.py report BENCH
 
@@ -34,6 +36,7 @@ import torch
 import typer
 
 from kron_core.paths import interim_dir
+from kron_dna import evalkit as EK
 from kron_dna import genome as G
 from kron_dna import xheads as X
 
@@ -114,8 +117,11 @@ def codes_of(contigs: pl.DataFrame, bases: np.ndarray, chrom: str, lo: int, hi: 
 def score(bench: Path, checkpoints: list[str] = typer.Argument(..., help="LABEL=CHECKPOINT (a file or run dir)"),
           context: int = typer.Option(1048576, help="bases given to the model, centred on each window"),
           dnase_head: str = "dnase", splice_head: str = "splice", name: str = "hg38", device: str = "cuda",
-          limit: int = typer.Option(0, help="the first N windows only (a smoke run; the label gets a suffix)")) -> None:
+          limit: int = typer.Option(0, help="the first N windows only (a smoke run; the label gets a suffix)"),
+          dtype: str = typer.Option("bf16", help="bf16 | fp16 | fp32 (bf16 is emulated, slow, on Turing cards)"),
+          shard: str = typer.Option("", help="i/n: windows k % n == i only, under BENCH/shards/; then merge")) -> None:
     """KronGenome's further heads on every window: predictions in the benchmark's form, under pred/<label>/."""
+    sh = EK.parse_shard(shard)
     if not (bench / "READY").exists():
         raise typer.BadParameter(f"{bench} has no frozen targets (run targets first)")
     if context < WIN or (context - WIN) % (2 * BIN):
@@ -135,7 +141,7 @@ def score(bench: Path, checkpoints: list[str] = typer.Argument(..., help="LABEL=
     for item in checkpoints:
         label, where = item.split("=", 1)
         label += f"__first{limit}" if limit else ""
-        out = bench / "pred" / label
+        out = bench / "pred" / label if sh[1] == 1 else bench / "shards" / label / EK.tag(sh)
         if (out / "index.json").exists():
             raise typer.BadParameter(f"{out} exists; choose another label")
         model, state = G.load_checkpoint(where)
@@ -152,14 +158,16 @@ def score(bench: Path, checkpoints: list[str] = typer.Argument(..., help="LABEL=
         model.x_span = (flank, flank + WIN)                           # the heads run on the window only, as in training
         consts = ds.consts(dev)
         unit = 2 ** model.config.n_down
-        d128 = np.zeros((win.height, WIN // BIN, len(ds.ids)), dtype=np.float32)
-        sp = np.zeros((win.height, WIN, 4), dtype=np.float16)
+        rows = [k for k in range(win.height) if EK.mine(k, sh)]
+        d128 = np.zeros((len(rows), WIN // BIN, len(ds.ids)), dtype=np.float32)
+        sp = np.zeros((len(rows), WIN, 4), dtype=np.float16)
         t0 = time.time()
-        for k, r in enumerate(win.iter_rows(named=True)):
+        mine = (r for k_, r in enumerate(win.iter_rows(named=True)) if EK.mine(k_, sh))
+        for k, r in enumerate(mine):                                  # k: the row in this shard's arrays
             seq = torch.from_numpy(codes_of(contigs, bases, r["chrom"], r["start"] - flank, r["end"] + flank)).to(dev)
             seg = torch.zeros(1, context // unit, dtype=torch.long, device=dev)
             ctx = torch.zeros(1, dtype=torch.long, device=dev) if model.config.n_contexts > 0 else None
-            with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16, enabled=dev.type == "cuda"):
+            with torch.no_grad(), EK.autocast(dev, dtype):
                 model(seq[None], seg, ctx)
             assert model.last_x_at == (flank, flank + WIN), model.last_x_at
             pd = model.last_x[dnase_head][0].float()[:, :len(ds.ids)]  # [WIN, 13]: the primary channels come first
@@ -168,20 +176,46 @@ def score(bench: Path, checkpoints: list[str] = typer.Argument(..., help="LABEL=
             d128[k] = log1p_bins(p_log.cpu().numpy())
             sp[k] = model.last_x[splice_head][0][:, :4].float().clamp(-6e4, 6e4).cpu().numpy().astype(np.float16)
             if k % 16 == 0:
-                typer.echo(f"{label}: window {k + 1}/{win.height}, {time.time() - t0:.0f} s")
+                typer.echo(f"{label}: window {k + 1}/{len(rows)}, {time.time() - t0:.0f} s")
         out.mkdir(parents=True, exist_ok=True)
         np.save(out / "dnase_128.npy", d128)
         np.save(out / "splice.npy", sp)
         (out / "index.json").write_text(json.dumps(dict(
             label=label, source=str(where), kind="KronGenome", step=int(state.get("step", -1)), context=context,
-            windows=list(range(win.height)), xhead_kind=model.config.xhead_kind,
+            windows=rows, dtype=dtype, shard=list(sh) if sh[1] > 1 else None, xhead_kind=model.config.xhead_kind,
             xhead_layers=model.config.xhead_layers, n_layers=model.config.n_layers,
             commit=((state.get("run_record") or {}).get("source") or {}).get("commit"),
             seconds=round(time.time() - t0, 1), heads_run_on="the window's 131,072 bases (x_span), trunk on the whole context"),
             indent=1))
-        typer.echo(f"{label}: {win.height} windows in {time.time() - t0:.0f} s -> {out}")
+        typer.echo(f"{label}: {len(rows)} windows in {time.time() - t0:.0f} s -> {out}")
         del model
         torch.cuda.empty_cache() if dev.type == "cuda" else None
+
+
+@app.command()
+def merge(bench: Path, label: str, shards: int = typer.Option(..., help="n, as in --shard i/n")) -> None:
+    """Joins the n shards of LABEL (BENCH/shards/LABEL/i-of-n) into pred/LABEL, as an unsharded score writes it."""
+    parts = [bench / "shards" / label / f"{i}-of-{shards}" for i in range(shards)]
+    missing = [p.name for p in parts if not (p / "index.json").exists()]
+    if missing:
+        raise typer.BadParameter(f"{label}: shards {missing} missing")
+    infos = [json.loads((p / "index.json").read_text()) for p in parts]
+    for k in ("source", "step", "context", "dtype", "commit"):
+        if len({json.dumps(i.get(k)) for i in infos}) > 1:
+            raise typer.BadParameter(f"{label}: shards differ in {k}")
+    rows = np.concatenate([np.asarray(i["windows"], dtype=int) for i in infos])
+    o = np.argsort(rows)
+    if not np.array_equal(rows[o], np.arange(windows_of(bench).height)):
+        raise typer.BadParameter(f"{label}: the shards do not cover every window exactly once")
+    out = bench / "pred" / label
+    if (out / "index.json").exists():
+        raise typer.BadParameter(f"{out} exists")
+    out.mkdir(parents=True, exist_ok=True)
+    np.save(out / "dnase_128.npy", np.concatenate([np.load(p / "dnase_128.npy") for p in parts])[o])
+    np.save(out / "splice.npy", np.concatenate([np.load(p / "splice.npy") for p in parts])[o])
+    info = dict(infos[0], windows=rows[o].tolist(), shard=None, shards=shards, seconds=sum(i["seconds"] for i in infos))
+    (out / "index.json").write_text(json.dumps(info, indent=1))
+    typer.echo(f"{label}: {shards} shards, {len(rows)} windows -> {out}")
 
 
 # ------------------------------------------------------------------------------------------------------- report

@@ -3,7 +3,8 @@ validation set: a species in no training genome, an older and a newer annotation
 
     uv run python scripts/kron_dna/splice_zeroshot.py windows OUT --name dmel_r6 [--n 96]      (the windows)
     uv run python scripts/kron_dna/genes_eval.py score OUT --name dmel_r6 --labels old=STORE --labels new=STORE \
-        LABEL=CHECKPOINT
+        LABEL=CHECKPOINT [--dtype bf16|fp16|fp32] [--shard i/n]
+    uv run python scripts/kron_dna/genes_eval.py merge OUT LABEL --shards n --labels old=STORE --labels new=STORE
 
 For each window the model reads 1,048,576 bases centred on it; its ``genes`` head runs on the window's 131,072 bases
 (as ``splice_zeroshot.py``). Per annotation and channel (tss, polya, utr5, cds, utr3, ncexon, intron; per strand):
@@ -32,6 +33,7 @@ import torch
 import typer
 
 from kron_core.paths import interim_dir
+from kron_dna import evalkit as EK
 from kron_dna import genome as G
 from kron_dna import xheads as X
 
@@ -71,13 +73,13 @@ def exon_f1(call: np.ndarray, lab: np.ndarray) -> dict:
 def score(out: Path, checkpoints: list[str] = typer.Argument(..., help="LABEL=CHECKPOINT"),
           name: str = typer.Option(...), labels: list[str] = typer.Option(..., help="TAG=STORE, one per annotation"),
           windows_csv: Path = typer.Option(None, "--windows"), head: str = "genes", context: int = 1048576,
-          device: str = "cuda") -> None:
+          device: str = "cuda",
+          dtype: str = typer.Option("bf16", help="bf16 | fp16 | fp32 (bf16 is emulated, slow, on Turing cards)"),
+          shard: str = typer.Option("", help="i/n: windows k % n == i only, written under OUT/shards/; then merge")
+          ) -> None:
+    sh = EK.parse_shard(shard)
     win = pl.read_csv(windows_csv or out / "windows.csv")
-    stores = {t: X.open_store(p) for t, p in (s.split("=", 1) for s in labels)}
-    ids = next(iter(stores.values())).ids
-    assert all(st.ids == ids for st in stores.values()), "the annotations' channels differ"
-    lab = {t: np.stack([st.window(int(r["bases_offset"]), WIN, WIN) for r in win.iter_rows(named=True)]).astype(bool)
-           for t, st in stores.items()}                                 # [n, WIN, 14] each
+    lab, ids = labels_of(labels, win) if sh[1] == 1 else (None, ids_of(labels))
     src = interim_dir("genome", name)
     bases = np.memmap(src / "bases.u8", dtype=np.uint8, mode="r")
     contigs = pl.read_parquet(src / "contigs.parquet")
@@ -92,64 +94,121 @@ def score(out: Path, checkpoints: list[str] = typer.Argument(..., help="LABEL=CH
         model = model.to(dev).eval()
         model.x_active, model.x_span = {head}, (flank, flank + WIN)
         unit = 2 ** model.config.n_down
-        pred = np.zeros((win.height, WIN, len(ids)), dtype=np.float16)
+        rows = [k for k in range(win.height) if EK.mine(k, sh)]
+        pred = np.zeros((len(rows), WIN, len(ids)), dtype=np.float16)
         t0 = time.time()
-        for k, r in enumerate(win.iter_rows(named=True)):
+        for j, (k, r) in enumerate((k, r) for k, r in enumerate(win.iter_rows(named=True)) if EK.mine(k, sh)):
             seq = torch.from_numpy(XB.codes_of(contigs, bases, r["chrom"], r["start"] - flank, r["end"] + flank)).to(dev)
             seg = torch.zeros(1, context // unit, dtype=torch.long, device=dev)
             ctx = torch.zeros(1, dtype=torch.long, device=dev) if model.config.n_contexts > 0 else None
-            with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16, enabled=dev.type == "cuda"):
+            with torch.no_grad(), EK.autocast(dev, dtype):
                 model(seq[None], seg, ctx)
-            pred[k] = model.last_x[head][0][:, :len(ids)].float().clamp(-6e4, 6e4).cpu().numpy().astype(np.float16)
-        out.mkdir(parents=True, exist_ok=True)
-        np.save(out / f"{label}.genes.npy", pred)         # the logits, so later metrics need no card
-        call = pred > 0
-        res = dict(label=label, checkpoint=str(where), step=int(state.get("step", -1)), genome=name,
-                   n_windows=win.height, seconds=round(time.time() - t0, 1), annotations={})
-        for t, y in lab.items():
-            per = {}
-            for c, i in enumerate(ids):
-                yc, pc = y[..., c], call[..., c]
-                tp, fp, fn = int((yc & pc).sum()), int((~yc & pc).sum()), int((yc & ~pc).sum())
-                ap = XB.RankedSplice(pred[..., c], yc).ap() if yc.any() else float("nan")
-                per[i] = dict(ap=ap, f1=f1(tp, fp, fn), positives=int(yc.sum()))
-            summ = {}
-            for nm, kinds in (("genic_f1", GENIC), ("subgenic_f1", SUBGENIC)):
-                cols = [c for c, i in enumerate(ids) if i.rsplit("_", 1)[0] in kinds]
-                yc, pc = y[..., cols], call[..., cols]
-                summ[nm] = f1(int((yc & pc).sum()), int((~yc & pc).sum()), int((yc & ~pc).sum()))
-            ex = {st: exon_f1(call[..., ids.index(f"cds_{st}")], y[..., ids.index(f"cds_{st}")])
-                  for st in ("plus", "minus")}
-            tp_ = sum(v["exact"] for v in ex.values())
-            summ["cds_exon_f1"] = f1(tp_, sum(v["predicted"] for v in ex.values()) - tp_,
-                                     sum(v["annotated"] for v in ex.values()) - tp_)
-            res["annotations"][t] = dict(channels=per, cds_exons=ex, **summ)
-        tags = list(lab)
-        if len(tags) == 2:                           # where the two annotations disagree: whose side the head takes
-            a, b = tags
-            dis = {}
-            for c, i in enumerate(ids):
-                d = lab[a][..., c] != lab[b][..., c]
-                n = int(d.sum())
-                if n:
-                    pc = call[..., c][d]
-                    dis[i] = dict(bases=n, agrees_with={a: float((pc == lab[a][..., c][d]).mean()),
-                                                        b: float((pc == lab[b][..., c][d]).mean())})
-            res["disagreement"] = dis
-        out.mkdir(parents=True, exist_ok=True)
-        (out / f"{label}.genes.json").write_text(json.dumps(res, indent=1))
-        for t in tags:
-            an = res["annotations"][t]
-            typer.echo(f"{label} vs {t}: Genic F1 {an['genic_f1']:.3f}, Subgenic F1 {an['subgenic_f1']:.3f}, "
-                       f"CDS exon F1 {an['cds_exon_f1']:.3f}; AP "
-                       + ", ".join(f"{i} {v['ap']:.2f}" for i, v in an["channels"].items() if i.endswith("_plus")))
-        if "disagreement" in res:
-            for i, v in res["disagreement"].items():
-                typer.echo(f"  {i}: {v['bases']:,} bases differ; head agrees with "
-                           + ", ".join(f"{t} {s:.1%}" for t, s in v["agrees_with"].items()))
+            pred[j] = model.last_x[head][0][:, :len(ids)].float().clamp(-6e4, 6e4).cpu().numpy().astype(np.float16)
+        info = dict(label=label, checkpoint=str(where), step=int(state.get("step", -1)), genome=name, dtype=dtype,
+                    n_windows=win.height, seconds=round(time.time() - t0, 1))
         del model
         if dev.type == "cuda":
             torch.cuda.empty_cache()
+        if sh[1] > 1:                                   # a shard: its windows' logits, joined by merge
+            d = out / "shards" / label
+            d.mkdir(parents=True, exist_ok=True)
+            np.save(d / f"{EK.tag(sh)}.npy", pred)
+            (d / f"{EK.tag(sh)}.json").write_text(json.dumps(dict(info, rows=rows, shard=list(sh)), indent=1))
+            typer.echo(f"{label}: shard {EK.tag(sh)}, {len(rows)} windows in {info['seconds']:.0f} s")
+            continue
+        finish(out, info, pred, lab, ids)
+
+
+def ids_of(labels: list[str]) -> list[str]:
+    return X.open_store(labels[0].split("=", 1)[1]).ids
+
+
+def labels_of(labels: list[str], win: pl.DataFrame) -> tuple[dict, list[str]]:
+    stores = {t: X.open_store(p) for t, p in (s.split("=", 1) for s in labels)}
+    ids = next(iter(stores.values())).ids
+    assert all(st.ids == ids for st in stores.values()), "the annotations' channels differ"
+    lab = {t: np.stack([st.window(int(r["bases_offset"]), WIN, WIN) for r in win.iter_rows(named=True)]).astype(bool)
+           for t, st in stores.items()}                                 # [n, WIN, 14] each
+    return lab, ids
+
+
+@app.command()
+def merge(out: Path, label: str, shards: int = typer.Option(..., help="n, as in --shard i/n"),
+          labels: list[str] = typer.Option(..., help="TAG=STORE, as given to score"),
+          windows_csv: Path = typer.Option(None, "--windows")) -> None:
+    """Joins the n shards of LABEL and computes every metric, as an unsharded score would."""
+    win = pl.read_csv(windows_csv or out / "windows.csv")
+    d = out / "shards" / label
+    missing = [i for i in range(shards) if not (d / f"{i}-of-{shards}.npy").exists()]
+    if missing:
+        raise typer.BadParameter(f"{label}: shards {missing} of {shards} missing")
+    infos = [json.loads((d / f"{i}-of-{shards}.json").read_text()) for i in range(shards)]
+    for k in ("checkpoint", "step", "genome", "dtype", "n_windows"):
+        if len({json.dumps(i[k]) for i in infos}) > 1:
+            raise typer.BadParameter(f"{label}: shards differ in {k}")
+    if infos[0]["n_windows"] != win.height:
+        raise typer.BadParameter(f"{label}: shards were scored on {infos[0]['n_windows']} windows, not {win.height}")
+    lab, ids = labels_of(labels, win)
+    pred = np.zeros((win.height, WIN, len(ids)), dtype=np.float16)
+    seen = np.zeros(win.height, dtype=int)
+    for i, inf in enumerate(infos):
+        pred[inf["rows"]] = np.load(d / f"{i}-of-{shards}.npy")
+        seen[inf["rows"]] += 1
+    if not (seen == 1).all():
+        raise typer.BadParameter(f"{label}: windows not covered exactly once")
+    finish(out, dict(infos[0], seconds=sum(i["seconds"] for i in infos), shards=shards), pred, lab, ids)
+
+
+def finish(out: Path, info: dict, pred: np.ndarray, lab: dict, ids: list[str]) -> None:
+    """Every metric from the logits ``pred`` [windows, WIN, channels] against each annotation's labels."""
+    label = info["label"]
+    for k in ("rows", "shard"):
+        info.pop(k, None)
+    out.mkdir(parents=True, exist_ok=True)
+    np.save(out / f"{label}.genes.npy", pred)         # the logits, so later metrics need no card
+    call = pred > 0
+    res = dict(info, annotations={})
+    for t, y in lab.items():
+        per = {}
+        for c, i in enumerate(ids):
+            yc, pc = y[..., c], call[..., c]
+            tp, fp, fn = int((yc & pc).sum()), int((~yc & pc).sum()), int((yc & ~pc).sum())
+            ap = XB.RankedSplice(pred[..., c], yc).ap() if yc.any() else float("nan")
+            per[i] = dict(ap=ap, f1=f1(tp, fp, fn), positives=int(yc.sum()))
+        summ = {}
+        for nm, kinds in (("genic_f1", GENIC), ("subgenic_f1", SUBGENIC)):
+            cols = [c for c, i in enumerate(ids) if i.rsplit("_", 1)[0] in kinds]
+            yc, pc = y[..., cols], call[..., cols]
+            summ[nm] = f1(int((yc & pc).sum()), int((~yc & pc).sum()), int((yc & ~pc).sum()))
+        ex = {st: exon_f1(call[..., ids.index(f"cds_{st}")], y[..., ids.index(f"cds_{st}")])
+              for st in ("plus", "minus")}
+        tp_ = sum(v["exact"] for v in ex.values())
+        summ["cds_exon_f1"] = f1(tp_, sum(v["predicted"] for v in ex.values()) - tp_,
+                                 sum(v["annotated"] for v in ex.values()) - tp_)
+        res["annotations"][t] = dict(channels=per, cds_exons=ex, **summ)
+    tags = list(lab)
+    if len(tags) == 2:                           # where the two annotations disagree: whose side the head takes
+        a, b = tags
+        dis = {}
+        for c, i in enumerate(ids):
+            d = lab[a][..., c] != lab[b][..., c]
+            n = int(d.sum())
+            if n:
+                pc = call[..., c][d]
+                dis[i] = dict(bases=n, agrees_with={a: float((pc == lab[a][..., c][d]).mean()),
+                                                    b: float((pc == lab[b][..., c][d]).mean())})
+        res["disagreement"] = dis
+    out.mkdir(parents=True, exist_ok=True)
+    (out / f"{label}.genes.json").write_text(json.dumps(res, indent=1))
+    for t in tags:
+        an = res["annotations"][t]
+        typer.echo(f"{label} vs {t}: Genic F1 {an['genic_f1']:.3f}, Subgenic F1 {an['subgenic_f1']:.3f}, "
+                   f"CDS exon F1 {an['cds_exon_f1']:.3f}; AP "
+                   + ", ".join(f"{i} {v['ap']:.2f}" for i, v in an["channels"].items() if i.endswith("_plus")))
+    if "disagreement" in res:
+        for i, v in res["disagreement"].items():
+            typer.echo(f"  {i}: {v['bases']:,} bases differ; head agrees with "
+                       + ", ".join(f"{t} {s:.1%}" for t, s in v["agrees_with"].items()))
 
 
 if __name__ == "__main__":

@@ -93,6 +93,19 @@ def test_targets_score_and_report_run_end_to_end(genomes, tmp_path, monkeypatch,
     assert res.exit_code == 0, res.output + repr(res.exception)
     d = bench / "pred" / "tiny"
     assert np.load(d / "dnase_128.npy").shape == (2, 2, 3) and np.load(d / "splice.npy").shape == (2, 256, 4)
+    for i in (1, 0):                                     # two shards, merged: the unsharded arrays, window by window
+        res = run("score", bench, f"sharded={tmp_path / 'ck.pt'}", "--context", 768, "--device", "cpu", "--name", "hgt",
+                  "--shard", f"{i}/2", "--dtype", "fp32")
+        assert res.exit_code == 0, res.output + repr(res.exception)
+    assert not (bench / "pred" / "sharded").exists()
+    res = run("merge", bench, "sharded", "--shards", 2)
+    assert res.exit_code == 0, res.output + repr(res.exception)
+    m = bench / "pred" / "sharded"
+    assert np.allclose(np.load(m / "dnase_128.npy"), np.load(d / "dnase_128.npy"), atol=1e-5)
+    assert np.array_equal(np.load(m / "splice.npy"), np.load(d / "splice.npy"))
+    assert json.loads((m / "index.json").read_text())["windows"] == [0, 1]
+    import shutil
+    shutil.rmtree(m)                                     # the report below compares two sources
     other = bench / "pred" / "noisy"                     # a second source on the same windows
     other.mkdir()
     np.save(other / "dnase_128.npy", np.load(d / "dnase_128.npy") + rng.normal(size=(2, 2, 3)).astype(np.float32))
