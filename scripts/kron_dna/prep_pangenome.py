@@ -60,14 +60,17 @@ def rows_of(index: Path) -> pl.DataFrame:
     return pl.read_csv(index, infer_schema_length=0).filter(pl.col("haplotype").is_in(["1", "2"]))
 
 
-def alias_url(r: dict) -> str:
-    base = r["assembly"].rsplit("/", 1)[0]
-    return https(f"{base}/annotation/chrom_assignment/{r['assembly_name']}.chromAlias.txt")
+def alias_url(r: dict, where: dict) -> str | None:
+    """The assembly's chromAlias: the release's alias index (WORK/chrom_alias_hprc_r2_v1.0.index.csv) when it lists
+    the assembly, else None (HG002's Q100 assemblies, whose sequence names already end in their chromosome)."""
+    return https(where[r["assembly_name"]]) if r["assembly_name"] in where else None
 
 
 @app.command()
 def part(index: Path, work: Path, part: int = 0, parts: int = 1) -> None:
     rows = rows_of(index)
+    ai = work / "chrom_alias_hprc_r2_v1.0.index.csv"
+    where = {a: loc for a, loc in pl.read_csv(ai, infer_schema_length=0).select("assembly_name", "location").iter_rows()}
     for k, r in enumerate(rows.iter_rows(named=True)):
         if k % parts != part:
             continue
@@ -82,16 +85,24 @@ def part(index: Path, work: Path, part: int = 0, parts: int = 1) -> None:
         fa, al, sm = tmp / "a.fa.gz", tmp / "alias.txt", tmp / "a.md5"
         fetch(https(r["assembly"]), fa)
         fetch(https(r["assembly_md5"]), sm)
-        fetch(alias_url(r), al)
+        url_a = alias_url(r, where)
+        if url_a:
+            fetch(url_a, al)
         want = sm.read_text().split()[0]
         got = md5(fa)
         if got != want:
             raise SystemExit(f"{name}: md5 {got} != the release's {want}")
         alias = {}
-        for line in al.read_text().splitlines():
+        for line in (al.read_text().splitlines() if url_a else []):
             if line and not line.startswith("#"):
                 f = line.split("\t")
                 alias[f[0]] = f[1]
+        if not url_a:                                 # PanSN names: <sample>#<hap>#chrN
+            with gzip.open(fa, "rt") as f:
+                for line in f:
+                    if line.startswith(">"):
+                        nm = line[1:].split()[0]
+                        alias[nm] = nm.split("#")[-1]
         tag = f"{r['sample_id']}#{r['haplotype']}#"
         out_rows, offset, kept = [], 0, {}
         (tmp / "out").mkdir()
