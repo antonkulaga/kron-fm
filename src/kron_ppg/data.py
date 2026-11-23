@@ -94,7 +94,18 @@ class Windows:
 
 
 def _subject_frame(subjects: list[dict]) -> pl.DataFrame:
-    """The subject table with ``subject``, ``age`` and ``sex`` first; numeric columns typed as numbers."""
+    """The subject table with ``subject``, ``age`` and ``sex`` first; numeric columns typed as numbers.
+
+    One row per subject: a subject listed twice with different values (two hospital cases at two ages) is
+    refused, since every window of that subject would carry one of the two silently.
+    """
+    seen: dict[str, dict] = {}
+    for s in subjects:
+        key = str(s.get("subject"))
+        if key in seen and seen[key] != s:
+            raise ValueError(f"subject {key} listed twice with different values; keep one row per subject")
+        seen[key] = s
+    subjects = list(seen.values())
     names = ["subject", "age", "sex"] + sorted({k for s in subjects for k in s} - {"subject", "age", "sex"})
     raw = pl.DataFrame({n: [None if s.get(n) in (None, "") else str(s[n]) for s in subjects] for n in names},
                        schema={n: pl.String for n in names})

@@ -431,7 +431,9 @@ def _pool_step(clock: PPGAgeClock, patches, pv, weight, states, psum, pcount):
 def stream_ages(clock: PPGAgeClock, pool: StreamPool, keys: list[str], hours: float, chunk: int, lanes: int,
                 dev, pool_mode: str = "uniform") -> dict[str, tuple[float, float, int]]:
     """Each person's age read at the end of up to ``hours`` of their streams, one after another, the memory and
-    the pool carried across them: ``key -> (predicted, age, patches pooled)``."""
+    the pool carried across them: ``key -> (predicted, age, patches pooled)``. Each module's train/eval mode is
+    restored after (a frozen encoder keeps its dropout off)."""
+    modes = {m: m.training for m in clock.modules()}
     clock.eval()
     out = {}
     budget = int(hours * 3600 * pool.sample_rate)
@@ -469,7 +471,8 @@ def stream_ages(clock: PPGAgeClock, pool: StreamPool, keys: list[str], hours: fl
                 age, psum, pcount = _pool_step(clock, patches, pv, weight, states, psum, pcount)
             for j, (k, _) in enumerate(group):
                 out[k] = (float(age[j]), pool.age[k], int(pcount[j]))
-    clock.train()
+    for m, mode in modes.items():
+        m.train(mode)
     return out
 
 

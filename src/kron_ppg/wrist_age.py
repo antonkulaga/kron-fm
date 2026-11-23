@@ -285,7 +285,7 @@ def evaluate(p: People, folds: int = 10, repeats: int = 5, null: int = 20, seed:
             result["per_source"][str(s)] = {**score(p.age[mine], {k: v[mine] for k, v in cv.items()}, seed),
                                             "age_range": [float(p.age[mine].min()), float(p.age[mine].max())]}
     if null:
-        result["null"] = permutation_null(p, null, folds, 2, seed)
+        result["null"] = permutation_null(p, null, folds, repeats, seed)  # the same procedure as the real score
         result["null"]["p_value"] = float((1 + sum(m <= result["pooled"]["mae"] for m in result["null"]["mae"]))
                                           / (1 + null))
     if len(np.unique(p.source)) > 1:
@@ -324,7 +324,17 @@ def run(folders: Sequence[Path], encoder_path: Path | str | None, out: Path, cap
 
     out.mkdir(parents=True, exist_ok=True)
     cache = out / "people.npz"
+    # what the cached embeddings were made from: a rerun with another encoder, band or cohort must not reuse them
+    made_from = {"encoder": str(encoder_path), "data": [str(f) for f in folders], "cap": cap, "seed": seed,
+                 "lowpass_hz": cutoff}
+    stamp = out / "people.json"
     if cache.is_file():
+        if stamp.is_file():
+            cached = json.loads(stamp.read_text())
+            if cached != made_from:
+                raise ValueError(f"{cache} was made from {cached}, not {made_from}; use another --out")
+        else:  # a run from before the stamp: trusted as the caller's, and stamped now
+            stamp.write_text(json.dumps(made_from, indent=2) + "\n")
         people = People.load(cache)
     else:
         pool = Pool.load(folders)
@@ -348,6 +358,7 @@ def run(folders: Sequence[Path], encoder_path: Path | str | None, out: Path, cap
             emb = embed(encoder, pool, idx, batch_size, device, cutoff)
         people = per_person(pool.subject[idx], pool.age[idx], emb)
         people.save(cache)
+        stamp.write_text(json.dumps(made_from, indent=2) + "\n")
         # each window's embedding too, for how many readings a person needs (float16 keeps it small)
         np.savez(out / "windows.npz", subject=pool.subject[idx].astype(str), x=emb.astype(np.float16))
     result, cv = evaluate(people, folds, repeats, null, seed)
@@ -470,9 +481,14 @@ def export(run_dir: Path, out: Path | None = None, chunk: int = 25, window_s: fl
     encoder.cpu()
     reference = float(reference + head["bias"])
     record["app"] = {
-        "recipe": f"band-pass 0.5-{cutoff:g} Hz, resample to {c.sample_rate:g} Hz, cut {window_s:g} s windows, robust-scale "
+        # the order the head was fitted with: prepare_signal's 0.5-8 Hz band, scale and gate, then the head's own
+        # band (lowpass) over each whole window last
+        "recipe": f"band-pass 0.5-8 Hz, resample to {c.sample_rate:g} Hz, cut {window_s:g} s windows, robust-scale "
                   "each (median, IQR/1.349), drop windows the quality gate refuses (periodicity < 0.35 or any "
-                  f"|x| > 20); feed each window as {per_window} chunks of {chunk * c.patch} samples; zero every "
+                  "|x| > 20)"
+                  + (f", then remove every frequency above {cutoff:g} Hz from each kept window (FFT over the window)"
+                     if cutoff < 8.0 else "")
+                  + f"; feed each window as {per_window} chunks of {chunk * c.patch} samples; zero every "
                   "recurrent_state/conv_state at each window's start, keep pool_sum/pool_count across windows; "
                   "the age after the last chunk is the person's estimate",
         "parity_vs_window_embedding_years": abs(age - reference),
