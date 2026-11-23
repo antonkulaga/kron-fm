@@ -1807,13 +1807,13 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                 sp_ = np.zeros(wrow, dtype=np.uint8)
                 cm_ = np.zeros(len(ntv3["ids"]), dtype=bool)              # the channels this window can train
                 if xs is not None:
-                    nt[:take, e_["lo"]:e_["hi"]] = e_["dense"][at:at + take]
+                    nt[:take, e_["lo"]:e_["hi"]] = XH.read_rows(e_["dense"], at, at + take)   # pread, not the mapping
                     sp_[:take] = e_["split"][at:at + take]
                     cm_[e_["lo"]:e_["hi"]] = True
                 elif not from_mito and fg is None:                        # organelle windows have no nuclear tracks
                     n_h = ntv3["n_h"]
                     if ntv3["dense"] is not None:
-                        nt[:take, :n_h] = ntv3["dense"][at:at + take][:, ntv3["cols"]]
+                        nt[:take, :n_h] = XH.read_rows(ntv3["dense"], at, at + take)[:, ntv3["cols"]]   # pread
                     else:
                         for k_, arr_ in enumerate(ntv3["arrs"]):
                             nt[:take, k_] = arr_[at:at + take]
