@@ -11,6 +11,8 @@ For each window the model reads 1,048,576 bases centred on it; its ``genes`` hea
 - average precision of the head's logits against the labels, exact over every base of every window;
 - base-wise F1 of the head's calls (logit > 0) against the labels, and Helixer's summaries: Genic F1 over the
   CDS, UTR (5' and 3') and intron bases of both strands pooled, Subgenic F1 over CDS and intron;
+- Tiberius's exon level for CDS exons: a run of CDS calls is right only if an annotated CDS exon (isoforms
+  pooled, so close to but not exactly Tiberius's longest-CDS transcript per gene) has exactly its two ends;
 - where two annotations disagree on a base and channel, the share of those bases on which the head's call agrees
   with each of them (the newer annotation is the better one; does the head side with it).
 
@@ -43,6 +45,25 @@ SUBGENIC = ("cds", "intron")
 
 def f1(tp: int, fp: int, fn: int) -> float:
     return float(2 * tp / max(2 * tp + fp + fn, 1))
+
+
+def runs(x: np.ndarray) -> set:
+    """``[n, L]`` bool -> {(window, start, end)} of every maximal run of True, end exclusive (a run touching a window
+    edge is cut there; such runs are counted on both sides alike)."""
+    out = set()
+    for w in range(x.shape[0]):
+        d = np.diff(np.concatenate([[0], x[w].astype(np.int8), [0]]))
+        for a, b in zip(np.flatnonzero(d == 1), np.flatnonzero(d == -1)):
+            out.add((w, int(a), int(b)))
+    return out
+
+
+def exon_f1(call: np.ndarray, lab: np.ndarray) -> dict:
+    """Tiberius's exon level for CDS exons: a predicted exon (a run of CDS calls on one strand) is right only if an
+    annotated one (a run of CDS labels; isoforms pooled) has exactly its two ends."""
+    p, t = runs(call), runs(lab)
+    tp = len(p & t)
+    return dict(f1=f1(tp, len(p) - tp, len(t) - tp), predicted=len(p), annotated=len(t), exact=tp)
 
 
 @app.command()
@@ -94,7 +115,12 @@ def score(out: Path, checkpoints: list[str] = typer.Argument(..., help="LABEL=CH
                 cols = [c for c, i in enumerate(ids) if i.rsplit("_", 1)[0] in kinds]
                 yc, pc = y[..., cols], call[..., cols]
                 summ[nm] = f1(int((yc & pc).sum()), int((~yc & pc).sum()), int((yc & ~pc).sum()))
-            res["annotations"][t] = dict(channels=per, **summ)
+            ex = {st: exon_f1(call[..., ids.index(f"cds_{st}")], y[..., ids.index(f"cds_{st}")])
+                  for st in ("plus", "minus")}
+            tp_ = sum(v["exact"] for v in ex.values())
+            summ["cds_exon_f1"] = f1(tp_, sum(v["predicted"] for v in ex.values()) - tp_,
+                                     sum(v["annotated"] for v in ex.values()) - tp_)
+            res["annotations"][t] = dict(channels=per, cds_exons=ex, **summ)
         tags = list(lab)
         if len(tags) == 2:                           # where the two annotations disagree: whose side the head takes
             a, b = tags
@@ -111,7 +137,8 @@ def score(out: Path, checkpoints: list[str] = typer.Argument(..., help="LABEL=CH
         (out / f"{label}.genes.json").write_text(json.dumps(res, indent=1))
         for t in tags:
             an = res["annotations"][t]
-            typer.echo(f"{label} vs {t}: Genic F1 {an['genic_f1']:.3f}, Subgenic F1 {an['subgenic_f1']:.3f}; AP "
+            typer.echo(f"{label} vs {t}: Genic F1 {an['genic_f1']:.3f}, Subgenic F1 {an['subgenic_f1']:.3f}, "
+                       f"CDS exon F1 {an['cds_exon_f1']:.3f}; AP "
                        + ", ".join(f"{i} {v['ap']:.2f}" for i, v in an["channels"].items() if i.endswith("_plus")))
         if "disagreement" in res:
             for i, v in res["disagreement"].items():

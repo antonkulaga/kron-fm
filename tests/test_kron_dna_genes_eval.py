@@ -59,12 +59,15 @@ def test_genes_eval_scores_two_annotations(tmp_path, monkeypatch):
     for mod in (GE, SZ):
         monkeypatch.setattr(mod, "interim_dir", lambda *a: g)
     out = tmp_path / "eval"
-    SZ.windows(out, name="toy", n=2, seed=0, context=131072, chroms="", keep=None)
+    SZ.windows(out, name="toy", n=2, seed=0, context=131072, chroms="", keep=None, max_n=0.0)
     GE.score(out, [f"m={tmp_path / 'ck.pt'}"], name="toy", labels=[f"old={tmp_path / 'old'}", f"new={tmp_path / 'new'}"],
              windows_csv=None, head="genes", context=131072, device="cpu")
     r = json.loads((out / "m.genes.json").read_text())
     assert set(r["annotations"]) == {"old", "new"} and r["n_windows"] == 2 and r["step"] == 7
-    assert 0 <= r["annotations"]["new"]["genic_f1"] <= 1
+    assert 0 <= r["annotations"]["new"]["genic_f1"] <= 1 and 0 <= r["annotations"]["new"]["cds_exon_f1"] <= 1
+    assert r["annotations"]["old"]["cds_exons"]["plus"]["annotated"] > 0
+    assert GE.exon_f1(np.array([[0, 1, 1, 0, 1, 1, 1]], bool), np.array([[0, 1, 1, 0, 0, 1, 1]], bool)) == dict(
+        f1=0.5, predicted=2, annotated=2, exact=1)
     d = r["disagreement"]
     assert set(d) == {"utr3_plus", "polya_plus"} or "utr3_plus" in d     # the longer 3' exons are the difference
     for v in d.values():
