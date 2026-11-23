@@ -36,10 +36,9 @@ PART = f".part.{socket.gethostname()}.{os.getpid()}"
 
 
 def targets_np(u8: np.ndarray, scales: np.ndarray, nz: np.ndarray, rna: np.ndarray) -> np.ndarray:
-    """numpy twin of :func:`kron_dna.xheads.targets_of` (float32)."""
-    x = np.maximum(np.expm1(u8.astype(np.float32) / 255.0 * scales), 0) / nz
-    x = np.where(rna, np.power(np.maximum(x, 1e-12), 0.75), x)
-    return np.where(x > 10, 2 * np.sqrt(10 * x) - 10, x).astype(np.float32)
+    """numpy twin of :func:`kron_dna.xheads.targets_of` (float32), on the shared transforms."""
+    from kron_dna.prep.transforms import decode_u8, targets_np as tr
+    return tr(decode_u8(u8, scales) / nz, rna).astype(np.float32)
 
 
 def main(src: Path, out: Path, bin: int = 128, part: int = 0, parts: int = 1,

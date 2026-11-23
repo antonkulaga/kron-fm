@@ -68,6 +68,8 @@ def _sample_windows(rows, rng, n, width=100_000, have=None, split=None, tries=20
 def one(fid: str) -> dict:
     import pyBigWig
 
+    from kron_dna.prep.transforms import decode_u8, encode_u8, targets_np
+
     rows, total, src, out, b = _G["rows"], _G["total"], _G["src"], _G["out"], _G["bin"]
     side = out / "cells" / f"{fid}.json"
     if side.exists():
@@ -108,12 +110,9 @@ def one(fid: str) -> dict:
             seen += z - a
             x = np.where(bad, 0.0, x)
             negative += int((x < 0).sum())
-            u = np.clip(np.log1p(np.maximum(x, 0)) / sc * 255.0, 0, 255).astype(np.uint8)
+            u = encode_u8(x, sc)
             lg = u.astype(np.float32) / 255.0 * sc
-            t = np.maximum(np.expm1(lg), 0) / nz
-            if rna:
-                t = np.power(np.maximum(t, 1e-12), 0.75)
-            t = np.where(t > 10, 2 * np.sqrt(10 * t) - 10, t)
+            t = targets_np(decode_u8(u, sc) / nz, rna)
             k = (off + (a - s) + np.arange(z - a)) // b                     # each base's global cell
             lo = int(k[0])
             s_t[lo:lo + int(k[-1]) - lo + 1] += np.bincount(k - lo, weights=t)
