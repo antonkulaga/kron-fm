@@ -40,14 +40,23 @@ WIN = XB.WIN
 
 @app.command()
 def windows(out: Path, name: str = typer.Option(...), n: int = 96, seed: int = 0,
-            context: int = 1048576) -> None:
-    """Random N-free windows over the genome's gap-free contigs."""
+            context: int = 1048576,
+            chroms: str = typer.Option("", help="only these chromosomes, '+'-joined (e.g. chr8+chr9: held out)"),
+            keep: Path = typer.Option(None, help="a windows.csv whose windows on these chromosomes are kept first")) -> None:
+    """Random N-free windows over the genome's gap-free contigs (or those of ``chroms``); ``keep``'s come first."""
     src = interim_dir("genome", name)
     bases = np.memmap(src / "bases.u8", dtype=np.uint8, mode="r")
     contigs = pl.read_parquet(src / "contigs.parquet").filter((pl.col("end") - pl.col("start")) >= WIN)
+    if chroms:
+        contigs = contigs.filter(pl.col("chrom").is_in(chroms.split("+")))
     lens = (contigs["end"] - contigs["start"]).to_numpy()
     rng = np.random.default_rng(seed)
     rows, tries = [], 0
+    if keep is not None:
+        old = pl.read_csv(keep)
+        if chroms:
+            old = old.filter(pl.col("chrom").is_in(chroms.split("+")))
+        rows = [dict(r, window_id=f"w{k:03d}") for k, r in enumerate(old.drop("window_id").iter_rows(named=True))]
     while len(rows) < n:
         tries += 1
         assert tries < 100 * n, "too few N-free windows"
