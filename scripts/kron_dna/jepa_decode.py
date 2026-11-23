@@ -5,9 +5,12 @@ genome) blocks of bins are hidden (MASK input, as block JEPA trains them); then 
 are set four ways and the model's own decoder, masked-base head and NTv3 track head run on each:
 
 - ``real``: the core states of the clean (unmasked) window: the upper bound;
-- ``jepa``: the JEPA predictor applied to the masked window's core (what the objective trains);
-- ``online``: the masked window's core as it is (the trunk's own guess, no predictor);
-- ``copy``: each hidden bin takes the nearest visible bin's clean state (the copy-the-neighbour baseline).
+- ``jepa_raw`` / ``jepa`` / ``jepa_oracle_norm``: the JEPA predictor on the masked window's core, as it comes, rescaled
+  to the masked core's norm per bin, and rescaled to the clean state's norm (the loss is cosine, so norm is free);
+- ``online``: the masked window's core as it is (the trunk's own guess, no predictor; the training log's "copy
+  baseline" is this state against the target);
+- ``nearest_visible``: each hidden bin takes the nearest visible bin's clean state.
+``real`` keeps the masked skips, so it is the honest ceiling: the decoder never sees the hidden bases.
 
 The decoder's skip connections come from the masked input in every case, so inside a block the only information
 about the hidden bases is the core state. Scored inside the blocks: masked-base accuracy against the true bases,
@@ -98,8 +101,8 @@ def main(checkpoints: list[Path] = typer.Argument(..., help="checkpoint files wi
             print(f"{ck}: no JEPA predictor, skipped")
             continue
         unit = 2 ** model.config.n_down
-        acc = {k: [] for k in ("real", "jepa", "online", "copy")}
-        cor = {k: [] for k in ("jepa", "online", "copy")}
+        acc = {k: [] for k in ("real", "jepa_raw", "jepa", "jepa_oracle_norm", "online", "nearest_visible")}
+        cor = {k: [] for k in ("real", "jepa_raw", "jepa", "jepa_oracle_norm", "online", "nearest_visible")}
         brng = np.random.default_rng(seed + 1)
         for at, s in picks:
             hid = G.block_mask(np.zeros((1, window // unit), dtype=np.int64), s[None], unit, share, lo, hi, brng)[0]
@@ -115,14 +118,21 @@ def main(checkpoints: list[Path] = typer.Argument(..., help="checkpoint files wi
                 _, nt_clean = heads_of(model, core_c, skips_c)
                 hb = torch.tensor(hid, device=dev)
                 near = torch.tensor(nearest_visible(hid), device=dev)
-                variants = {"real": core_c, "jepa": model.jepa_pred(core_m), "online": core_m, "copy": core_c[:, near]}
+                pred = model.jepa_pred(core_m)
+                # the JEPA loss is 1 - cosine, so the predictor's norm is free: rescale each predicted state to the norm
+                # of the masked core's state at that bin (available at inference), and to the clean state's norm
+                # (an oracle norm, the ceiling of the direction alone)
+                pn = pred.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+                variants = {"real": core_c, "jepa_raw": pred, "jepa": pred / pn * core_m.norm(dim=-1, keepdim=True),
+                            "jepa_oracle_norm": pred / pn * core_c.norm(dim=-1, keepdim=True),
+                            "online": core_m, "nearest_visible": core_c[:, near]}
                 for k, cv in variants.items():
                     mix = core_m.clone()
                     mix[0, hb] = cv[0, hb].to(mix.dtype)
                     logits, nt = heads_of(model, mix, skips_m)
                     m = torch.tensor(base_hidden & (s < 4), device=dev)
                     acc[k].append(float((logits[0, m, :4].argmax(-1) == seq[0, m]).float().mean()))
-                    if k != "real" and nt is not None and nt_clean is not None:
+                    if nt is not None and nt_clean is not None:
                         cor[k].append(pearson_tracks(nt[0, m].float().cpu().numpy(), nt_clean[0, m].float().cpu().numpy()))
         row = dict(checkpoint=str(ck), step=int(state.get("step", -1)), windows=len(acc["real"]),
                    **{f"base_acc_{k}": float(np.mean(v)) for k, v in acc.items()},
