@@ -50,7 +50,7 @@ def test_genes_eval_scores_two_annotations(tmp_path, monkeypatch):
                      f"chr1\tX\tstart_codon\t{s0 + 1}\t{s0 + 3}\t.\t+\t.\ttranscript_id \"t{k}\";"]
         (tmp_path / f"{tag}.gtf").write_text("\n".join(rows) + "\n")
         monkeypatch.setattr(GS, "interim_dir", lambda *a: g)
-        GS.main(tmp_path / tag, name="toy", gtf=tmp_path / f"{tag}.gtf", basic_only=False, chrom_prefix="")
+        GS.main(tmp_path / tag, name="toy", gtf=tmp_path / f"{tag}.gtf", basic_only=False, chrom_prefix="", source="", split=None)
     cfg = G.KronGenomeConfig(**{**small("v2").config.to_dict(), "xheads": [["genes", 14]], "xhead_kind": "kron",
                                 "xhead_bin": 4, "xhead_width": 64})
     torch.manual_seed(0)

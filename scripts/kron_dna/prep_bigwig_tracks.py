@@ -48,17 +48,21 @@ ENCODING = "uint8 = log1p(signal)/log1p_scale*255, clipped"
 _G: dict = {}
 
 
-def scale_of(bw, rows: list[tuple], percentile: float = 99.9) -> float:
+def scale_of(bw, rows: list[tuple], percentile: float = 99.9, split=None) -> float:
     """The ``percentile`` of non-zero log1p signal over 200 sampled 100 kb windows (99.9: as the NTv3 store; the
-    DNase pilot showed that it clips peak summits where a track's scale is low, so peaky assays take 99.99)."""
+    DNase pilot showed that it clips peak summits where a track's scale is low, so peaky assays take 99.99). With
+    ``split``, a draw counts only when its window is at least 90 % training split (code 1): held-out chromosomes never
+    calibrate the encoding (review, 23 Nov)."""
     rng = np.random.default_rng(0)
     vals = []
     have = set(bw.chroms())
     for _ in range(200):
-        c, s, e, _ = rows[int(rng.integers(0, len(rows)))]
+        c, s, e, off = rows[int(rng.integers(0, len(rows)))]
         if e - s < 100_000 or c not in have:
             continue
         a = int(rng.integers(s, e - 100_000))
+        if split is not None and float((np.asarray(split[off + a - s:off + a - s + 100_000]) == 1).mean()) < 0.9:
+            continue
         v = np.nan_to_num(bw.values(c, a, a + 100_000, numpy=True))
         vals.append(v[v > 0])
     v = np.concatenate(vals) if vals else np.array([1.0])
@@ -75,7 +79,7 @@ def one(fid: str) -> dict:
         return json.loads(side.read_text())
     bw = pyBigWig.open(str(src / f"{fid}.bigWig"))
     have = bw.chroms()
-    sc = scale_of(bw, rows, _G.get("percentile", 99.9))
+    sc = scale_of(bw, rows, _G.get("percentile", 99.9), _G.get("split"))
     part = str(dst) + f".part.{socket.gethostname()}.{os.getpid()}"
     arr = np.memmap(part, dtype=np.uint8, mode="w+", shape=(total,))
     nan = seen = negative = 0
@@ -134,7 +138,9 @@ def main(select: Path, bigwigs: Path, out: Path, name: str = "hg38", provenance:
     if provenance and provenance.exists():
         prov = {r["file"]: r for r in map(json.loads, provenance.read_text().splitlines())}
     (out / "tracks").mkdir(parents=True, exist_ok=True)
-    g = dict(rows=rows, total=total, src=bigwigs, out=out, percentile=scale_percentile)
+    sp_ = genome / "ntv3" / "split.u8"                 # the training split, so the scale is calibrated on it only
+    g = dict(rows=rows, total=total, src=bigwigs, out=out, percentile=scale_percentile,
+             split=np.memmap(sp_, dtype=np.uint8, mode="r") if sp_.exists() else None)
     with Pool(workers, initializer=_init, initargs=(g,)) as p:
         infos = {}
         for info in p.imap_unordered(one, files):

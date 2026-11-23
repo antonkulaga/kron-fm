@@ -150,6 +150,7 @@ class LabelStore:
     positives: np.ndarray             # [T] labelled bases per channel
     genome: str
     identity: dict = field(default_factory=dict)
+    train_bases: int = 0              # bases of the training split the positives were counted on (0: the whole store)
     kind = "binary"                   # classification: weighted BCE, average precision on the held-out chromosomes
 
     @classmethod
@@ -178,12 +179,16 @@ class LabelStore:
             if other not in at:
                 raise ValueError(f"{path}: stranded channel {i} has no partner")
             swap[k] = at[other]
-        positives = np.array([int(j["check"][i]["sites"]) for i in ids], dtype=np.int64)
+        # the class weights count the training split only (review, 23 Nov): train_sites and train_bases where the
+        # label script recorded them, else (a store made before) the whole store
+        positives = np.array([int(j["check"][i].get("train_sites", j["check"][i]["sites"])) for i in ids],
+                             dtype=np.int64)
+        train_bases = int(j.get("train_bases") or total)
         identity = dict(ids=ids, encoding="one bit per channel", genome=j.get("genome"), total_bases=total,
                         definition=j.get("definition"), labels_sha256=j.get(f"{stem}_sha256"),
                         record_sha256=hashlib.sha256(raw).hexdigest())
         return cls(path=path, ids=ids, labels=np.memmap(data, dtype=dtype, mode="r"), swap=swap,
-                   positives=positives, genome=str(j.get("genome")), identity=identity)
+                   positives=positives, genome=str(j.get("genome")), identity=identity, train_bases=train_bases)
 
     @property
     def dense(self) -> np.ndarray:                    # for the size check a store's user makes against the genome
@@ -209,7 +214,7 @@ class LabelStore:
     def consts(self, device) -> tuple:
         """(positive weights,) on ``device``: sqrt(negatives / positives) per channel, between 1 and 100, as the
         prepared genome's own rare tracks are weighted."""
-        share = self.positives / max(len(self.labels), 1)
+        share = self.positives / max(self.train_bases or len(self.labels), 1)
         w = np.clip(np.sqrt((1 - share) / np.maximum(share, 1e-12)), 1, 100).astype(np.float32)
         return (torch.as_tensor(w).to(device),)
 
@@ -422,6 +427,19 @@ class SpeciesStores:
         if saved.get("species") != self.identity.get("species"):
             out.append(f"species: checkpoint {sorted(saved.get('species') or {})}, now {sorted(self.identity['species'])}")
         return out
+
+
+def train_counts(labels: np.ndarray, split: np.ndarray, bits: dict, step: int = 1 << 26) -> tuple[dict, int]:
+    """Per channel of a bit-packed label array, its positives on the training split (code 1), and the split's bases."""
+    pos = {k: 0 for k in bits}
+    n = 0
+    for a in range(0, len(labels), step):
+        m = np.asarray(split[a:a + step]) == 1
+        lab = np.asarray(labels[a:a + step])[m]
+        n += int(m.sum())
+        for k, b in bits.items():
+            pos[k] += int(np.count_nonzero(lab & (1 << b)))
+    return pos, n
 
 
 def store_of_record(entry: dict):

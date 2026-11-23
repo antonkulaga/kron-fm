@@ -66,7 +66,7 @@ def run(tmp_path, monkeypatch, shift=0):
     g, gtf = build(tmp_path, shift)
     monkeypatch.setattr(GS, "interim_dir", lambda *a: g)
     out = tmp_path / "labels"
-    GS.main(out, name="toy", gtf=gtf, basic_only=False, chrom_prefix="")
+    GS.main(out, name="toy", gtf=gtf, basic_only=False, chrom_prefix="", source="", split=None)
     return out
 
 
@@ -114,7 +114,7 @@ def test_a_gff3_gives_the_same_labels(tmp_path, monkeypatch):
     gff = tmp_path / "gff" / "toy.gff3"
     gff.write_text("##gff-version 3\n" + "\n".join(lines) + "\n")
     monkeypatch.setattr(GS, "interim_dir", lambda *a: g)
-    GS.main(tmp_path / "gff" / "labels", name="toy", gtf=gff, basic_only=False, chrom_prefix="")
+    GS.main(tmp_path / "gff" / "labels", name="toy", gtf=gff, basic_only=False, chrom_prefix="", source="", split=None)
     a = np.fromfile(out / "labels.u16", dtype=np.uint16)
     b = np.fromfile(tmp_path / "gff" / "labels" / "labels.u16", dtype=np.uint16)
     assert np.array_equal(a, b) and a.any()
@@ -127,5 +127,26 @@ def test_chromosome_names_that_match_nothing_are_refused(tmp_path, monkeypatch):
     pl.read_parquet(g / "contigs.parquet").with_columns(chrom=pl.lit("chr1")).write_parquet(g / "contigs.parquet")
     monkeypatch.setattr(GS, "interim_dir", lambda *a: g)
     with pytest.raises(typer.Exit):
-        GS.main(tmp_path / "labels", name="toy", gtf=gtf, basic_only=False, chrom_prefix="")
+        GS.main(tmp_path / "labels", name="toy", gtf=gtf, basic_only=False, chrom_prefix="", source="", split=None)
     assert not (tmp_path / "labels" / "labels.u16").exists() and not (tmp_path / "labels" / "labels.json").exists()
+
+
+def test_class_weights_count_the_training_split_only(tmp_path, monkeypatch):
+    """With the genome's split, positives are also counted on its training bases, and the label store's class
+    weights use those (the + strand gene's CDS lies in a held-out stretch here, so its training count is 0)."""
+    g, gtf = build(tmp_path)
+    total = int(np.fromfile(g / "bases.u8", dtype=np.uint8).size)
+    sp = np.ones(total, dtype=np.uint8)
+    sp[0:500] = 4                                                 # the + gene (100-400) held out
+    (g / "ntv3").mkdir()
+    sp.tofile(g / "ntv3" / "split.u8")
+    monkeypatch.setattr(GS, "interim_dir", lambda *a: g)
+    out = tmp_path / "labels"
+    GS.main(out, name="toy", gtf=gtf, basic_only=False, chrom_prefix="", source="", split=None)
+    import json
+    rec = json.loads((out / "labels.json").read_text())
+    assert rec["train_bases"] == total - 500
+    assert rec["check"]["cds_plus"]["sites"] == 100 and rec["check"]["cds_plus"]["train_sites"] == 0
+    assert rec["check"]["cds_minus"]["train_sites"] == rec["check"]["cds_minus"]["sites"] == 100
+    st = X.open_store(out)
+    assert st.train_bases == total - 500 and st.positives[st.ids.index("cds_minus")] == 100

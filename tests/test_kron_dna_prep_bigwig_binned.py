@@ -49,7 +49,7 @@ def test_direct_cells_equal_the_per_base_route(genomes, tmp_path, monkeypatch):
     monkeypatch.setattr(BB, "interim_dir", lambda *p: root.joinpath(*p))
     out = tmp_path / "direct"
     BB.main(sel, bwd, out, name="hgt", bin=16, workers=1, scale_percentile=99.99, convert_only=False,
-            provenance=None, check_cells=200)
+            provenance=None, check_cells=200, split=None)
     meta = json.loads((out / "binned.json").read_text())
     # the per-base route's encoding, built here (its own main checks 131 kb windows the test genome lacks)
     PB = load("prep_bigwig_tracks")

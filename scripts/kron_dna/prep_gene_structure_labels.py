@@ -50,7 +50,7 @@ def sha256(path: Path) -> str:
     return h.hexdigest()
 
 
-def read_gtf(gtf: Path, basic_only: bool) -> pl.DataFrame:
+def read_gtf(gtf: Path, basic_only: bool, source: str = "") -> pl.DataFrame:
     """exon, CDS, stop_codon and start_codon rows of a GTF or GFF3 (by name or its ``##gff-version 3`` line): chrom,
     type, start0 (0-based), end (exclusive), strand, tid (GTF transcript_id; GFF3 the row's first Parent)."""
     opener = gzip.open if str(gtf).endswith(".gz") else open
@@ -66,7 +66,7 @@ def read_gtf(gtf: Path, basic_only: bool) -> pl.DataFrame:
                     gff3 = True
                 continue
             c = line.rstrip("\n").split("\t")
-            if len(c) < 9 or c[2] not in want or c[6] not in "+-":
+            if len(c) < 9 or c[2] not in want or c[6] not in "+-" or (source and c[1] != source):
                 continue
             if basic_only and not ('basic' in (re.search(r'(?:^|;)tag=([^;]*)', c[8]) or [None, ""])[1].split(",")
                                        if gff3 else 'tag "basic"' in c[8]):
@@ -107,13 +107,17 @@ def intervals(g: pl.DataFrame) -> dict[str, pl.DataFrame]:
 
 def main(out: Path, name: str = typer.Option(...), gtf: Path = typer.Option(...),
          basic_only: bool = typer.Option(False, help="only transcripts tagged basic (GENCODE)"),
-         chrom_prefix: str = typer.Option("", help="prepend to the GTF's chromosome names (e.g. 'chr' for Ensembl)")) -> None:
+         chrom_prefix: str = typer.Option("", help="prepend to the GTF's chromosome names (e.g. 'chr' for Ensembl)"),
+         source: str = typer.Option("", help="only rows of this source (column 2), e.g. WormBase's curated models in "
+                                             "its full GFF3"),
+         split: Path = typer.Option(None, help="uint8 per base, 1 = training: positives are also counted there for "
+                                               "the head's class weights (default: the genome's ntv3/split.u8)")) -> None:
     src = interim_dir("genome", name)
     if src.resolve() in [out.resolve(), *out.resolve().parents]:
         raise typer.BadParameter("OUT_DIR lies inside the prepared genome; choose a new path")
     index = pl.read_parquet(src / "contigs.parquet")
     bases = np.memmap(src / "bases.u8", dtype=np.uint8, mode="r")
-    g = read_gtf(gtf, basic_only).with_columns(chrom=pl.lit(chrom_prefix) + pl.col("chrom"))
+    g = read_gtf(gtf, basic_only, source).with_columns(chrom=pl.lit(chrom_prefix) + pl.col("chrom"))
     if g.is_empty():
         raise typer.BadParameter(f"{gtf}: no exon rows" + (" tagged basic" if basic_only else ""))
     iv = intervals(g)
@@ -198,6 +202,13 @@ def main(out: Path, name: str = typer.Option(...), gtf: Path = typer.Option(...)
         part.unlink()
         raise typer.Exit(f"a canonical motif share is {worst:.3f}: offsets or strands are wrong")
     os.replace(part, out / "labels.u16")
+    sp_ = split or (src / "ntv3" / "split.u8")
+    train = None
+    if Path(sp_).exists():                            # the class weights count the training split only
+        from kron_dna.xheads import train_counts
+        tsites, tbases = train_counts(np.memmap(out / "labels.u16", dtype=np.uint16, mode="r"),
+                                      np.memmap(sp_, dtype=np.uint8, mode="r"), BITS)
+        train = (tsites, tbases, str(sp_))
     meta = dict(
         genome=name, total_bases=int(len(bases)), dtype="uint16", bits=BITS,
         definition="per transcript (" + ("GENCODE basic" if basic_only else "every transcript") + "), its own strand: "
@@ -206,7 +217,9 @@ def main(out: Path, name: str = typer.Option(...), gtf: Path = typer.Option(...)
                    "union over transcripts",
         other_strand="reverse the window and exchange each _plus channel with its _minus partner",
         annotation=str(gtf), annotation_sha256=sha256(gtf), transcripts=int(g["tid"].n_unique()),
-        check={**{k: dict(sites=v) for k, v in counts.items()}, "motifs": check},
+        check={**{k: dict(sites=v, **({"train_sites": train[0][k]} if train else {})) for k, v in counts.items()},
+               "motifs": check},
+        **({"train_bases": train[1], "train_split": train[2]} if train else {}),
         contigs_sha256=sha256(src / "contigs.parquet"), labels_sha256=sha256(out / "labels.u16"))
     (out / "labels.json").write_text(json.dumps(meta, indent=1))
     typer.echo(f"{meta['transcripts']:,} transcripts; bases per channel: "
