@@ -2126,6 +2126,8 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
     x_step: set = set()                               # heads with supervised positions in the current step
     x_rates: dict = {}                                # the last step's rate per role
     x_losses: dict = {n_: [] for n_ in xhead_sizes}
+    x_pearson_g: dict = {}            # (head, further genome): its held-out score, kept apart from hg38 chr8/chr9
+    x_where = {"genome": None}         # which genome's held-out rows loss_on is scoring (None: the primary's)
     x_pearson: dict = {n_: (xstores[n_].scorer(x_bin.get(n_, 1)) if n_ in xstores else XH.Pearson(k_))
                        for n_, k_ in xhead_sizes.items()}
     x_consts: dict = {}
@@ -2453,14 +2455,21 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                           XH.head_loss(model.last_x[n_], want_x[:, lo_x // cell_x:hi_x // cell_x].to(dev),
                                        x_ok[:, lo_x:hi_x].to(dev), x_consts_on(n_)(dev), kind_x, bin_x,
                                        cm_x.to(dev)))
-                mlm = mlm + xhead_weight * x_scale.get(n_, 1.0) * loss_x
+                # a head's loss reaches the shared trunk ramped over its own warmup (review 23 Nov: a head added
+                # in place, or on --init with --xhead-only 0, otherwise pulls the trunk at full weight while its
+                # readout is still random); a head past its warmup counts in full, as before
+                ramp_x = min(1.0, (xstage.state["updates"][n_] + 1) / max(xstage.plan.warmup_head, 1))
+                mlm = mlm + xhead_weight * x_scale.get(n_, 1.0) * ramp_x * loss_x
                 x_losses[n_].append(float(loss_x.detach()))
                 x_step.add(n_)
             else:                       # held-out rows whole: log1p signal at 128 bp, or logits against labels
                 rows_x = (x_ok.sum(1) > 0).to(dev)
                 p_x, w_x = XH.eval_pair(xstores[n_], model.last_x[n_], want_x.to(dev), x_consts_on(n_)(dev),
                                         x_bin.get(n_, 1))
-                x_pearson[n_].add(p_x[rows_x], w_x[rows_x], cm_x.to(dev)[rows_x])
+                pm_x = XH.positions_at(x_ok.to(dev), p_x.shape[1])          # held-out positions only, no padding
+                acc_x = (x_pearson[n_] if x_where["genome"] is None else       # a further genome scores apart
+                         x_pearson_g.setdefault((n_, x_where["genome"]), xstores[n_].scorer(x_bin.get(n_, 1))))
+                acc_x.add(p_x[rows_x], w_x[rows_x], cm_x.to(dev)[rows_x], pm_x[rows_x])
         reg_t = None                    # the anti-collapse term of this micro-batch (JEPA_TRACE)
         if target is not None and model.training and model.last_jepa is not None:
             with torch.no_grad(), autocast:
@@ -2895,10 +2904,12 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                 for k in g_eval:   # each further genome on its own held-out contigs, from streams of its own so the
                     g_rng = np.random.default_rng([seed, step, 1009, k])     # paired draws above stay bit-for-bit
                     g_mask = torch.Generator(device=dev).manual_seed(int(g_rng.integers(1 << 62)))
+                    x_where["genome"] = genomes[k].name                      # its head scores go to their own rows
                     genome_bits.append(float(np.mean([loss_on(*sample(
                         genomes[k].val, window=eval_window, batch=batch_size if arch == "v1" else 1,  # as above
                         gen=g_rng, genomes=genomes, force_genome=k), mask_gen=g_mask, track_only=True,
                         score_ntv3=False)[0].item() for _ in range(8)])) / math.log(2))
+                    x_where["genome"] = None
             guard_note = None
             if jepa_guard != "off":         # collapse measures on the fixed windows, then the guard's decision
                 t_guard = time.time()
@@ -3007,6 +3018,22 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                     x_pearson[n_] = (xstores[n_].scorer(x_bin.get(n_, 1)) if n_ in xstores
                                      else XH.Pearson(xhead_sizes[n_]))
                     x_losses[n_].clear()
+                if x_pearson_g:     # further genomes' held-out head scores, each on its own contigs
+                    g_csv = out / "xheads_genomes.csv"
+                    if main and not g_csv.exists():
+                        g_csv.write_text("step,head,genome,heldout_metric,heldout_mean,heldout_n,heldout_per_channel\n")
+                    for (n_, g_), sc_ in sorted(x_pearson_g.items()):
+                        r_g = sc_.value()
+                        ok_g = r_g[~np.isnan(r_g)]
+                        mean_g = float(ok_g.mean()) if len(ok_g) else float("nan")
+                        met_g = "average_precision" if xstores[n_].kind == "binary" else "Pearson"
+                        say(f"--xhead {n_} on {g_} held-out: {met_g} mean {mean_g:.4f} over {len(ok_g)} of "
+                            f"{len(r_g)} channels, n {XH.scored_n(sc_):,}")
+                        if main:
+                            with g_csv.open("a") as fh:
+                                fh.write(f"{step},{n_},{g_},{met_g},{mean_g:.5f},{XH.scored_n(sc_)},"
+                                         + " ".join(f"{v_:.5f}" for v_ in r_g) + "\n")
+                    x_pearson_g.clear()
             if epi_keep:
                 sc = torch.cat([k[0] for k in epi_keep])
                 tr = torch.cat([k[1] for k in epi_keep])

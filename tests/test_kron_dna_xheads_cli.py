@@ -455,4 +455,8 @@ def test_a_further_genome_trains_its_channels_and_an_init_widens_the_readout(gen
         res, _ = run(cli, monkeypatch, root, tmp_path / "bad", again + ["--xhead-species", bad])
         assert res.exit_code != 0 and why in MGT.flat(res.output + repr(res.exception)), bad
     per = [float(v) for v in x.filter(pl.col("head") == "dnase")["heldout_per_channel"].to_list()[-1].split()]
-    assert len(per) == 6 and np.isfinite(per).all()             # gB's channels are scored on its held-out contig
+    assert len(per) == 6 and np.isfinite(per[:3]).all()         # the primary's held-out rows: its own channels
+    g = pl.read_csv(out / "xheads_genomes.csv")                  # gB's held-out rows score apart (review 23 Nov)
+    gd = g.filter((pl.col("head") == "dnase") & (pl.col("genome") == "gB"))
+    per_g = [float(v) for v in gd["heldout_per_channel"].to_list()[-1].split()]
+    assert len(per_g) == 6 and np.isfinite(per_g[3:]).all()     # gB's channels, on its held-out contig

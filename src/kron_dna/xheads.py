@@ -544,14 +544,21 @@ class Pearson:
         self.n = torch.zeros(n, dtype=torch.float64)  # bins added, per channel
         self.s = [torch.zeros(n, dtype=torch.float64) for _ in range(5)]
 
-    def add(self, pred_log1p: torch.Tensor, want_log1p: torch.Tensor, cmask: torch.Tensor | None = None) -> None:
-        """``[B, L, T]`` each; whole bins only. ``cmask`` [B, T]: the channels each row counts for (None: all)."""
+    def add(self, pred_log1p: torch.Tensor, want_log1p: torch.Tensor, cmask: torch.Tensor | None = None,
+            pmask: torch.Tensor | None = None) -> None:
+        """``[B, L, T]`` each; whole bins only. ``cmask`` [B, T]: the channels each row counts for (None: all).
+        ``pmask`` [B, L]: the positions that count (None: all); a bin counts only when all its positions do, so
+        padding and positions outside the held-out contigs never enter the score."""
         b, length, t = pred_log1p.shape
         keep = length - length % self.bin
         if not keep:
             return
         w = torch.ones(b, t, dtype=torch.float64) if cmask is None else cmask.double().cpu()
-        w = w.unsqueeze(1).expand(b, keep // self.bin, t).reshape(-1, t)
+        w = w.unsqueeze(1).expand(b, keep // self.bin, t)
+        if pmask is not None:
+            pm = pmask[:, :keep].bool().cpu().reshape(b, -1, self.bin).all(2)
+            w = w * pm.unsqueeze(-1).double()
+        w = w.reshape(-1, t)
         x = pred_log1p[:, :keep].double().reshape(b, -1, self.bin, t).mean(2).reshape(-1, t).cpu()
         y = want_log1p[:, :keep].double().reshape(b, -1, self.bin, t).mean(2).reshape(-1, t).cpu()
         self.n += w.sum(0)
@@ -583,12 +590,17 @@ class AveragePrecision:
         self.neg_total = [0] * n
         self.floor = [float("-inf")] * n              # above it every negative of every batch was kept
 
-    def add(self, pred: torch.Tensor, want: torch.Tensor, cmask: torch.Tensor | None = None) -> None:
-        """``[B, L, T]`` logits and 0/1 labels; ``cmask`` [B, T]: the channels each row counts for (None: all)."""
+    def add(self, pred: torch.Tensor, want: torch.Tensor, cmask: torch.Tensor | None = None,
+            pmask: torch.Tensor | None = None) -> None:
+        """``[B, L, T]`` logits and 0/1 labels; ``cmask`` [B, T]: the channels each row counts for (None: all);
+        ``pmask`` [B, L]: the positions that count (None: all)."""
         b, length, t = pred.shape
         x, y = pred.detach().float().reshape(-1, t).cpu(), want.reshape(-1, t).cpu() > 0
         w = (torch.ones(b, t, dtype=torch.bool) if cmask is None else cmask.bool().cpu()).unsqueeze(1)
-        w = w.expand(b, length, t).reshape(-1, t)
+        w = w.expand(b, length, t)
+        if pmask is not None:
+            w = w & pmask.bool().cpu().unsqueeze(-1)
+        w = w.reshape(-1, t)
         for k in range(t):
             p, q = x[y[:, k] & w[:, k], k], x[~y[:, k] & w[:, k], k]
             self.pos[k].append(p)
@@ -617,6 +629,13 @@ class AveragePrecision:
             rank = torch.arange(1, p.numel() + 1, dtype=torch.float64)
             out[k] = float((rank / (rank + above)).mean())
         return out
+
+
+def positions_at(ok: torch.Tensor, length: int) -> torch.Tensor:
+    """A per-base mask ``ok`` [B, L] at the resolution of a prediction of ``length`` positions (L a multiple of it):
+    a position counts only when every base it covers does."""
+    f = max(1, ok.shape[1] // max(1, length))
+    return ok[:, :length * f].reshape(ok.shape[0], length, f).min(-1).values > 0
 
 
 def scored_n(scorer) -> int:
