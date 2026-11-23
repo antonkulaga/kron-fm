@@ -42,7 +42,9 @@ WIN = XB.WIN
 def windows(out: Path, name: str = typer.Option(...), n: int = 96, seed: int = 0,
             context: int = 1048576,
             chroms: str = typer.Option("", help="only these chromosomes, '+'-joined (e.g. chr8+chr9: held out)"),
-            keep: Path = typer.Option(None, help="a windows.csv whose windows on these chromosomes are kept first")) -> None:
+            keep: Path = typer.Option(None, help="a windows.csv whose windows on these chromosomes are kept first"),
+            max_n: float = typer.Option(0.0, help="the share of N a window may hold (a fragmented assembly's scaffolds "
+                                                  "hold gaps; 0: N-free)")) -> None:
     """Random N-free windows over the genome's gap-free contigs (or those of ``chroms``); ``keep``'s come first."""
     src = interim_dir("genome", name)
     bases = np.memmap(src / "bases.u8", dtype=np.uint8, mode="r")
@@ -63,7 +65,7 @@ def windows(out: Path, name: str = typer.Option(...), n: int = 96, seed: int = 0
         r = contigs.row(int(rng.choice(len(lens), p=lens / lens.sum())), named=True)
         s = r["start"] + int(rng.integers(0, r["end"] - r["start"] - WIN + 1))
         a = r["offset"] + s - r["start"]
-        if int(bases[a:a + WIN].max()) >= 4 or any(abs(s - q["start"]) < WIN and q["chrom"] == r["chrom"] for q in rows):
+        if float((np.asarray(bases[a:a + WIN]) >= 4).mean()) > max_n or any(abs(s - q["start"]) < WIN and q["chrom"] == r["chrom"] for q in rows):
             continue
         flank = (context - WIN) // 2
         lo, hi = s - flank, s + WIN + flank
