@@ -504,7 +504,8 @@ def report_lentimpra(out: Path, variants: Path = typer.Option(None, help="prep_l
     place in the genome (scored with ``--ref-only``), per cell line: Pearson of the measured ``log2(RNA/DNA)`` with
     (a) the mean ``log1p`` signal over the cell line's own channels, where the store has them, and (b) a ridge probe
     on every channel's ``log1p`` signal, fitted out-of-fold on the paper's ten folds (their Table S6 gives Enformer,
-    Sei and MPRALegNet on the same folds). chr8/chr9 elements apart (probe fitted on the others)."""
+    Sei and MPRALegNet on the same folds). chr8/chr9 elements apart (probe fitted on the others). A table with a
+    ``group`` column (``prep_exp_starr.py``: enhancer and promoter strengths) is reported per cell line and group."""
     lines, table = [], []
     for d in sorted((out / "pred").iterdir()):
         if not (d / "index.json").exists():
@@ -516,13 +517,15 @@ def report_lentimpra(out: Path, variants: Path = typer.Option(None, help="prep_l
         t = t.join(sites.select("chrom", "pos", "at"), on=["chrom", "pos"])
         meta = Path(info["store"]) / "binned.json"
         tracks = json.loads(meta.read_text())["tracks"] if meta.exists() else []
-        for (cell,), s in t.group_by("cell", maintain_order=True):
+        if "group" not in t.columns:                      # prep_exp_starr.py's table: enhancers and promoters apart
+            t = t.with_columns(group=pl.lit(""))
+        for (cell, group), s in t.group_by("cell", "group", maintain_order=True):
             y, x = s["activity"].to_numpy(), x_all[s["at"].to_numpy()]
             own = [k for k, tr in enumerate(tracks) if norm(str(tr.get("biosample", ""))) == norm(cell)]
             held = s["held_out"].to_numpy()
             oof = ridge_cv(x, y, s["fold"].to_numpy(), lam)
             pear = lambda a, b: float(np.corrcoef(a, b)[0, 1]) if len(a) > 2 else float("nan")
-            row = dict(label=d.name, head=info["head"], cell=cell, elements=s.height, own_channels=len(own),
+            row = dict(label=d.name, head=info["head"], cell=cell, group=group, elements=s.height, own_channels=len(own),
                        probe_pearson=pear(oof, y), probe_by_fold=[pear(oof[s["fold"].to_numpy() == f], y[s["fold"].to_numpy() == f])
                                                                   for f in sorted(set(s["fold"].to_list()))],
                        own_pearson=pear(x[:, own].mean(1), y) if own else None, held_out=int(held.sum()))
@@ -530,7 +533,7 @@ def report_lentimpra(out: Path, variants: Path = typer.Option(None, help="prep_l
                 ho = ridge_cv(x, y, held.astype(int), lam)
                 row["probe_pearson_held_out"] = pear(ho[held], y[held])
             table.append(row)
-            lines.append(f"{d.name:20s} {cell:6s} n={s.height:6d} probe={row['probe_pearson']:.3f} "
+            lines.append(f"{d.name:20s} {cell:6s} {group:9s} n={s.height:6d} probe={row['probe_pearson']:.3f} "
                          f"held-out chr8/chr9={row.get('probe_pearson_held_out', float('nan')):.3f} "
                          + (f"own({len(own)})={row['own_pearson']:.3f}" if own else "own: none"))
     (out / "report_lentimpra.json").write_text(json.dumps(table, indent=1))

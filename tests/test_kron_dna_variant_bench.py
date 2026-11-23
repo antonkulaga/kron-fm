@@ -210,3 +210,18 @@ def test_vexseq_exon_ends():
     # minus strand: the 3' splice site is at the high end
     assert m.ends(149, 1, -50, "-") == (100, 150) and m.ends(100, 50, -1, "-") == (100, 150)
     assert m.ends(150, -1, -51, "-") == (100, 150) and m.ends(99, 51, 1, "-") == (100, 150)
+
+
+def test_exp_starr_additive_fit():
+    """The enhancer x promoter fit recovers each element's strength from an incomplete grid of pairs."""
+    sp = importlib.util.spec_from_file_location("prep_exp_starr", Path(__file__).parents[1] / "scripts/kron_dna/prep_exp_starr.py")
+    m = importlib.util.module_from_spec(sp)
+    sp.loader.exec_module(m)
+    rng = np.random.default_rng(0)
+    a, b = rng.normal(size=30), rng.normal(size=40)
+    a, b = a - a.mean(), b - b.mean()
+    p, e = np.repeat(np.arange(30), 40), np.tile(np.arange(40), 30)
+    keep = rng.random(len(p)) < 0.7
+    p, e = p[keep], e[keep]
+    mu, fa, fb, r2 = m.additive(p, e, 2.0 + a[p] + b[e], 30, 40)
+    assert abs(mu - 2.0) < 1e-3 and np.allclose(fa, a, atol=1e-3) and np.allclose(fb, b, atol=1e-3) and r2 > 0.999
