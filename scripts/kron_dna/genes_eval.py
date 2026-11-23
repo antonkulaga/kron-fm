@@ -16,7 +16,8 @@ For each window the model reads 1,048,576 bases centred on it; its ``genes`` hea
 - where two annotations disagree on a base and channel, the share of those bases on which the head's call agrees
   with each of them (the newer annotation is the better one; does the head side with it).
 
-Writes ``OUT/<label>.genes.json`` with all of it, and prints the summary.
+Writes ``OUT/<label>.genes.json`` with all of it and ``OUT/<label>.genes.npy`` (the logits, float16
+``[windows, 131072, 14]``, so a later metric needs no card), and prints the summary.
 """
 from __future__ import annotations
 
@@ -100,6 +101,8 @@ def score(out: Path, checkpoints: list[str] = typer.Argument(..., help="LABEL=CH
             with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16, enabled=dev.type == "cuda"):
                 model(seq[None], seg, ctx)
             pred[k] = model.last_x[head][0][:, :len(ids)].float().clamp(-6e4, 6e4).cpu().numpy().astype(np.float16)
+        out.mkdir(parents=True, exist_ok=True)
+        np.save(out / f"{label}.genes.npy", pred)         # the logits, so later metrics need no card
         call = pred > 0
         res = dict(label=label, checkpoint=str(where), step=int(state.get("step", -1)), genome=name,
                    n_windows=win.height, seconds=round(time.time() - t0, 1), annotations={})
