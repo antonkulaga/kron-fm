@@ -118,3 +118,14 @@ def test_a_gff3_gives_the_same_labels(tmp_path, monkeypatch):
     a = np.fromfile(out / "labels.u16", dtype=np.uint16)
     b = np.fromfile(tmp_path / "gff" / "labels" / "labels.u16", dtype=np.uint16)
     assert np.array_equal(a, b) and a.any()
+
+
+def test_chromosome_names_that_match_nothing_are_refused(tmp_path, monkeypatch):
+    """A GTF named 'chr1' against a layout named '1' places nothing: refused, no empty store left behind."""
+    g, gtf = build(tmp_path)
+    gtf.write_text(gtf.read_text().replace("chr1\t", "1\t").replace("chrM\t", "MT\t"))
+    pl.read_parquet(g / "contigs.parquet").with_columns(chrom=pl.lit("chr1")).write_parquet(g / "contigs.parquet")
+    monkeypatch.setattr(GS, "interim_dir", lambda *a: g)
+    with pytest.raises(typer.Exit):
+        GS.main(tmp_path / "labels", name="toy", gtf=gtf, basic_only=False, chrom_prefix="")
+    assert not (tmp_path / "labels" / "labels.u16").exists() and not (tmp_path / "labels" / "labels.json").exists()

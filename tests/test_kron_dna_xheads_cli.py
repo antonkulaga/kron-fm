@@ -27,6 +27,8 @@ class StubWithHeads(MGT.StubGenome):
         self.x_active, self.x_span, self.last_x, self.last_x_at = None, None, {}, (0, 0)
 
     def forward(self, seq, segments=None, context=None):
+        if self.training:
+            SEQS.append(seq.detach().cpu())
         h = self.emb(seq.long())
         lo, hi = (0, h.shape[1]) if self.x_span is None else self.x_span      # as KronGenome: the heads' stretch
         SPANS.append((self.training, lo, hi, h.shape[1]))
@@ -39,6 +41,7 @@ class StubWithHeads(MGT.StubGenome):
 
 
 SPANS: list = []
+SEQS: list = []
 
 
 def make_store(root, primary, n=3):
@@ -460,3 +463,33 @@ def test_a_further_genome_trains_its_channels_and_an_init_widens_the_readout(gen
     gd = g.filter((pl.col("head") == "dnase") & (pl.col("genome") == "gB"))
     per_g = [float(v) for v in gd["heldout_per_channel"].to_list()[-1].split()]
     assert len(per_g) == 6 and np.isfinite(per_g[3:]).all()     # gB's channels, on its held-out contig
+
+
+def test_a_further_genome_split_is_checked_and_used(genomes, tmp_path, monkeypatch):
+    """--xhead-genome-split gB=SPLIT: a per-base split of gB (orthologs of the primary's held-out chromosomes held
+    out); a split of another length, or of a genome without --xhead-species, is refused."""
+    root, parent, store, child = setup(genomes, tmp_path, monkeypatch)
+    lab_h = splice_labels(tmp_path, genomes["hgt"], "lab_h")
+    lab_b = splice_labels(tmp_path, genomes["gB"], "lab_b")
+    n = int(np.fromfile(genomes["gB"] / "bases.u8", dtype=np.uint8).size)
+    sp = np.ones(n, dtype=np.uint8)
+    sp[: n // 3] = 4                                              # a third of gB, on its training contigs too
+    sp.tofile(tmp_path / "gb_split.u8")
+    np.ones(n - 1, dtype=np.uint8).tofile(tmp_path / "short.u8")
+    args = [a if a != "splice:2" else f"splice:{lab_h}" for a in child] + [
+        "--genome", "gB:0.3:0", "--xhead-only", "0", "--xhead-species", f"splice=gB:{lab_b}"]
+    out = tmp_path / "split"
+    res, _ = run(cli, monkeypatch, root, out, args + ["--xhead-genome-split", f"gB={tmp_path / 'gb_split.u8'}"])
+    assert res.exit_code == 0, res.output + repr(res.exception)
+    assert "--xhead-genome-split gB: 33.3% of its bases held out" in MGT.flat(res.output)
+    # all of gB held out: its training rows are all N (no input, no target); the primary's rows are not
+    (np.ones(n, dtype=np.uint8) * 4).tofile(tmp_path / "gb_all.u8")
+    SEQS.clear()
+    res, _ = run(cli, monkeypatch, root, tmp_path / "all4", args + ["--xhead-genome-split", f"gB={tmp_path / 'gb_all.u8'}"])
+    assert res.exit_code == 0, res.output + repr(res.exception)
+    rows = torch.cat([s_.reshape(-1, s_.shape[-1]) for s_ in SEQS])
+    all_n = ((rows == 4) | (rows == 5)).all(1)                     # 5: the mask token, itself over an N
+    assert all_n.any() and not all_n.all()
+    for bad, why in ((f"gB={tmp_path / 'short.u8'}", "the genome has"), (f"gA={tmp_path / 'gb_split.u8'}", "for a genome of")):
+        res, _ = run(cli, monkeypatch, root, tmp_path / "bad", args + ["--xhead-genome-split", bad])
+        assert res.exit_code != 0 and why in MGT.flat(res.output + repr(res.exception)), bad

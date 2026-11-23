@@ -885,6 +885,12 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                                                  "memory is the largest group's, not the sum"),
                  xhead_recompute: bool = typer.Option(False, help="recompute each --xhead head's inside in backward: "
                                                       "only its input and output are kept"),
+                 xhead_genome_split: list[str] = typer.Option([], help="GENOME=SPLIT: a further genome's per-base split "
+                                                              "(uint8, 1 training, 4 held out; prep_syntenic_split.py): "
+                                                              "its rows are supervised where it is 1, scored where 4, "
+                                                              "and its training rows read N at every held-out base (no "
+                                                              "input, no masked-base target); without one, a window's "
+                                                              "code is its contig's"),
                  xhead_species: list[str] = typer.Option([], help="NAME=GENOME:STORE: head NAME also trains on windows "
                                                          "of --genome GENOME from that genome's store; a channel that "
                                                          "matches one of the primary store's (assay, target, biosample, "
@@ -1363,6 +1369,19 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                 + ", ".join(f"{g_}: {len(st_.ids)} ({xstores[name_s].shared[g_]} shared)" for g_, st_ in extra_s.items())
                 + f" = {len(xstores[name_s].ids)} outputs")
 
+    x_gsplit: dict = {}                               # --xhead-genome-split: genome -> its per-base split
+    for spec_g in xhead_genome_split:
+        g_s, _, path_s = spec_g.partition("=")
+        if g_s not in x_species or not path_s:
+            raise typer.BadParameter(f"--xhead-genome-split {spec_g!r}: give GENOME=SPLIT for a genome of "
+                                     f"--xhead-species ({sorted(x_species)})")
+        x_gsplit[g_s] = np.memmap(path_s, dtype=np.uint8, mode="r")
+        n_g = len(next(g_ for g_ in genomes if g_.name == g_s).bases)
+        if len(x_gsplit[g_s]) != n_g:
+            raise typer.BadParameter(f"--xhead-genome-split {g_s}: {len(x_gsplit[g_s]):,} bases, the genome has {n_g:,}")
+        held_ = float((np.asarray(x_gsplit[g_s][::1000]) == 4).mean())       # every 1,000th base: an estimate
+        say(f"--xhead-genome-split {g_s}: {held_:.1%} of its bases held out")
+
     def x_mask(st_, g_name):
         """The channels of head store ``st_`` a row of genome ``g_name`` supervises (None: the primary genome)."""
         if isinstance(st_, XH.SpeciesStores):
@@ -1699,6 +1718,9 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                     at, take = on_grid(at, take, r["offset"], r["len"])
                 codes = np.full(wrow, 4, dtype=np.int64)
                 codes[:take] = g_.bases[at:at + take]
+                if force_genome is None and g_.name in x_gsplit:   # training rows: its held-out bases (orthologs of
+                    codes[:take][x_gsplit[g_.name][at:at + take] == 4] = 4   # the primary's held-out) read as N: no
+                    # input, no masked-base target, no label - as if cut out; its held-out draws keep them for scoring
                 ctxs.append(int(g_.context))
                 rsrc, rsel = rep_genome[fg], slice(at, at + take)
             elif xs is not None:
@@ -1796,7 +1818,10 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                     sp_[:take] = ntv3["split"][at:at + take]
                     cm_[:n_h] = True
                 elif fg is not None and genomes[fg].name in x_species:   # a further genome with head stores: its
-                    sp_[:take] = 4 if force_genome is not None else 1    # held-out draw, else its training contigs
+                    if genomes[fg].name in x_gsplit:                     # per-base split (orthologs held out), else
+                        sp_[:take] = x_gsplit[genomes[fg].name][at:at + take]
+                    else:                                                # its held-out draw / training contigs
+                        sp_[:take] = 4 if force_genome is not None else 1
                 if flip_row and (xs is not None or not from_mito):        # reverse AND swap the strand partners
                     nt[:take] = nt[:take][::-1][:, ntv3["swap"]]
                     sp_[:take] = sp_[:take][::-1]
@@ -1820,7 +1845,12 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                     if flip_row:
                         sp_[:take] = sp_[:take][::-1]
                 elif fg is not None and g_row in x_species:
-                    sp_[:take] = 4 if force_genome is not None else 1
+                    if g_row in x_gsplit:
+                        sp_[:take] = x_gsplit[g_row][at:at + take]
+                        if flip_row:
+                            sp_[:take] = sp_[:take][::-1]
+                    else:
+                        sp_[:take] = 4 if force_genome is not None else 1
                 for n_, st_ in xstores.items():
                     read_ = ((primary_ or (fg is not None and n_ in x_species.get(g_row, ())))
                              and (x_read["heads"] is None or n_ in x_read["heads"]))
