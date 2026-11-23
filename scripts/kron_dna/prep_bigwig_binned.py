@@ -44,16 +44,24 @@ PART = f".part.{socket.gethostname()}.{os.getpid()}"
 _G: dict = {}
 
 
-def _sample_windows(rows, rng, n, width=100_000, have=None):
+def _sample_windows(rows, rng, n, width=100_000, have=None, split=None, tries=200_000):
+    """``n`` windows of ``width`` bases at random on contigs the bigWig lists; with ``split``, only windows whose
+    bases are at least 90 % training split (code 1), so held-out chromosomes never calibrate an encoding (review,
+    23 Nov: 24 of 125 and 30 of 200 draws fell on chr8/chr9 before)."""
     out = []
-    while len(out) < n:
+    for _ in range(tries):
+        if len(out) >= n:
+            break
         c, s, e, off = rows[int(rng.integers(0, len(rows)))]
         if e - s < width or (have is not None and c not in have):
             if all(r[2] - r[1] < width for r in rows):
                 break
             continue
         a = int(rng.integers(s, e - width))
-        out.append((c, a, off + (a - s)))
+        g = off + (a - s)
+        if split is not None and float((np.asarray(split[g:g + width]) == 1).mean()) < 0.9:
+            continue
+        out.append((c, a, g))
     return out
 
 
@@ -67,14 +75,14 @@ def one(fid: str) -> dict:
     bw = pyBigWig.open(str(src / f"{fid}.bigWig"))
     have = bw.chroms()
     rng = np.random.default_rng(0)
-    # the encoding's scale: the percentile of non-zero signal over sampled windows (as prep_bigwig_tracks.scale_of)
-    vals = [np.nan_to_num(bw.values(c, a, a + 100_000, numpy=True)) for c, a, _ in _sample_windows(rows, rng, 200, have=have)]
+    # the encoding's scale: the percentile of non-zero signal over sampled training-split windows
+    vals = [np.nan_to_num(bw.values(c, a, a + 100_000, numpy=True)) for c, a, _ in _sample_windows(rows, rng, 200, have=have, split=_G["split"])]
     v = np.concatenate([x[x > 0] for x in vals]) if vals else np.array([1.0])
     sc = float(max(np.log1p(np.percentile(v, _G["percentile"])) if v.size else 1.0, 1e-3))
     # the non-zero mean of decoded signal on the training split, from sampled windows
     split = _G["split"]
     tot = cnt = 0.0
-    for c, a, g in _sample_windows(rows, np.random.default_rng(1), 400, have=have):
+    for c, a, g in _sample_windows(rows, np.random.default_rng(1), 400, have=have, split=split):
         x = np.nan_to_num(bw.values(c, a, a + 100_000, numpy=True))
         u = np.clip(np.log1p(np.maximum(x, 0)) / sc * 255.0, 0, 255).astype(np.uint8)
         d = np.expm1(u.astype(np.float64) / 255.0 * sc)

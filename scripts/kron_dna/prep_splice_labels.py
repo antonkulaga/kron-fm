@@ -55,7 +55,9 @@ def introns_of(exons: pl.DataFrame) -> pl.DataFrame:
             .filter(pl.col("i1") - pl.col("i0") >= 4).unique())
 
 
-def main(out: Path, name: str = "hg38", gtf: Path = typer.Option(None)) -> None:
+def main(out: Path, name: str = "hg38", gtf: Path = typer.Option(None),
+         split: Path = typer.Option(None, help="uint8 per base, 1 = training: positives are also counted there for "
+                                               "the head's class weights (default: the genome's ntv3/split.u8)")) -> None:
     import polars_bio as pb
 
     gtf = gtf or input_dir("regulation", "gencode") / "gencode.basic.gtf.gz"
@@ -114,12 +116,22 @@ def main(out: Path, name: str = "hg38", gtf: Path = typer.Option(None)) -> None:
     part = out / f"splice.u8.part.{socket.gethostname()}.{os.getpid()}"
     labels.tofile(part)
     os.replace(part, out / "splice.u8")
+    sp_ = split or (src / "ntv3" / "split.u8")
+    train = None
+    if Path(sp_).exists():                            # the class weights count the training split only
+        from kron_dna.xheads import train_counts
+        tsites, tbases = train_counts(np.memmap(out / "splice.u8", dtype=np.uint8, mode="r"),
+                                      np.memmap(sp_, dtype=np.uint8, mode="r"), BITS)
+        for k in check:
+            check[k]["train_sites"] = tsites[k]
+        train = (tbases, str(sp_))
     meta = dict(
         genome=name, total_bases=int(len(bases)), bits=BITS,
         definition="per intron of each GENCODE basic transcript, in the transcript's direction: donor = the intron's "
                    "first base, acceptor = the intron's last base; one base each, per strand",
         other_strand="reverse the window and exchange bits (0, 2) and (1, 3)",
         introns=int(introns.height), introns_placed=int(ok.sum()), check=check,
+        **({"train_bases": train[0], "train_split": train[1]} if train else {}),
         annotation_sha256=sha256(gtf), contigs_sha256=sha256(src / "contigs.parquet"),
         splice_sha256=sha256(out / "splice.u8"))
     (out / "splice.json").write_text(json.dumps(meta, indent=1))
