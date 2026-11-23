@@ -2767,9 +2767,10 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
     if jepa_guard != "off" and main:
         g_rng = np.random.default_rng(20261117)
         g_src = train_idx if jepa_guard_from == "train" else val_idx
+        g_word = "training" if jepa_guard_from == "train" else "held-out"
         g_rows = [r_ for r_ in g_src.iter_rows(named=True) if r_["len"] > jepa_guard_window]
         if not g_rows:
-            raise typer.BadParameter(f"--jepa-guard-window {jepa_guard_window:,}: no {jepa_guard_from} contig is that long")
+            raise typer.BadParameter(f"--jepa-guard-window {jepa_guard_window:,}: no {g_word} contig is that long")
         g_share = jepa_block_share if jepa_block_share > 0 else 0.2
         for _ in range(200 * jepa_guard_windows):
             if len(guard_win) == jepa_guard_windows:
@@ -2784,8 +2785,8 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                                 guard_lo, guard_hi, g_rng)[0]
             guard_win.append((s_, pick_, hid_))
         if not guard_win:
-            raise typer.BadParameter(f"--jepa-guard: no {jepa_guard_from} window with at least 90% known bases")
-        say(f"jepa guard ({jepa_guard}): {len(guard_win)} fixed {jepa_guard_from} windows of {jepa_guard_window:,} bases "
+            raise typer.BadParameter(f"--jepa-guard: no {g_word} window with at least 90% known bases")
+        say(f"jepa guard ({jepa_guard}): {len(guard_win)} fixed {g_word} windows of {jepa_guard_window:,} bases "
             f"({', '.join(sorted(set(g_src['chrom'].to_list())))[:200]}), blocks {g_share:g} of bins + {mask_prob:g} "
             f"scattered MASK; trigger: entropy rank < {jepa_guard_rank:g} x running max or min dim std < "
             f"{jepa_guard_std:g} x running median, two evaluations in a row"
