@@ -44,30 +44,10 @@ PART = f".part.{socket.gethostname()}.{os.getpid()}"
 _G: dict = {}
 
 
-def _sample_windows(rows, rng, n, width=100_000, have=None, split=None, tries=200_000):
-    """``n`` windows of ``width`` bases at random on contigs the bigWig lists; with ``split``, only windows whose
-    bases are at least 90 % training split (code 1), so held-out chromosomes never calibrate an encoding (review,
-    23 Nov: 24 of 125 and 30 of 200 draws fell on chr8/chr9 before)."""
-    out = []
-    for _ in range(tries):
-        if len(out) >= n:
-            break
-        c, s, e, off = rows[int(rng.integers(0, len(rows)))]
-        if e - s < width or (have is not None and c not in have):
-            if all(r[2] - r[1] < width for r in rows):
-                break
-            continue
-        a = int(rng.integers(s, e - width))
-        g = off + (a - s)
-        if split is not None and float((np.asarray(split[g:g + width]) == 1).mean()) < 0.9:
-            continue
-        out.append((c, a, g))
-    return out
-
-
 def one(fid: str) -> dict:
     import pyBigWig
 
+    from kron_dna.prep.bigwig import ScanStats, nonzero_mean, scale_of, scan
     from kron_dna.prep.transforms import decode_u8, encode_u8, targets_np
 
     rows, total, src, out, b = _G["rows"], _G["total"], _G["src"], _G["out"], _G["bin"]
@@ -75,48 +55,22 @@ def one(fid: str) -> dict:
     if side.exists():
         return json.loads(side.read_text())
     bw = pyBigWig.open(str(src / f"{fid}.bigWig"))
-    have = bw.chroms()
-    rng = np.random.default_rng(0)
-    # the encoding's scale: the percentile of non-zero signal over sampled training-split windows
-    vals = [np.nan_to_num(bw.values(c, a, a + 100_000, numpy=True)) for c, a, _ in _sample_windows(rows, rng, 200, have=have, split=_G["split"])]
-    v = np.concatenate([x[x > 0] for x in vals]) if vals else np.array([1.0])
-    sc = float(max(np.log1p(np.percentile(v, _G["percentile"])) if v.size else 1.0, 1e-3))
-    # the non-zero mean of decoded signal on the training split, from sampled windows
     split = _G["split"]
-    tot = cnt = 0.0
-    for c, a, g in _sample_windows(rows, np.random.default_rng(1), 400, have=have, split=split):
-        x = np.nan_to_num(bw.values(c, a, a + 100_000, numpy=True))
-        u = np.clip(np.log1p(np.maximum(x, 0)) / sc * 255.0, 0, 255).astype(np.uint8)
-        d = np.expm1(u.astype(np.float64) / 255.0 * sc)
-        m = (np.asarray(split[g:g + 100_000]) == 1) & (u > 0)
-        tot += float(d[m].sum())
-        cnt += float(m.sum())
-    nz = tot / cnt if cnt else 1.0
+    sc = scale_of(bw, rows, _G["percentile"], split)        # the shared calibration (kron_dna.prep.bigwig)
+    nz = nonzero_mean(bw, rows, sc, split)
     rna = _G["rna"][fid]
     cells = -(-total // b)
     s_t = np.zeros(cells, dtype=np.float64)
     s_l = np.zeros(cells, dtype=np.float64)
-    nan = seen = negative = 0
-    unobserved = []
-    for c, s, e, off in rows:
-        if c not in have or have[c] < e:
-            unobserved.append(f"{c}:{s}-{e}")
-            continue
-        for a in range(s, e, CHUNK):
-            z = min(a + CHUNK, e)
-            x = bw.values(c, a, z, numpy=True)
-            bad = ~np.isfinite(x)
-            nan += int(bad.sum())
-            seen += z - a
-            x = np.where(bad, 0.0, x)
-            negative += int((x < 0).sum())
-            u = encode_u8(x, sc)
-            lg = u.astype(np.float32) / 255.0 * sc
-            t = targets_np(decode_u8(u, sc) / nz, rna)
-            k = (off + (a - s) + np.arange(z - a)) // b                     # each base's global cell
-            lo = int(k[0])
-            s_t[lo:lo + int(k[-1]) - lo + 1] += np.bincount(k - lo, weights=t)
-            s_l[lo:lo + int(k[-1]) - lo + 1] += np.bincount(k - lo, weights=lg)
+    stats = ScanStats()
+    for g0, x in scan(bw, rows, stats, CHUNK):
+        u = encode_u8(x, sc)
+        lg = u.astype(np.float32) / 255.0 * sc
+        t = targets_np(decode_u8(u, sc) / nz, rna)
+        k = (g0 + np.arange(len(x))) // b                                 # each base's global cell
+        lo = int(k[0])
+        s_t[lo:lo + int(k[-1]) - lo + 1] += np.bincount(k - lo, weights=t)
+        s_l[lo:lo + int(k[-1]) - lo + 1] += np.bincount(k - lo, weights=lg)
     bw.close()
     n = np.full(cells, float(b))
     n[-1] = total - (cells - 1) * b
@@ -125,8 +79,7 @@ def one(fid: str) -> dict:
         tmp = str(dst) + PART
         arr.astype(np.float16).tofile(tmp)
         os.replace(tmp, dst)
-    info = {"file": fid, "log1p_scale": sc, "nonzero_mean": nz, "nan_share": nan / max(seen, 1), "observed_bases": seen,
-            "negative_values": negative, "unobserved_contigs": unobserved}
+    info = {"file": fid, "log1p_scale": sc, "nonzero_mean": nz, **stats.info()}
     Path(str(side) + PART).write_text(json.dumps(info))
     os.replace(str(side) + PART, side)
     return info

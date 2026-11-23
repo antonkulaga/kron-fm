@@ -49,24 +49,10 @@ _G: dict = {}
 
 
 def scale_of(bw, rows: list[tuple], percentile: float = 99.9, split=None) -> float:
-    """The ``percentile`` of non-zero log1p signal over 200 sampled 100 kb windows (99.9: as the NTv3 store; the
-    DNase pilot showed that it clips peak summits where a track's scale is low, so peaky assays take 99.99). With
-    ``split``, a draw counts only when its window is at least 90 % training split (code 1): held-out chromosomes never
-    calibrate the encoding (review, 23 Nov)."""
-    rng = np.random.default_rng(0)
-    vals = []
-    have = set(bw.chroms())
-    for _ in range(200):
-        c, s, e, off = rows[int(rng.integers(0, len(rows)))]
-        if e - s < 100_000 or c not in have:
-            continue
-        a = int(rng.integers(s, e - 100_000))
-        if split is not None and float((np.asarray(split[off + a - s:off + a - s + 100_000]) == 1).mean()) < 0.9:
-            continue
-        v = np.nan_to_num(bw.values(c, a, a + 100_000, numpy=True))
-        vals.append(v[v > 0])
-    v = np.concatenate(vals) if vals else np.array([1.0])
-    return float(max(np.log1p(np.percentile(v, percentile)) if v.size else 1.0, 1e-3))
+    """The shared calibration (:func:`kron_dna.prep.bigwig.scale_of`): 200 training windows of 100 kb (B23; before, 200
+    draws of which those off the training split were dropped, so a rebuilt per-base store's scales move slightly)."""
+    from kron_dna.prep.bigwig import scale_of as shared
+    return shared(bw, rows, percentile, split)
 
 
 def one(fid: str) -> dict:
@@ -82,27 +68,16 @@ def one(fid: str) -> dict:
     sc = scale_of(bw, rows, _G.get("percentile", 99.9), _G.get("split"))
     part = str(dst) + f".part.{socket.gethostname()}.{os.getpid()}"
     arr = np.memmap(part, dtype=np.uint8, mode="w+", shape=(total,))
-    nan = seen = negative = 0
-    unobserved = []
-    for c, s, e, off in rows:
-        if c not in have or have[c] < e:
-            unobserved.append(f"{c}:{s}-{e}")
-            continue
-        for a in range(s, e, CHUNK):
-            b = min(a + CHUNK, e)
-            v = bw.values(c, a, b, numpy=True)
-            bad = ~np.isfinite(v)
-            nan += int(bad.sum())
-            seen += b - a
-            v = np.where(bad, 0.0, v)
-            negative += int((v < 0).sum())
-            arr[off + (a - s): off + (b - s)] = np.clip(np.log1p(np.maximum(v, 0)) / sc * 255.0, 0, 255).astype(np.uint8)
+    from kron_dna.prep.bigwig import ScanStats, scan
+    from kron_dna.prep.transforms import encode_u8
+    stats = ScanStats()
+    for g0, v in scan(bw, rows, stats, CHUNK):
+        arr[g0:g0 + len(v)] = encode_u8(v, sc)
     arr.flush()
     del arr
     bw.close()
     os.replace(part, dst)
-    info = {"file": fid, "log1p_scale": sc, "nan_share": nan / max(seen, 1), "observed_bases": seen,
-            "negative_values": negative, "unobserved_contigs": unobserved}
+    info = {"file": fid, "log1p_scale": sc, **stats.info()}
     Path(str(side) + PART).write_text(json.dumps(info))
     os.replace(str(side) + PART, side)
     return info
