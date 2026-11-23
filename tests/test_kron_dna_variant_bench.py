@@ -114,3 +114,78 @@ def test_score_merge_and_asb_report(genomes, tmp_path, monkeypatch, device):
     assert res.exit_code == 0, res.output + repr(res.exception)
     rm = next(r for r in json.loads((out / "report_mpra.json").read_text()) if r["label"] == "m")
     assert rm["variants"] == n - 1 and -1 <= rm["spearman_all"] <= 1 and rm["own_channels"] == 0
+    # the eQTL report: the same sites as a positive/negative table read at "the TSS" (here each variant's position)
+    eq = t.select("chrom", "ref", "alt", "held_out", position="pos", tss="pos").with_row_index("k").with_columns(
+        label=(pl.col("k") % 2).cast(pl.Int32), pair=(pl.col("k") // 2).cast(pl.Int64), strand=pl.lit("+"),
+        distance=pl.col("k").cast(pl.Int64) * 100).drop("k")
+    eq.write_parquet(tmp_path / "eqtl.parquet")
+    res = run("report-eqtl", out, "--variants", tmp_path / "eqtl.parquet", "--n-boot", 5)
+    assert res.exit_code == 0, res.output + repr(res.exception)
+    assert (out / "report_eqtl.json").exists()
+    # elements read once (lentiMPRA's shape): the reference readout of the same places, and the probe report
+    el = pl.DataFrame(dict(chrom=["chr1"] * 4 + ["chr8"] * 2, pos=[1500, 3100, 2000, 2600, 1200, 1500])).with_columns(
+        ref=pl.lit(""), alt=pl.lit(""), cell=pl.lit("K562"), activity=pl.Series(rng.normal(size=6)),
+        fold=pl.Series([1, 2, 1, 2, 1, 2]), held_out=pl.col("chrom") == "chr8")
+    el.write_parquet(tmp_path / "el.parquet")
+    out2 = tmp_path / "bench2"
+    res = run("score", out2, f"m={tmp_path / 'ck.pt'}", *[tmp_path / "el.parquet" if x == tmp_path / "v.parquet" else x for x in base],
+              "--ref-only", "--batch", 3)
+    assert res.exit_code == 0, res.output + repr(res.exception)
+    r2, s2 = np.load(out2 / "pred" / "m" / "ref.npy"), pl.read_parquet(out2 / "pred" / "m" / "sites.parquet")
+    assert np.array_equal(r2, np.load(out2 / "pred" / "m" / "alt.npy")) and s2.height == 6
+    k2 = s2.with_row_index("k").filter((pl.col("chrom") == "chr1") & (pl.col("pos") == 1500))["k"][0]
+    assert np.allclose(r2[k2], ref[a], rtol=1e-4, atol=1e-4)                        # the variant run's reference
+    res = run("report-lentimpra", out2)
+    assert res.exit_code == 0, res.output + repr(res.exception)
+    assert json.loads((out2 / "report_lentimpra.json").read_text())[0]["elements"] == 6
+
+
+def test_label_head_and_mfass_report(genomes, tmp_path, monkeypatch, device):
+    """The splice head: the highest logit per channel within each row's own flank; the MFASS report on it."""
+    import torch
+    from typer.testing import CliRunner
+
+    from kron_dna import genome as G
+    from test_kron_dna_split import small
+
+    if device.type != "cpu":
+        pytest.skip("the end-to-end run is the CPU one, with the stand-in for the KronLSTM layer")
+    root, hgt = genomes["root"], genomes["hgt"]
+    monkeypatch.setattr(VB, "interim_dir", lambda *parts: root.joinpath(*parts))
+    bases = np.fromfile(hgt / "bases.u8", dtype=np.uint8)
+    lab_dir = tmp_path / "splice"
+    lab_dir.mkdir()
+    bits = {"donor_plus": 0, "acceptor_plus": 1, "donor_minus": 2, "acceptor_minus": 3}
+    np.zeros(bases.size, np.uint8).tofile(lab_dir / "splice.u8")
+    (lab_dir / "splice.json").write_text(json.dumps(dict(
+        genome="hgt", total_bases=int(bases.size), bits=bits, definition="one base per site, per strand", splice_sha256="x",
+        check={k: dict(sites=0) for k in bits})))
+    c = pl.read_parquet(hgt / "contigs.parquet").filter(pl.col("chrom") == "chr1").row(0, named=True)
+    rows, letters = [], "ACGT"
+    for k, pos in enumerate(range(1400, 4400, 150)):
+        b = int(bases[c["offset"] + pos - c["start"]])
+        if b < 4:
+            rows.append(dict(chrom="chr1", pos=pos, ref=letters[b], alt=letters[(b + 1) % 4], strand="+-"[k % 2],
+                             exon_mid=pos + 20, half=40 + k, region=["exon", "upstr_intron"][k % 2], sdv=k % 3 == 0,
+                             dpsi=-0.1 * k, held_out=False))
+    t = pl.DataFrame(rows)
+    t.write_parquet(tmp_path / "mfass.parquet")
+    cfg = G.KronGenomeConfig(**{**small("v2").config.to_dict(), "xheads": [["splice", 4]], "xhead_kind": "kron",
+                                "xhead_bin": 4, "xhead_width": 64})
+    torch.manual_seed(0)
+    torch.save({"model": G.KronGenome(cfg).state_dict(), "config": cfg.to_dict(), "step": 7}, tmp_path / "ck.pt")
+    out = tmp_path / "bench"
+    run = lambda *a: CliRunner().invoke(VB.app, [str(x) for x in a])
+    res = run("score", out, f"m={tmp_path / 'ck.pt'}", "--variants", tmp_path / "mfass.parquet", "--head", "splice",
+              "--store", lab_dir, "--name", "hgt", "--context", 768, "--edge", 64, "--read-col", "exon_mid",
+              "--flank-col", "half", "--device", "cpu", "--dtype", "fp32", "--batch", 2)
+    assert res.exit_code == 0, res.output + repr(res.exception)
+    d = out / "pred" / "m"
+    info = json.loads((d / "index.json").read_text())
+    ref, alt = np.load(d / "ref.npy"), np.load(d / "alt.npy")
+    assert info["kind"] == "binary" and info["ids"] == list(bits) and ref.shape == (t.height, 4)
+    assert (ref < 0).any() and not np.allclose(ref, alt)            # logits, not signal
+    res = run("report-mfass", out)
+    assert res.exit_code == 0, res.output + repr(res.exception)
+    rep = json.loads((out / "report_mfass.json").read_text())
+    assert rep[0]["variants"] == t.height and 0 <= rep[0]["ap"] <= 1

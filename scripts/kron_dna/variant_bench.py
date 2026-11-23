@@ -6,13 +6,15 @@ binding benchmark (ADASTRA, ``prep_asb.py``) and any table of the same shape (MP
         [--batch 1] [--dtype bf16|fp16|fp32] [--shard i/n] [--chunk 131072]
     uv run python scripts/kron_dna/variant_bench.py merge OUT LABEL --shards n       (after every --shard i/n)
     uv run python scripts/kron_dna/variant_bench.py report-asb OUT [--variants T.parquet]
+    uv run python scripts/kron_dna/variant_bench.py report-mpra OUT | report-eqtl OUT | report-lentimpra OUT | report-mfass OUT
 
 ``score``: the table's distinct sites (``chrom``, ``pos`` 0-based, ``ref``, ``alt``, and the read position: ``pos``,
 or ``--read-col``, e.g. a gene's TSS). One window of ``--context`` bases per site, centred between the variant and
 the read position (128-bp grid), read twice: the assembly's sequence and the same with ``ref`` replaced by ``alt``
 (an indel shifts what follows; the window keeps its length, cut or N-padded at its end). The head runs on the bins
 around the read position; a site's readout is the predicted signal (``expm1`` of the head's log1p) summed over the
-bins within ``--flank`` of it, for **every** channel of the head's store: ``ref.npy`` and ``alt.npy``,
+bins within ``--flank`` of it (``--flank-col``: each row's own), for **every** channel of the head's store (a label
+head such as ``splice`` gives its highest logit there instead): ``ref.npy`` and ``alt.npy``,
 ``[sites, channels]``, with ``sites.parquet`` and the channel names in ``index.json``, so a report picks channels
 afterwards. Sites whose ``ref`` is not the assembly's, or longer than 64 bases, are left out and counted.
 
@@ -45,7 +47,7 @@ EPS = 1.0
 CODE = {"A": 0, "C": 1, "G": 2, "T": 3, "N": 4}
 KEY = ["chrom", "pos", "ref", "alt", "read"]
 STORES = {"chiptf": "chip-tf-v1-bin128", "chiphr": "chip-histone-rest-v1-bin128", "chip492b": "chip-histone-core-v1-bin128",
-          "dnase196b": "dnase-biosamples-v1-bin128", "rna462b": "rnaseq-stranded-v1-bin128"}
+          "dnase196b": "dnase-biosamples-v1-bin128", "rna462b": "rnaseq-stranded-v1-bin128", "splice": "splice-sites-v1"}
 
 
 def codes_of(contigs: pl.DataFrame, bases: np.ndarray, chrom: str, lo: int, hi: int) -> np.ndarray:
@@ -69,12 +71,16 @@ def with_alt(seq: np.ndarray, at: int, ref: str, alt: str) -> np.ndarray | None:
     return new[:len(seq)]
 
 
-def sites_of(variants: Path, where: str, read_col: str, max_variants: int, seed: int) -> pl.DataFrame:
+def sites_of(variants: Path, where: str, read_col: str, max_variants: int, seed: int, flank_col: str = "",
+             flank: int = 0) -> pl.DataFrame:
     t = pl.read_parquet(variants)
+    if "pos" not in t.columns and "position" in t.columns:      # prep_eqtl_finemap.py's name for it
+        t = t.rename({"position": "pos"})
     if where:
         t = t.filter(pl.sql_expr(where))
-    t = t.with_columns(read=pl.col(read_col).cast(pl.Int64) if read_col else pl.col("pos"))
-    s = t.select(KEY).unique().sort(KEY)
+    t = t.with_columns(read=pl.col(read_col).cast(pl.Int64) if read_col else pl.col("pos"),
+                       flank=pl.col(flank_col).cast(pl.Int64) if flank_col else pl.lit(flank, dtype=pl.Int64))
+    s = t.group_by(KEY).agg(pl.col("flank").max()).sort(KEY)
     if max_variants and s.height > max_variants:
         s = s[np.sort(np.random.default_rng(seed).choice(s.height, max_variants, replace=False))]
     return s.with_row_index("site")
@@ -96,14 +102,17 @@ def score(out: Path, checkpoints: list[str] = typer.Argument(..., help="LABEL=CH
           where: str = typer.Option("", help="an SQL condition on the table's columns"),
           read_col: str = typer.Option("", help="the column of the read position (default: the variant's own)"),
           max_variants: int = 0, name: str = "hg38", context: int = 131072, edge: int = 4096, flank: int = 192,
+          flank_col: str = typer.Option("", help="a column with each row's own flank (e.g. half an exon)"),
           batch: int = typer.Option(1, help="sites per forward (each is two sequences)"), seed: int = 0,
+          ref_only: bool = typer.Option(False, help="read the reference only (a table of elements, as lentiMPRA's: "
+                                                    "ref and alt empty); alt.npy is then ref.npy"),
           device: str = "cuda", dtype: str = typer.Option("bf16", help="bf16 | fp16 | fp32"),
           chunk: int = typer.Option(0, help="bases per encoder chunk (memory cap; 0: the whole window at once)"),
           shard: str = typer.Option("", help="i/n: sites k % n == i only, written under OUT/shards/; then merge")) -> None:
     sh = EK.parse_shard(shard)
     src = interim_dir("genome", name)
     root = src.parent.parent
-    sites = sites_of(variants, where, read_col, max_variants, seed)
+    sites = sites_of(variants, where, read_col, max_variants, seed, flank_col, flank)
     sites = sites.with_columns(w_lo=((pl.col("pos") + pl.col("read")) // 2 // BIN) * BIN - context // 2)
     inside = lambda c: (pl.col(c) >= pl.col("w_lo") + edge) & (pl.col(c) < pl.col("w_lo") + context - edge)
     n_all = sites.height
@@ -127,14 +136,13 @@ def score(out: Path, checkpoints: list[str] = typer.Argument(..., help="LABEL=CH
         if where_store is None:
             raise typer.BadParameter(f"{label}: give --store for head {head!r}")
         store = X.open_store(str(where_store))
-        if store.kind == "binary":
-            raise typer.BadParameter(f"{head}: a label head; this scorer reads track heads")
+        binary = store.kind == "binary"                 # a label head (splice): logits, read as their maximum
         model = model.to(dev).eval()
         model.x_active = {head}
         if chunk and not EK.capped_ok(model):
             raise typer.BadParameter(f"{label}: --chunk needs a v2/v2l core without learned chunking")
         unit = 2 ** model.config.n_down
-        consts = store.consts(dev)
+        consts = None if binary else store.consts(dev)
         n_ch = len(store.ids)
 
         def signal(seqs: torch.Tensor, span: tuple[int, int]) -> np.ndarray:
@@ -149,6 +157,8 @@ def score(out: Path, checkpoints: list[str] = typer.Argument(..., help="LABEL=CH
                     model(seqs, torch.zeros(len(seqs), seqs.shape[1] // unit, dtype=torch.long, device=dev), ctx)
                     raw = model.last_x[head]
             raw = raw.float()[..., :n_ch]
+            if binary:
+                return raw.cpu().numpy()
             p_log = X.signal_of(torch.nn.functional.softplus(raw), consts[1], consts[2])   # as xheads.eval_pair
             return torch.expm1(p_log.float()).clamp_min(0).cpu().numpy()
 
@@ -162,12 +172,14 @@ def score(out: Path, checkpoints: list[str] = typer.Argument(..., help="LABEL=CH
             if not pend:
                 return
             span = pend[0][3]
-            seqs = torch.from_numpy(np.stack([s for p in pend for s in (p[1], p[2])])).to(dev)
+            n_seq = 1 if ref_only else 2
+            seqs = torch.from_numpy(np.stack([s for p in pend for s in (p[1], p[2])[:n_seq]])).to(dev)
             sig = signal(seqs, span)
             res = (span[1] - span[0]) // sig.shape[1]         # bases per row of the head's output
-            for j, (k, _, _, _, rel) in enumerate(pend):
-                a, b = max((rel - flank - span[0]) // res, 0), (rel + flank - span[0]) // res + 1
-                ref_out[k], alt_out[k] = sig[2 * j, a:b].sum(0), sig[2 * j + 1, a:b].sum(0)
+            for j, (k, _, _, _, rel, fl) in enumerate(pend):
+                a, b = max((rel - fl - span[0]) // res, 0), (rel + fl - span[0]) // res + 1
+                pool = (lambda v: v.max(0)) if binary else (lambda v: v.sum(0))
+                ref_out[k], alt_out[k] = pool(sig[n_seq * j, a:b]), pool(sig[n_seq * j + n_seq - 1, a:b])
                 done[k] = True
             pend.clear()
 
@@ -177,19 +189,20 @@ def score(out: Path, checkpoints: list[str] = typer.Argument(..., help="LABEL=CH
             alt = with_alt(ref, r["pos"] - lo, r["ref"], r["alt"])
             if alt is None:
                 continue
-            rel = r["read"] - lo
-            s_lo = max(((rel - flank - BIN) // BIN) * BIN, 0)
-            s_hi = min(((rel + flank + 2 * BIN) // BIN) * BIN, context)
+            rel, fl = r["read"] - lo, r["flank"]
+            s_lo = max(((rel - fl - BIN) // BIN) * BIN, 0)
+            s_hi = min(((rel + fl + 2 * BIN) // BIN) * BIN, context)
             if pend and (pend[0][3] != (s_lo, s_hi) or len(pend) >= batch):
                 flush()
-            pend.append((k, ref, alt, (s_lo, s_hi), rel))
+            pend.append((k, ref, alt, (s_lo, s_hi), rel, fl))
             if k % 500 == 0:
                 typer.echo(f"{label}: site {k + 1}/{mine.height}, {time.time() - t0:.0f} s")
         flush()
-        kept = mine.filter(pl.Series(done)).drop("w_lo")
+        kept = mine.filter(pl.Series(done)).drop("w_lo", "flank")
         info = dict(label=label, source=str(ck), step=int(state.get("step", -1)), head=head, store=str(store.path),
-                    ids=list(store.ids), context=context, edge=edge, flank=flank, where=where, read_col=read_col,
-                    max_variants=max_variants, seed=seed, variants=str(variants), dtype=dtype, chunk=chunk,
+                    ids=list(store.ids), kind=store.kind, context=context, edge=edge, flank=flank, flank_col=flank_col,
+                    where=where, read_col=read_col,
+                    max_variants=max_variants, seed=seed, ref_only=ref_only, variants=str(variants), dtype=dtype, chunk=chunk,
                     sites_in_table=n_all, sites_in_window=sites.height, sites_scored=kept.height,
                     ref_mismatch=int((~done).sum()), seconds=round(time.time() - t0, 1),
                     commit=((state.get("run_record") or {}).get("source") or {}).get("commit"))
@@ -210,7 +223,7 @@ def merge(out: Path, label: str, shards: int = typer.Option(..., help="n, as in 
     if missing:
         raise typer.BadParameter(f"{label}: {len(missing)} of {shards} shards missing: {missing[:5]}")
     infos = [json.loads((p / "index.json").read_text()) for p in parts]
-    for k in ("source", "step", "head", "ids", "context", "edge", "flank", "where", "read_col", "max_variants", "seed",
+    for k in ("source", "step", "head", "ids", "context", "edge", "flank", "flank_col", "where", "read_col", "max_variants", "seed",
               "variants", "dtype", "sites_in_window"):
         if len({json.dumps(i.get(k)) for i in infos}) > 1:
             raise typer.BadParameter(f"{label}: shards differ in {k}")
@@ -373,6 +386,151 @@ def report_mpra(out: Path, variants: Path = typer.Option(None, help="prep_mpra_s
                   for r in per]
     (out / "report_mpra.json").write_text(json.dumps(table, indent=1))
     typer.echo("\n".join(lines))
+
+
+# ------------------------------------------------------------------------------------------------ the eQTL report
+
+@app.command("report-eqtl")
+def report_eqtl(out: Path, variants: Path = typer.Option(None, help="prep_eqtl_finemap.py's table (default: the one "
+                                                                    "scored)"), n_boot: int = 200) -> None:
+    """Fine-mapped eQTLs (``label`` 1) against their matched negatives (0), scored with ``--read-col tss`` on the
+    RNA head: a variant's score is the mean over the gene strand's channels of ``|log2((alt + 1) / (ref + 1))|`` at
+    the TSS (unsigned: the table has no direction). AUROC, average precision, and the share of pairs whose positive
+    outscores its negative; chr8/chr9 apart; distance to the TSS as the baseline (matched, so near chance)."""
+    lines, table = [], []
+    for d in sorted((out / "pred").iterdir()):
+        if not (d / "index.json").exists():
+            continue
+        info = json.loads((d / "index.json").read_text())
+        t = pl.read_parquet(variants or Path(info["variants"]))
+        t = t.rename({"position": "pos"}) if "pos" not in t.columns else t
+        sites = pl.read_parquet(d / "sites.parquet").with_row_index("at")
+        mag = np.abs(np.log2((np.load(d / "alt.npy") + EPS) / (np.load(d / "ref.npy") + EPS)))
+        ids = info["ids"]
+        by = {"+": [k for k, c in enumerate(ids) if c.endswith("_P")], "-": [k for k, c in enumerate(ids) if c.endswith("_M")]}
+        t = t.join(sites.select("chrom", "pos", "ref", "alt", "at", tss="read"), on=["chrom", "pos", "ref", "alt", "tss"])
+        score = np.array([mag[a, by[s] or slice(None)].mean() for a, s in zip(t["at"].to_numpy(), t["strand"].to_list())])
+        t = t.with_columns(score=pl.Series(score))
+        for nm, s in (("all", t), ("chr8/chr9 (held out)", t.filter("held_out")), ("other chromosomes", t.filter(~pl.col("held_out"))),
+                      ("within 10 kb of the TSS", t.filter(pl.col("distance").abs() <= 10_000)),
+                      ("beyond 10 kb", t.filter(pl.col("distance").abs() > 10_000))):
+            y = (s["label"] == 1).to_numpy()
+            if y.sum() < 10 or (~y).sum() < 10:
+                continue
+            v, dist = s["score"].to_numpy(), -np.abs(s["distance"].to_numpy()).astype(float)
+            pr = s.group_by("pair").agg(p=pl.col("score").filter(pl.col("label") == 1).max(),
+                                        q=pl.col("score").filter(pl.col("label") == 0).max()).drop_nulls()
+            row = dict(label=d.name, head=info["head"], context=info["context"], subset=nm, variants=s.height,
+                       positives=int(y.sum()), auroc=auroc(v, y), auroc_ci=ci(lambda i: auroc(v[i], y[i]), len(y), n_boot),
+                       ap=ap(v, y), chance=float(y.mean()), distance_auroc=auroc(dist, y), pairs=pr.height,
+                       pair_wins=float(((pr["p"] > pr["q"]).sum() + 0.5 * (pr["p"] == pr["q"]).sum()) / max(pr.height, 1)))
+            table.append(row)
+            lines.append(f"{d.name:20s} {nm:26s} n={s.height:6d} pos={row['positives']:5d} auroc={row['auroc']:.3f}"
+                         f"[{row['auroc_ci'][0]:.3f},{row['auroc_ci'][1]:.3f}] ap={row['ap']:.3f} (chance {row['chance']:.3f}) "
+                         f"pair wins={row['pair_wins']:.3f} of {pr.height} distance auroc={row['distance_auroc']:.3f}")
+    (out / "report_eqtl.json").write_text(json.dumps(table, indent=1))
+    typer.echo("\n".join(lines))
+
+
+# ------------------------------------------------------------------------------------------------ the lentiMPRA report
+
+def ridge_cv(x: np.ndarray, y: np.ndarray, fold: np.ndarray, lam: float = 100.0) -> np.ndarray:
+    """Out-of-fold ridge predictions of ``y`` from ``x`` (standardised on each training part), by the given folds."""
+    out = np.full(len(y), np.nan)
+    for f in np.unique(fold):
+        te = fold == f
+        mu, sd = x[~te].mean(0), x[~te].std(0) + 1e-6
+        a, b = (x[~te] - mu) / sd, (x[te] - mu) / sd
+        w = np.linalg.solve(a.T @ a + lam * np.eye(a.shape[1]), a.T @ (y[~te] - y[~te].mean()))
+        out[te] = b @ w + y[~te].mean()
+    return out
+
+
+@app.command("report-lentimpra")
+def report_lentimpra(out: Path, variants: Path = typer.Option(None, help="prep_lentimpra.py's table (default: the one "
+                                                                         "scored)"), lam: float = 100.0) -> None:
+    """lentiMPRA activity of native 200-bp elements (Agarwal et al. 2025) against the head's prediction at their
+    place in the genome (scored with ``--ref-only``), per cell line: Pearson of the measured ``log2(RNA/DNA)`` with
+    (a) the mean ``log1p`` signal over the cell line's own channels, where the store has them, and (b) a ridge probe
+    on every channel's ``log1p`` signal, fitted out-of-fold on the paper's ten folds (their Table S6 gives Enformer,
+    Sei and MPRALegNet on the same folds). chr8/chr9 elements apart (probe fitted on the others)."""
+    lines, table = [], []
+    for d in sorted((out / "pred").iterdir()):
+        if not (d / "index.json").exists():
+            continue
+        info = json.loads((d / "index.json").read_text())
+        t = pl.read_parquet(variants or Path(info["variants"])).filter(pl.col("activity").is_not_null())
+        sites = pl.read_parquet(d / "sites.parquet").with_row_index("at")
+        x_all = np.log1p(np.load(d / "ref.npy")).astype(np.float64)
+        t = t.join(sites.select("chrom", "pos", "at"), on=["chrom", "pos"])
+        meta = Path(info["store"]) / "binned.json"
+        tracks = json.loads(meta.read_text())["tracks"] if meta.exists() else []
+        for (cell,), s in t.group_by("cell", maintain_order=True):
+            y, x = s["activity"].to_numpy(), x_all[s["at"].to_numpy()]
+            own = [k for k, tr in enumerate(tracks) if norm(str(tr.get("biosample", ""))) == norm(cell)]
+            held = s["held_out"].to_numpy()
+            oof = ridge_cv(x, y, s["fold"].to_numpy(), lam)
+            pear = lambda a, b: float(np.corrcoef(a, b)[0, 1]) if len(a) > 2 else float("nan")
+            row = dict(label=d.name, head=info["head"], cell=cell, elements=s.height, own_channels=len(own),
+                       probe_pearson=pear(oof, y), probe_by_fold=[pear(oof[s["fold"].to_numpy() == f], y[s["fold"].to_numpy() == f])
+                                                                  for f in sorted(set(s["fold"].to_list()))],
+                       own_pearson=pear(x[:, own].mean(1), y) if own else None, held_out=int(held.sum()))
+            if held.sum() > 50:                          # the probe fitted on the other chromosomes
+                ho = ridge_cv(x, y, held.astype(int), lam)
+                row["probe_pearson_held_out"] = pear(ho[held], y[held])
+            table.append(row)
+            lines.append(f"{d.name:20s} {cell:6s} n={s.height:6d} probe={row['probe_pearson']:.3f} "
+                         f"held-out chr8/chr9={row.get('probe_pearson_held_out', float('nan')):.3f} "
+                         + (f"own({len(own)})={row['own_pearson']:.3f}" if own else "own: none"))
+    (out / "report_lentimpra.json").write_text(json.dumps(table, indent=1))
+    typer.echo("\n".join(lines))
+
+
+# ------------------------------------------------------------------------------------------------ the MFASS report
+
+@app.command("report-mfass")
+def report_mfass(out: Path, variants: Path = typer.Option(None, help="prep_mfass.py's table (default: the one scored)"),
+                 n_boot: int = 200) -> None:
+    """Splice-disrupting variants (MFASS; ``sdv``: dPSI <= -0.5) from the splice head, scored with ``--head splice
+    --read-col exon_mid --flank-col half``: a variant's prediction is the change (alt - ref) of the exon's acceptor
+    and donor logits (each the highest of its strand's channel over the exon and 3 bases beyond), averaged. Average
+    precision and AUROC of the predicted loss for ``sdv``, Spearman with the measured dPSI; per region, chr8/chr9
+    apart."""
+    lines, table = [], []
+    for d in sorted((out / "pred").iterdir()):
+        if not (d / "index.json").exists():
+            continue
+        info = json.loads((d / "index.json").read_text())
+        ch = {c: k for k, c in enumerate(info["ids"])}
+        t = pl.read_parquet(variants or Path(info["variants"]))
+        sites = pl.read_parquet(d / "sites.parquet").with_row_index("at")
+        delta = np.load(d / "alt.npy") - np.load(d / "ref.npy")
+        t = t.join(sites.select("chrom", "pos", "ref", "alt", "at", exon_mid="read"), on=["chrom", "pos", "ref", "alt", "exon_mid"])
+        own = {"+": [ch["acceptor_plus"], ch["donor_plus"]], "-": [ch["acceptor_minus"], ch["donor_minus"]]}
+        pred = np.array([delta[a, own[s]].mean() for a, s in zip(t["at"].to_numpy(), t["strand"].to_list())])
+        t = t.with_columns(pred=pl.Series(pred))
+        subsets = [("all", t), ("chr8/chr9 (held out)", t.filter("held_out")), ("other chromosomes", t.filter(~pl.col("held_out")))]
+        subsets += [(str(r), t.filter(pl.col("region") == r)) for r in t["region"].drop_nulls().unique().sort()]
+        for nm, s in subsets:
+            y = s["sdv"].to_numpy().astype(bool)
+            if y.sum() < 5:
+                continue
+            v = -s["pred"].to_numpy()
+            row = dict(label=d.name, subset=nm, variants=s.height, sdv=int(y.sum()), chance=float(y.mean()), ap=ap(v, y),
+                       ap_ci=ci(lambda i: ap(v[i], y[i]), len(y), n_boot), auroc=auroc(v, y),
+                       spearman_dpsi=spearman(s["pred"].to_numpy(), s["dpsi"].to_numpy()))
+            table.append(row)
+            lines.append(f"{d.name:20s} {nm:22s} n={s.height:6d} sdv={row['sdv']:4d} ap={row['ap']:.3f}"
+                         f"[{row['ap_ci'][0]:.3f},{row['ap_ci'][1]:.3f}] (chance {row['chance']:.3f}) auroc={row['auroc']:.3f} "
+                         f"rho(dPSI)={row['spearman_dpsi']:.3f}")
+    (out / "report_mfass.json").write_text(json.dumps(table, indent=1))
+    typer.echo("\n".join(lines))
+
+
+def ap(score: np.ndarray, y: np.ndarray) -> float:
+    o = np.argsort(-score, kind="stable")
+    y = y[o].astype(np.float64)
+    return float((np.cumsum(y) / np.arange(1, len(y) + 1) * y).sum() / y.sum()) if y.sum() else float("nan")
 
 
 if __name__ == "__main__":

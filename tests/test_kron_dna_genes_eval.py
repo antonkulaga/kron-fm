@@ -78,7 +78,7 @@ def test_genes_eval_scores_two_annotations(tmp_path, monkeypatch):
     assert rs["annotations"] == r["annotations"] and rs["shards"] == 2
     assert np.array_equal(np.load(out / "s.splice.npy"), np.load(out / "m.splice.npy"))   # the splice logits too
     assert np.load(out / "m.splice.npy").shape == (2, 131072, 4)
-    assert {"cds_exon_f1_snapped", "cds_exon_f1_paired"} <= set(r["annotations"]["new"])
+    assert {"cds_exon_f1_snapped", "cds_exon_f1_paired", "cds_exon_f1_chained"} <= set(r["annotations"]["new"])
     # the decoders on a made-up window: an exon [100, 200) on +, acceptor at 99 and donor at 200; calls blurred
     logit = np.full((1, 400), -5.0, np.float32)
     logit[0, 90:130] = 5
@@ -87,6 +87,13 @@ def test_genes_eval_scores_two_annotations(tmp_path, monkeypatch):
     sp4[0, 99, 1], sp4[0, 200, 0] = 9, 9                 # acceptor +, donor +
     assert GE.pair_exons(logit, sp4, "plus") == {(0, 100, 200)}
     assert GE.snap(GE.smooth(logit > 0), sp4, "plus") == {(0, 100, 200)}
+    assert GE.chain_exons(logit, sp4, "plus") == {(0, 100, 200)}
+    assert GE.chain_exons(logit, sp4, "plus", GE.smooth(logit > 0)) == {(0, 100, 200)}   # the sites beat the call's ends
+    two = np.full((1, 400, 4), -9.0, np.float32)         # two exons in a row, an intron of 30 between
+    two[0, 99, 1], two[0, 150, 0], two[0, 179, 1], two[0, 240, 0] = 9, 9, 9, 9
+    lg2 = np.full((1, 400), -5.0, np.float32)
+    lg2[0, 100:150], lg2[0, 180:240] = 5, 5
+    assert GE.chain_exons(lg2, two, "plus", floor=100.0) == {(0, 100, 150), (0, 180, 240)}
     spm = np.full((1, 400, 4), -9.0, np.float32)
     spm[0, 99, 2], spm[0, 200, 3] = 9, 9                 # on -: the donor below the exon, the acceptor above
     assert GE.pair_exons(logit, spm, "minus") == {(0, 100, 200)} and GE.pair_exons(logit, spm, "plus") == set()

@@ -1,6 +1,6 @@
 """Saturation mutagenesis MPRAs of disease-associated promoters and enhancers on hg38 (Kircher et al. 2019; the
 CAGI5 regulation challenge data): the ``GRCh38_<experiment>.tsv`` files of the paper's OSF project (75b2m,
-``Variants/GRCh38``), every single-base change and 1-bp deletion of 20 elements, each with its measured effect on
+``Variants/GRCh38``), every single-base change and 1-bp deletion of 21 elements, each with its measured effect on
 reporter expression.
 
     uv run python scripts/kron_dna/prep_mpra_satmut.py OUT.parquet DIR_WITH_TSVS [--name hg38]

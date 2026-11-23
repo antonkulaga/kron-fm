@@ -152,6 +152,58 @@ def pair_exons(logit: np.ndarray, splice: np.ndarray, strand: str, cover: float 
     return out
 
 
+def chain_exons(logit: np.ndarray, splice: np.ndarray, strand: str, calls: np.ndarray | None = None, thr: float = 3.0,
+                longest: int = 3000, clip: float = 1.0, site: float = 40.0, floor: float = 160.0) -> set:
+    """Exons ``{(window, start, end)}`` as the best chain per window: the set of non-overlapping stretches, each from
+    a low-end candidate to a high-end candidate at most ``longest`` bases on, with the highest total score (dynamic
+    programming over exon ends). A stretch scores the sum of its bases' CDS logits clipped to ``+-clip``, plus
+    ``site`` times each end's splice logit (capped at 8); it must score above ``floor``. Candidates are the splice
+    head's sites above ``thr`` and, at ``-2 * site``, the ends of the smoothed calls ``calls`` (a first or last
+    coding exon ends at a codon). The sites weigh far more than a base because the genes head is binned and its
+    edges are blurred; defaults tuned on beluga (F) and checked on chicken (A3). No reading frame yet."""
+    lo_ch, hi_ch = SITES[strand]
+    opens: dict = {}
+    if calls is not None:
+        for w, a, b in runs(calls):
+            o = opens.setdefault(w, ([], []))
+            o[0].append(a)
+            o[1].append(b)
+    out = set()
+    for w in range(logit.shape[0]):
+        cs = np.concatenate([[0.0], np.cumsum(np.clip(logit[w].astype(np.float32), -clip, clip), dtype=np.float64)])
+        s_lo, s_hi = splice[w, :, lo_ch].astype(np.float32), splice[w, :, hi_ch].astype(np.float32)
+        A = {int(p) + 1: site * min(float(s_lo[p]), 8.0) for p in np.flatnonzero(s_lo > thr)}
+        B = {int(p): site * min(float(s_hi[p]), 8.0) for p in np.flatnonzero(s_hi > thr)}
+        for a in opens.get(w, ([], []))[0]:
+            A.setdefault(int(a), -2 * site)
+        for b in opens.get(w, ([], []))[1]:
+            B.setdefault(int(b), -2 * site)
+        if not A or not B:
+            continue
+        a_pos = np.array(sorted(A))
+        a_sc = np.array([A[a] for a in a_pos])
+        ends, best, back = [0], [0.0], [None]            # chains by their last exon's end; best is increasing
+        for b in sorted(B):
+            j0, j1 = np.searchsorted(a_pos, b - longest), np.searchsorted(a_pos, b)
+            if j1 <= j0:
+                continue
+            aa = a_pos[j0:j1]
+            sc = cs[b] - cs[aa] + a_sc[j0:j1] + B[b]
+            prev = np.searchsorted(ends, aa, side="right") - 1          # the best chain ending at or before each start
+            tot = np.where(sc > floor, sc + np.asarray(best)[prev], -np.inf)
+            i = int(tot.argmax())
+            if tot[i] > best[-1]:
+                ends.append(b)
+                best.append(float(tot[i]))
+                back.append((int(aa[i]), int(prev[i])))
+        k = len(ends) - 1
+        while k > 0:
+            a, prev_k = back[k]
+            out.add((w, a, ends[k]))
+            k = prev_k
+    return out
+
+
 def smooth(call: np.ndarray, gap: int = 20, short: int = 30) -> np.ndarray:
     """``[n, L]`` calls with gaps of up to ``gap`` bases closed and runs under ``short`` bases dropped: the least
     decoding that turns per-base calls into exons (no gene model; Tiberius and Helixer decode with an HMM)."""
@@ -295,7 +347,9 @@ def finish(out: Path, info: dict, pred: np.ndarray, lab: dict, ids: list[str], s
     if splice is not None:
         np.save(out / f"{label}.splice.npy", splice)
         snapped = {"snapped": {st: snap(sm_cds[st], splice, st) for st in ("plus", "minus")},
-                   "paired": {st: pair_exons(pred[..., ids.index(f"cds_{st}")], splice, st) for st in ("plus", "minus")}}
+                   "paired": {st: pair_exons(pred[..., ids.index(f"cds_{st}")], splice, st) for st in ("plus", "minus")},
+                   "chained": {st: chain_exons(pred[..., ids.index(f"cds_{st}")], splice, st, sm_cds[st])
+                               for st in ("plus", "minus")}}
     res = dict(info, annotations={})
     for t, y in lab.items():
         per = {}
