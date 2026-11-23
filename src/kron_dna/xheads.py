@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -27,6 +28,35 @@ from kron_dna import genome as G
 
 
 # ------------------------------------------------------------------------------------------------ the store
+
+_FDS: dict = {}
+
+
+def read_rows(mm, a: int, b: int) -> np.ndarray:
+    """Rows ``a:b`` of a row-major memmap read with ``os.pread`` at their offset, not through the mapping: a run
+    touches hundreds of GB of stores at random, and every page read through a mapping stays mapped in the process
+    (the trainer measured F at 342 GB RssFile, 17 of 20 s in the kernel per step, at 15 s/step instead of 2.8). The
+    page cache serves both alike. Anything that is not a file-backed ``np.memmap`` (a test's stand-in) is sliced."""
+    fn = getattr(mm, "filename", None)
+    if not isinstance(mm, np.memmap) or fn is None:
+        return np.asarray(mm[a:b])
+    b = min(b, mm.shape[0])
+    if b <= a:
+        return np.zeros((0,) + mm.shape[1:], dtype=mm.dtype)
+    key = (os.getpid(), fn)                           # one descriptor per file and process (a fork reopens)
+    fd = _FDS.get(key)
+    if fd is None:
+        fd = _FDS[key] = os.open(fn, os.O_RDONLY)
+    row = int(np.prod(mm.shape[1:], dtype=np.int64)) * mm.dtype.itemsize
+    want = (b - a) * row
+    buf = os.pread(fd, want, int(mm.offset) + a * row)
+    while len(buf) < want:                            # pread may return short; read the rest
+        more = os.pread(fd, want - len(buf), int(mm.offset) + a * row + len(buf))
+        if not more:
+            raise OSError(f"{fn}: short read at row {a}")
+        buf += more
+    return np.frombuffer(buf, dtype=mm.dtype).reshape((b - a,) + mm.shape[1:])
+
 
 @dataclass
 class TrackStore:
@@ -83,7 +113,7 @@ class TrackStore:
         """Targets ``[width, T]`` uint8 of bases ``at:at + take`` (zero-padded to ``width``); ``flip``: the other
         strand, reversed with the strand partners swapped, as the window's bases are reverse-complemented."""
         out = self.empty(width)
-        out[:take] = self.dense[at:at + take]
+        out[:take] = read_rows(self.dense, at, at + take)
         if flip:
             out[:take] = out[:take][::-1][:, self.swap]
         return out
@@ -160,7 +190,7 @@ class LabelStore:
     def window(self, at: int, take: int, width: int, flip: bool = False) -> np.ndarray:
         """Targets ``[width, T]`` uint8 (0 or 1) of bases ``at:at + take``; ``flip``: the other strand."""
         out = np.zeros((width, len(self.ids)), dtype=np.uint8)
-        bits = np.asarray(self.labels[at:at + take])
+        bits = read_rows(self.labels, at, at + take)
         out[:take] = (bits[:, None] >> np.arange(len(self.ids), dtype=bits.dtype)[None, :]) & 1
         if flip:
             out[:take] = out[:take][::-1][:, self.swap]
@@ -251,8 +281,8 @@ class BinnedTrackStore:
         if at % self.bin:
             raise ValueError(f"a window at base {at} is off the store's {self.bin}-base grid")
         c = at // self.bin
-        out[:n, :, 0] = self.target[c:c + n]
-        out[:n, :, 1] = self.log1p[c:c + n]
+        out[:n, :, 0] = read_rows(self.target, c, c + n)
+        out[:n, :, 1] = read_rows(self.log1p, c, c + n)
         if flip:
             out[:n] = out[:n][::-1][:, self.swap]
         return out

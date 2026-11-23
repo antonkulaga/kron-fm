@@ -6,7 +6,8 @@
 ``INDEX.csv`` is the release's ``data_tables/assemblies_release2_v1.0.index.csv`` (one row per haplotype; the two
 haplotype-0 reference rows are skipped). ``part`` takes every Nth haplotype: downloads its ``.fa.gz`` (checked against
 the release's md5) and its ``chromAlias.txt`` (assembly sequence -> chr1..chr22, X, Y, M), keeps the sequences
-assigned to chr1-22, X and Y, names each ``<sample>#<haplotype>#<chr>``, splits them at runs of N as genome-prepare
+assigned to chr1-22, X and Y (a whole chromosome ``chrN``, or a scaffold assigned to it but not placed,
+``chrN_<accession>_random``; ``chrUn`` is left out), names each ``<sample>#<haplotype>#<alias>``, splits them at runs of N as genome-prepare
 does (``genome.contigs_of``: gaps of 50 N or more, contigs under 10 kb dropped) and writes ``WORK/parts/<assembly>/``
 (``bases.u8``, ``contigs.parquet``); the FASTA is then deleted. A finished part is skipped on a rerun.
 ``assemble`` concatenates every part, in index order, into ``data/interim/genome/<name>/`` (``bases.u8`` and
@@ -98,15 +99,16 @@ def part(index: Path, work: Path, part: int = 0, parts: int = 1) -> None:
         with gzip.open(fa, "rt") as f, open(tmp / "out" / "bases.u8", "wb") as fh:
             def flush(nm, chunks):
                 nonlocal offset
-                chrom = alias.get(nm)
-                if chrom not in KEEP:
+                al_ = alias.get(nm, "")
+                chrom = al_.split("_")[0]             # chrN, or chrN_<accession>_random: assigned, not placed
+                if chrom not in KEEP:                 # chrUn and unaligned sequences stay out
                     return
                 codes = G.encode_bases("".join(chunks))
                 kept[chrom] = kept.get(chrom, 0) + 1
                 for a, b in G.contigs_of(codes, 50, 10_000):
                     fh.write(codes[a:b].tobytes())
-                    out_rows.append((tag + chrom, a, b, offset, chrom in HELD))
-                    offset += b - a
+                    out_rows.append((tag + al_, a, b, offset, chrom in HELD))
+                    offset += int(b - a)
             for line in f:
                 if line.startswith(">"):
                     if name_ is not None:
