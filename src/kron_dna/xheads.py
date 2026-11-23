@@ -662,11 +662,16 @@ class AveragePrecision:
                 continue
             q = torch.cat(self.neg[k]) if self.neg[k] else torch.zeros(0)
             floor = self.floor[k]
-            p = torch.sort(p, descending=True).values
-            above = torch.searchsorted(-torch.sort(q, descending=True).values, -p, right=False).double()  # negatives > p
-            above = torch.where(p >= floor, above, torch.full_like(above, float(self.neg_total[k])))
-            rank = torch.arange(1, p.numel() + 1, dtype=torch.float64)
-            out[k] = float((rank / (rank + above)).mean())
+            # precision at each positive's own score, ties included (review 23 Nov: counting only strictly higher
+            # negatives gave a constant classifier AP 1.0): positives and negatives scoring >= it, as a threshold
+            # at that score would keep them (sklearn's average_precision for distinct scores, exact under ties)
+            p_up = torch.sort(p).values
+            q_up = torch.sort(q).values if q.numel() else q
+            pos_ge = (p.numel() - torch.searchsorted(p_up, p, right=False)).double()
+            neg_ge = (q.numel() - torch.searchsorted(q_up, p, right=False)).double() if q.numel() else \
+                torch.zeros_like(pos_ge)
+            neg_ge = torch.where(p >= floor, neg_ge, torch.full_like(neg_ge, float(self.neg_total[k])))
+            out[k] = float((pos_ge / (pos_ge + neg_ge)).mean())
         return out
 
 

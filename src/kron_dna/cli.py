@@ -972,7 +972,11 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                                                 "double the --jepa-reg weight at each such evaluation up to "
                                                 "--jepa-guard-cap x; triggered again at the cap: save and stop with "
                                                 "exit code 42)"),
-                 jepa_guard_windows: int = typer.Option(8, help="with --jepa-guard: number of fixed held-out windows"),
+                 jepa_guard_windows: int = typer.Option(8, help="with --jepa-guard: number of fixed monitoring windows"),
+                 jepa_guard_from: str = typer.Option("train", help="with --jepa-guard: where its fixed windows come from: "
+                                                     "train (default; review 23 Nov: the guard steers training, so "
+                                                     "it must not decide on the held-out chromosomes) or heldout "
+                                                     "(the old behaviour)"),
                  jepa_guard_window: int = typer.Option(131072, help="with --jepa-guard: bases per monitoring window"),
                  jepa_guard_rank: float = typer.Option(0.5, help="with --jepa-guard: entropy-rank trigger, a share "
                                                        "of its running maximum"),
@@ -1170,6 +1174,8 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
             block_lo, block_hi = G.parse_block_len(jepa_block_len, unit)
         except ValueError as err:
             raise typer.BadParameter(f"--jepa-block-len: {err}") from None
+    if jepa_guard_from not in ("train", "heldout"):
+        raise typer.BadParameter("--jepa-guard-from must be train or heldout")
     if jepa_guard not in ("off", "monitor", "on"):
         raise typer.BadParameter("--jepa-guard must be off, monitor or on")
     if jepa_guard != "off":
@@ -2121,19 +2127,39 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
         # --xhead-species: a head with more outputs than the checkpoint's (a further genome's channels appended): its
         # readout rows of the old channels are copied, the new rows keep this model's fresh initialisation
         own_ = model.state_dict()
-        widened_ = {}
+        widened_, moved_ = {}, {}
+        # each head's channel ids in the checkpoint (its stage records the store it trained on): readout rows are
+        # matched by id, not by position (review 23 Nov: a reordered or re-selected store would otherwise put an old
+        # channel's weights on another channel); a checkpoint without ids keeps the positional copy
+        old_ids_ = {h_: list(st_.get("ids") or []) for h_, st_ in
+                    (((init_state.get("xstage") or {}).get("state") or {}).get("stores") or {}).items()}
         for k_, v_ in list(init_state["model"].items()):
             w_ = own_.get(k_)
-            if (k_.startswith("xheads.") and w_ is not None and v_.dim() >= 1 and w_.shape[1:] == v_.shape[1:]
-                    and w_.shape[0] > v_.shape[0]):
+            if not (k_.startswith("xheads.") and w_ is not None and v_.dim() >= 1 and w_.shape[1:] == v_.shape[1:]):
+                continue
+            h_ = k_.split(".")[1]
+            ids_old, ids_new = old_ids_.get(h_), (list(xstores[h_].ids) if h_ in xstores else None)
+            if ids_old and ids_new and len(ids_old) == v_.shape[0] and len(ids_new) == w_.shape[0] \
+                    and ids_new[:len(ids_old)] != ids_old:
+                at_ = {i_: k2_ for k2_, i_ in enumerate(ids_old)}
+                new_ = w_.clone()
+                hit_ = [(j_, at_[i_]) for j_, i_ in enumerate(ids_new) if i_ in at_]
+                if hit_:
+                    jj_, ii_ = zip(*hit_)
+                    new_[list(jj_)] = v_[list(ii_)]
+                init_state["model"][k_] = new_
+                moved_[h_] = (len(hit_), len(ids_new))
+            elif w_.shape[0] > v_.shape[0]:
                 new_ = w_.clone()
                 new_[:v_.shape[0]] = v_
                 init_state["model"][k_] = new_
-                h_ = k_.split(".")[1]
                 widened_[h_] = (int(v_.shape[0]), int(w_.shape[0]))
         if widened_:
             say("--xhead: widened readouts (old channels kept, new rows fresh): "
                 + ", ".join(f"{h_} {a_} -> {b_}" for h_, (a_, b_) in widened_.items()))
+        if moved_:
+            say("--xhead: readout rows matched to the checkpoint's channels by id (the order or selection changed): "
+                + ", ".join(f"{h_} {a_} of {b_} kept" for h_, (a_, b_) in moved_.items()))
         grown, notes = G.expand_state_dict(init_state["model"], model, new_contexts=new_contexts)
         missing, unexpected = model.load_state_dict(grown, strict=False)
         say(f"initialised from {init}; new: {missing}; dropped: {unexpected}; padded: {notes or 'nothing'}")
@@ -2717,6 +2743,13 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
 
     # --jepa-guard: restore its state on resume (with off a saved state is ignored and the loss is the configured
     # one); fixed held-out monitoring windows (rank 0 measures, whatever the seed: the same windows in every run)
+    if guard_saved is not None and guard_saved.get("from", "heldout") != jepa_guard_from and jepa_guard != "off":
+        # the reference statistics were measured on other windows: keep the regulariser factor already applied
+        # (the loss does not jump), restart the references on the new windows
+        say(f"jepa guard: the checkpoint's guard watched {guard_saved.get('from', 'heldout')} windows, this run "
+            f"watches {jepa_guard_from} windows: running references restart (factor x{guard_saved.get('mult', 1.0):g} kept)")
+        guard_saved = {k_: v_ for k_, v_ in guard_saved.items() if k_ not in ("max_rank", "std_mins", "evals", "hits", "from")}
+    guard["from"] = jepa_guard_from
     if guard_saved is not None:
         if jepa_guard == "on":
             guard.update({k_: v_ for k_, v_ in guard_saved.items() if k_ in guard})
@@ -2733,9 +2766,10 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
     guard_win = []
     if jepa_guard != "off" and main:
         g_rng = np.random.default_rng(20261117)
-        g_rows = [r_ for r_ in val_idx.iter_rows(named=True) if r_["len"] > jepa_guard_window]
+        g_src = train_idx if jepa_guard_from == "train" else val_idx
+        g_rows = [r_ for r_ in g_src.iter_rows(named=True) if r_["len"] > jepa_guard_window]
         if not g_rows:
-            raise typer.BadParameter(f"--jepa-guard-window {jepa_guard_window:,}: no held-out contig is that long")
+            raise typer.BadParameter(f"--jepa-guard-window {jepa_guard_window:,}: no {jepa_guard_from} contig is that long")
         g_share = jepa_block_share if jepa_block_share > 0 else 0.2
         for _ in range(200 * jepa_guard_windows):
             if len(guard_win) == jepa_guard_windows:
@@ -2750,9 +2784,9 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                                 guard_lo, guard_hi, g_rng)[0]
             guard_win.append((s_, pick_, hid_))
         if not guard_win:
-            raise typer.BadParameter("--jepa-guard: no held-out window with at least 90% known bases")
-        say(f"jepa guard ({jepa_guard}): {len(guard_win)} fixed held-out windows of {jepa_guard_window:,} bases "
-            f"({', '.join(sorted(set(val_idx['chrom'].to_list())))}), blocks {g_share:g} of bins + {mask_prob:g} "
+            raise typer.BadParameter(f"--jepa-guard: no {jepa_guard_from} window with at least 90% known bases")
+        say(f"jepa guard ({jepa_guard}): {len(guard_win)} fixed {jepa_guard_from} windows of {jepa_guard_window:,} bases "
+            f"({', '.join(sorted(set(g_src['chrom'].to_list())))[:200]}), blocks {g_share:g} of bins + {mask_prob:g} "
             f"scattered MASK; trigger: entropy rank < {jepa_guard_rank:g} x running max or min dim std < "
             f"{jepa_guard_std:g} x running median, two evaluations in a row"
             + (f"; then --jepa-reg weight x2 per evaluation up to x{jepa_guard_cap:g}, then stop (exit 42)"
@@ -2844,6 +2878,10 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
         if bench_grads is not None and step == 0:              # the first step's gradients, before clipping
             torch.save(dict(losses=bench_losses, grads={n_: (None if p_.grad is None else p_.grad.detach().cpu())
                                                         for n_, p_ in model.named_parameters()}), bench_grads)
+        if xstage is not None and not xstage.inherited_trains:   # head-only: the inherited weights' gradients go,
+            for n_, p_ in model.named_parameters():                # so AdamW leaves their moments and step count as
+                if not n_.startswith("xheads."):                   # the checkpoint had them and they do not enter the
+                    p_.grad = None                                 # clip norm (review 23 Nov)
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         if xstage is not None:          # each group's rate: the run's schedule (the line above) as a share of --lr,
             x_rates = XH.set_rates(opt, xstage, sorted(x_step),               # times the group's own peak and warmup

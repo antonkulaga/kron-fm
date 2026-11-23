@@ -53,3 +53,23 @@ def test_a_pack_bucket_can_be_empty():
     b = PK.Buckets(np.array([1 << 20, (1 << 20) - 5]), None, ladder)
     short_len = ladder[-1][0] // 2                  # shorter than any contig of the table
     assert len(b.cell(short_len).members) == 0
+
+
+def test_average_precision_counts_ties_against_the_positive():
+    """A constant classifier is not perfect (review 23 Nov: it scored 1.0)."""
+    pred = torch.zeros(1, 100, 1)
+    want = torch.zeros(1, 100, 1, dtype=torch.long)
+    want[0, 7, 0] = 1
+    ap = XH.AveragePrecision(1, keep=1.0)
+    ap.add(pred, want)
+    assert abs(ap.value()[0] - 0.01) < 1e-9
+
+
+def test_average_precision_matches_sklearn_on_distinct_and_tied_scores():
+    from sklearn.metrics import average_precision_score
+    rng = np.random.default_rng(3)
+    s = np.round(rng.normal(size=400), 1)          # many ties
+    y = (rng.random(400) < 0.1).astype(int)
+    ap = XH.AveragePrecision(1, keep=1.0)
+    ap.add(torch.tensor(s, dtype=torch.float32).reshape(1, -1, 1), torch.tensor(y).reshape(1, -1, 1))
+    assert abs(ap.value()[0] - average_precision_score(y, s)) < 1e-6
