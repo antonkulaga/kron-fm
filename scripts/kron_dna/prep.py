@@ -11,6 +11,7 @@ script unchanged on the shared ``kron_dna.prep`` base.
     uv run python scripts/kron_dna/prep.py labels splice OUT --name hg38 --gtf GTF
     uv run python scripts/kron_dna/prep.py labels genes OUT --name hg38 --gtf GTF [--basic-only] [--source S]
     uv run python scripts/kron_dna/prep.py split syntenic CHAIN OUT --name mm10
+    uv run python scripts/kron_dna/prep.py split orthologs GTF OUT --name tgut_btaegut7 --gene-info INFO --orthologs ORTH
     uv run python scripts/kron_dna/prep.py check histone|tf|accessibility|rna STORE GENOME [--gtf GTF]
 
 Every subcommand takes exactly the arguments of the script it names (``--help`` after it shows them).
@@ -33,6 +34,7 @@ ROUTES = {
     ("labels", "splice"): ("prep_splice_labels.py", None),
     ("labels", "genes"): ("prep_gene_structure_labels.py", None),
     ("split", "syntenic"): ("prep_syntenic_split.py", None),
+    ("split", "orthologs"): ("prep_ortholog_split.py", None),
     ("check", "histone"): ("check_chip_store.py", "keep"),
     ("check", "tf"): ("check_chip_store.py", "keep"),
     ("check", "accessibility"): ("check_chip_store.py", "keep"),
