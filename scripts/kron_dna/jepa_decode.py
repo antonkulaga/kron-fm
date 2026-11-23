@@ -82,6 +82,8 @@ def main(checkpoints: list[Path] = typer.Argument(..., help="checkpoint files wi
     import os
     genome = genome or Path(os.environ["KRON_FM_DATA"]) / "interim" / "genome" / "hg38"
     contigs = pl.read_parquet(genome / "contigs.parquet").filter(pl.col("chrom").is_in(chroms.split(",")))
+    if "len" not in contigs.columns:                              # a prepared genome's contigs: start/end/offset
+        contigs = contigs.with_columns((pl.col("end") - pl.col("start")).alias("len"))
     contigs = contigs.filter(pl.col("len") > window)
     bases = np.memmap(genome / "bases.u8", dtype=np.uint8, mode="r")
     rng = np.random.default_rng(seed)
