@@ -385,14 +385,21 @@ class SpeciesStores:
 
     def _place(self, part: np.ndarray, genome: str | None) -> np.ndarray:
         out = np.zeros(part.shape[:1] + (len(self.ids),) + part.shape[2:], dtype=part.dtype)
-        out[:, self.cols[genome]] = part
+        cols = self.cols[genome]
+        if len(cols) and cols[-1] - cols[0] + 1 == len(cols) and (np.diff(cols) == 1).all():
+            out[:, cols[0]:cols[-1] + 1] = part       # a contiguous range (the primary's): a plain slice copy
+        else:
+            out[:, cols] = part
         return out
 
     def window(self, at: int, take: int, width: int, flip: bool = False, genome: str | None = None) -> np.ndarray:
         return self._place(self.store_of(genome).window(at, take, width, flip), genome)
 
     def empty(self, width: int) -> np.ndarray:
-        return self._place(self.primary.empty(width), None) * 0
+        """Zeros of a window's shape at the head's full width, left untouched (np.zeros maps them lazily: a row
+        that reads nothing costs nothing, as with a plain store)."""
+        e = self.primary.empty(width)
+        return np.zeros(e.shape[:1] + (len(self.ids),) + e.shape[2:], dtype=e.dtype)
 
     def consts(self, device) -> tuple:
         """Per channel, the primary store's constants where it has the channel, else the further genome's."""
