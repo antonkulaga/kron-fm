@@ -168,9 +168,12 @@ def read_galaxyppg(folder: Path) -> SourceData:
             x = _column(data, "ppg")
             if len(t) < 100:
                 continue
-            fs = 1.0 / float(np.median(np.diff(t)))
+            from kron_ppg.watch_readers import uniform
+
+            fs = round(1.0 / float(np.median(np.diff(t))), 3)
+            # on the time grid, so a dropout stays a gap (NaN) and is never spliced shut;
             # the SDK's green PPG falls as blood volume rises: invert so the systolic peak points up
-            yield Recording(s["subject"], s["subject"], round(fs, 3), -x)
+            yield Recording(s["subject"], s["subject"], fs, uniform(t, -x, fs))
 
     return SourceData(subjects, gen())
 

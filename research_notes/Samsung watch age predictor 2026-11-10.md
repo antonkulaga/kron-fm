@@ -53,9 +53,10 @@ spread over a day or two; more helps.
 - **Graph:** one ONNX streaming graph, `stream.onnx`, 24 MB (fp32), opset 17; inputs a 5 s chunk (125 samples),
   a validity mask, the pool (257 floats) and six layers' memory (~470 KB); output the age so far. Checked against
   PyTorch (max 1e-5 y) and against the window path (0.004 y).
-- **App recipe:** band-pass 0.5-5 Hz, 25 Hz, 30 s windows robust-scaled (median, IQR/1.349), drop windows of
-  periodicity < 0.35 or any |x| > 20; feed 6 chunks per window; zero the layer memory at each window start, keep
-  the pool; read the age after the last window.
+- **App recipe:** band-pass 0.5-8 Hz, 25 Hz, 30 s windows robust-scaled (median, IQR/1.349), drop windows of
+  periodicity < 0.35 or any |x| > 20, *then* remove everything above 5 Hz from each kept window; feed 6 chunks per
+  window; zero the layer memory at each window start, keep the pool; read the age after the last window. (Corrected
+  2026-11-23: the earlier text band-passed at 5 Hz before scaling and gating, which is not how the head was fitted.)
 - **Compute:** 15 ms per 5 s chunk on one server CPU thread (ONNX Runtime), 11 CPU-s per hour of signal. A
   watch core (Cortex-A55 class) is perhaps 3-6x slower: well under a second per 30 s reading. Not measured on a
   watch.
@@ -194,6 +195,38 @@ besides Aurora, on another device, and is used here as a test set only (research
 So a Galaxy Watch clock needs a few dozen people of known, varied age recorded on that watch, so that a head can be
 fitted there, or pretraining and heads across many wide-age devices, which no open data offers yet. Reader:
 `kron_ppg.watch_readers.read_dreamt` (restricted source, owner-only files).
+
+## Review of data preparation and training (2026-11-23)
+
+Two independent reviews of the committed code (Claude and Codex, read-only, no data), each finding checked
+against the code. The ridge cross-validation itself held up in both: grouped by person, scaler and penalty fitted
+inside each fold, both baselines from the training fold, MAE and bootstrap over people.
+
+Fixed (tests added):
+
+- **A rerun could reuse another run's embeddings.** `people.npz` was reused whenever present, so a rerun into the
+  same folder with another encoder or band refitted the old embeddings under the new name. The cache is now stamped
+  with what made it and a mismatch is refused. The results above were each made in their own folder.
+- **The permutation null ran 2 CV repeats against the score's 5.** It now runs the same procedure. With 20 shuffles
+  the smallest p-value is 0.048 either way. On Aurora, DREAMT and the pooled open wrist sets the real MAE sat
+  0.7-4.6 y below the best of 20 shuffles; some small single-watch sets sat within 0.3 y of theirs, as reported.
+- **A frozen encoder's dropout came back on after the first validation** in the two deep-clock trainers (not in
+  the ridge head, which embeds in eval mode). Each module's mode is now restored.
+- **A subject listed twice with two ages** (a person with two hospital cases) kept the last age silently. It is
+  now refused.
+- **The app recipe's order** (above).
+
+Readers fixed and rerun (9d92235): samples stamped together are spread over the step to the next stamp instead
+of averaged (about 6 % of Galaxy Active 2 steps), and GalaxyPPG is placed on its time grid, so a dropout is a gap
+(2 gaps in 23 people). The eight open wrist sets re-prepared this way give the same c1 open-data head: **4.27 y vs
+4.36 y** on the same 214 people, paired difference -0.09 y (-0.21 to +0.04), so no number above moves. PulseWatch
+is left as it is: its windows are its 30 s segments, so none crosses a join; only the band-pass runs across them.
+
+Still open:
+
+- **Pretraining saw the open wrist people** (without ages) that the open-data head is fitted and scored on. No age
+  leaks, and Aurora and DREAMT stay outside pretraining, so the Aurora and DREAMT numbers are clean; the per-device
+  offsets of the open sets are measured on devices the encoder had seen.
 
 ## Limits
 

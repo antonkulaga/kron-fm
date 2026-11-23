@@ -216,7 +216,9 @@ def _eval_index(pool: Pool, idx: np.ndarray, per_subject_cap: int, seed: int) ->
 
 def predict(clock: PPGAgeClock, pool: Pool, idx: np.ndarray, batch_size: int, dev: torch.device
             ) -> dict[str, tuple[float, float, int]]:
-    """Per-subject mean predictions over the windows at ``idx``."""
+    """Per-subject mean predictions over the windows at ``idx``; each module's train/eval mode is restored after
+    (a frozen encoder stays in eval mode, so its dropout stays off)."""
+    modes = {m: m.training for m in clock.modules()}
     clock.eval()
     preds = []
     with torch.no_grad():
@@ -224,7 +226,8 @@ def predict(clock: PPGAgeClock, pool: Pool, idx: np.ndarray, batch_size: int, de
             chunk = idx[start:start + batch_size]
             x = torch.from_numpy(np.stack([pool.window(int(i)) for i in chunk])).to(dev)
             preds.append(clock(x).float().cpu().numpy())
-    clock.train()
+    for m, mode in modes.items():
+        m.train(mode)
     flat = np.concatenate(preds) if preds else np.zeros(0)
     return per_subject(pool.subject[idx], flat, pool.age[idx])
 

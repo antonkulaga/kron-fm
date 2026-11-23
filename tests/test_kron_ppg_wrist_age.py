@@ -102,3 +102,50 @@ def test_lowpass_keeps_slow_and_removes_fast_components():
     slow, fast = np.sin(2 * np.pi * 1.2 * t), np.sin(2 * np.pi * 7.0 * t)
     out = lowpass(np.stack([slow + fast]), fs, 5.0)[0]
     np.testing.assert_allclose(out, slow, atol=1e-4)
+
+
+def test_a_cached_run_refuses_another_band_or_encoder(tmp_path):
+    """people.npz is reused only for what made it: another band into the same --out is refused."""
+    import pytest
+
+    from kron_ppg.wrist_age import run
+    from test_kron_ppg_wrist_probe import tiny_variant
+
+    folder = tiny_variant(tmp_path / "tiny")
+    out = tmp_path / "run"
+    run([folder], None, out, cap=8, folds=4, repeats=1, null=0)
+    run([folder], None, out, cap=8, folds=4, repeats=1, null=0)  # the same inputs: the cache is reused
+    with pytest.raises(ValueError, match="another --out"):
+        run([folder], None, out, cap=8, folds=4, repeats=1, null=0, cutoff=5.0)
+
+
+def test_a_subject_listed_twice_with_two_ages_is_refused():
+    import pytest
+
+    from kron_ppg.data import _subject_frame
+
+    same = {"subject": "a", "age": "50"}
+    assert _subject_frame([same, dict(same)]).height == 1
+    with pytest.raises(ValueError, match="listed twice"):
+        _subject_frame([same, {"subject": "a", "age": "52"}])
+
+
+def test_predict_keeps_a_frozen_encoder_in_eval_mode(device):
+    from kron_ppg.model import PPGAgeClock
+    from kron_ppg.train import predict
+    from test_kron_ppg_model import SMALL
+
+    class _Pool:
+        sample_rate = 25.0
+        subject = np.array(["a", "a"])
+        age = np.array([40.0, 40.0])
+
+        def window(self, i):
+            return np.zeros(int(25 * 8), np.float32)
+
+    enc = KronPPG(KronPPGConfig(**SMALL))
+    clock = PPGAgeClock(enc).to(device)
+    clock.train()
+    enc.eval()  # frozen
+    predict(clock, _Pool(), np.arange(2), 2, torch.device(device))
+    assert clock.training and not enc.training

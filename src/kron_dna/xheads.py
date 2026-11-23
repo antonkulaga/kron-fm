@@ -38,7 +38,9 @@ def read_rows(mm, a: int, b: int) -> np.ndarray:
     (the trainer measured F at 342 GB RssFile, 17 of 20 s in the kernel per step, at 15 s/step instead of 2.8). The
     page cache serves both alike. Anything that is not a file-backed ``np.memmap`` (a test's stand-in) is sliced."""
     fn = getattr(mm, "filename", None)
-    if not isinstance(mm, np.memmap) or fn is None:
+    # an ndarray memmap only: a test's recording stand-in (not an ndarray, even where it replaces np.memmap) keeps
+    # its reads going through its own __getitem__
+    if not (isinstance(mm, np.ndarray) and isinstance(mm, np.memmap)) or fn is None:
         return np.asarray(mm[a:b])
     b = min(b, mm.shape[0])
     if b <= a:

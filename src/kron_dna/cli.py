@@ -1719,9 +1719,9 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                 if g_.name in x_species:             # its windows start on the head stores' grid, as the primary's
                     at, take = on_grid(at, take, r["offset"], r["len"])
                 codes = np.full(wrow, 4, dtype=np.int64)
-                codes[:take] = g_.bases[at:at + take]
+                codes[:take] = XH.read_rows(g_.bases, at, at + take)          # pread, not the mapping
                 if force_genome is None and g_.name in x_gsplit:   # training rows: its held-out bases (orthologs of
-                    codes[:take][x_gsplit[g_.name][at:at + take] == 4] = 4   # the primary's held-out) read as N: no
+                    codes[:take][XH.read_rows(x_gsplit[g_.name], at, at + take) == 4] = 4   # the primary's held-out) read as N: no
                     # input, no masked-base target, no label - as if cut out; its held-out draws keep them for scoring
                 ctxs.append(int(g_.context))
                 rsrc, rsel = rep_genome[fg], slice(at, at + take)
@@ -1768,7 +1768,7 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                 at = int(gen.integers(lo, max(lo, hi) + 1))
                 at, take = on_grid(at, take, c_off, c_len)
                 codes = np.full(wrow, 4, dtype=np.int64)
-                codes[:take] = bases[at:at + take]
+                codes[:take] = XH.read_rows(bases, at, at + take)
                 ctxs.append(0)                                            # nuclear (context 0)
                 rsrc, rsel = rep_main, slice(at, at + take)
             else:
@@ -1779,7 +1779,7 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                 at = r["offset"] + int(gen.integers(0, r["len"] - take + 1))
                 at, take = on_grid(at, take, r["offset"], r["len"])
                 codes = np.full(wrow, 4, dtype=np.int64)
-                codes[:take] = bases[at:at + take]
+                codes[:take] = XH.read_rows(bases, at, at + take)
                 ctxs.append(0)                                            # nuclear (context 0)
                 rsrc, rsel = rep_main, slice(at, at + take)
             flip_row = flip and gen.random() < 0.5
@@ -1788,7 +1788,7 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
             if rep:                                  # a repeat is a repeat on either strand: reversed, not swapped
                 r_ = np.zeros(wrow, dtype=np.uint8)
                 if rep_rng.random() >= repeat_channel_drop and rsrc is not None:
-                    r_[:take] = rsrc[rsel]
+                    r_[:take] = (XH.read_rows(rsrc, rsel.start, rsel.stop) if isinstance(rsel, slice) else rsrc[rsel])
                     if flip_row:
                         r_[:take] = r_[:take][::-1].copy()
                 rep_rows.append(r_)
@@ -1807,21 +1807,21 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                 sp_ = np.zeros(wrow, dtype=np.uint8)
                 cm_ = np.zeros(len(ntv3["ids"]), dtype=bool)              # the channels this window can train
                 if xs is not None:
-                    nt[:take, e_["lo"]:e_["hi"]] = e_["dense"][at:at + take]
+                    nt[:take, e_["lo"]:e_["hi"]] = XH.read_rows(e_["dense"], at, at + take)   # pread, not the mapping
                     sp_[:take] = e_["split"][at:at + take]
                     cm_[e_["lo"]:e_["hi"]] = True
                 elif not from_mito and fg is None:                        # organelle windows have no nuclear tracks
                     n_h = ntv3["n_h"]
                     if ntv3["dense"] is not None:
-                        nt[:take, :n_h] = ntv3["dense"][at:at + take][:, ntv3["cols"]]
+                        nt[:take, :n_h] = XH.read_rows(ntv3["dense"], at, at + take)[:, ntv3["cols"]]   # pread
                     else:
                         for k_, arr_ in enumerate(ntv3["arrs"]):
                             nt[:take, k_] = arr_[at:at + take]
-                    sp_[:take] = ntv3["split"][at:at + take]
+                    sp_[:take] = XH.read_rows(ntv3["split"], at, at + take)
                     cm_[:n_h] = True
                 elif fg is not None and genomes[fg].name in x_species:   # a further genome with head stores: its
                     if genomes[fg].name in x_gsplit:                     # per-base split (orthologs held out), else
-                        sp_[:take] = x_gsplit[genomes[fg].name][at:at + take]
+                        sp_[:take] = XH.read_rows(x_gsplit[genomes[fg].name], at, at + take)
                     else:                                                # its held-out draw / training contigs
                         sp_[:take] = 4 if force_genome is not None else 1
                 if flip_row and (xs is not None or not from_mito):        # reverse AND swap the strand partners
@@ -1843,12 +1843,12 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                 g_row = genomes[fg].name if fg is not None else None
                 sp_ = np.zeros(wrow, dtype=np.uint8)
                 if primary_:
-                    sp_[:take] = xsplit[at:at + take]
+                    sp_[:take] = XH.read_rows(xsplit, at, at + take)
                     if flip_row:
                         sp_[:take] = sp_[:take][::-1]
                 elif fg is not None and g_row in x_species:
                     if g_row in x_gsplit:
-                        sp_[:take] = x_gsplit[g_row][at:at + take]
+                        sp_[:take] = XH.read_rows(x_gsplit[g_row], at, at + take)
                         if flip_row:
                             sp_[:take] = sp_[:take][::-1]
                     else:
