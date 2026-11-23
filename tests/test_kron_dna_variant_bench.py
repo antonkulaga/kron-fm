@@ -114,3 +114,11 @@ def test_score_merge_and_asb_report(genomes, tmp_path, monkeypatch, device):
     assert res.exit_code == 0, res.output + repr(res.exception)
     rm = next(r for r in json.loads((out / "report_mpra.json").read_text()) if r["label"] == "m")
     assert rm["variants"] == n - 1 and -1 <= rm["spearman_all"] <= 1 and rm["own_channels"] == 0
+    # the eQTL report: the same sites as a positive/negative table read at "the TSS" (here each variant's position)
+    eq = t.select("chrom", "ref", "alt", "held_out", position="pos", tss="pos").with_row_index("k").with_columns(
+        label=(pl.col("k") % 2).cast(pl.Int32), pair=(pl.col("k") // 2).cast(pl.Int64), strand=pl.lit("+"),
+        distance=pl.col("k").cast(pl.Int64) * 100).drop("k")
+    eq.write_parquet(tmp_path / "eqtl.parquet")
+    res = run("report-eqtl", out, "--variants", tmp_path / "eqtl.parquet", "--n-boot", 5)
+    assert res.exit_code == 0, res.output + repr(res.exception)
+    assert (out / "report_eqtl.json").exists()

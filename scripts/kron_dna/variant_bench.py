@@ -6,6 +6,7 @@ binding benchmark (ADASTRA, ``prep_asb.py``) and any table of the same shape (MP
         [--batch 1] [--dtype bf16|fp16|fp32] [--shard i/n] [--chunk 131072]
     uv run python scripts/kron_dna/variant_bench.py merge OUT LABEL --shards n       (after every --shard i/n)
     uv run python scripts/kron_dna/variant_bench.py report-asb OUT [--variants T.parquet]
+    uv run python scripts/kron_dna/variant_bench.py report-mpra OUT | report-eqtl OUT
 
 ``score``: the table's distinct sites (``chrom``, ``pos`` 0-based, ``ref``, ``alt``, and the read position: ``pos``,
 or ``--read-col``, e.g. a gene's TSS). One window of ``--context`` bases per site, centred between the variant and
@@ -71,6 +72,8 @@ def with_alt(seq: np.ndarray, at: int, ref: str, alt: str) -> np.ndarray | None:
 
 def sites_of(variants: Path, where: str, read_col: str, max_variants: int, seed: int) -> pl.DataFrame:
     t = pl.read_parquet(variants)
+    if "pos" not in t.columns and "position" in t.columns:      # prep_eqtl_finemap.py's name for it
+        t = t.rename({"position": "pos"})
     if where:
         t = t.filter(pl.sql_expr(where))
     t = t.with_columns(read=pl.col(read_col).cast(pl.Int64) if read_col else pl.col("pos"))
@@ -373,6 +376,56 @@ def report_mpra(out: Path, variants: Path = typer.Option(None, help="prep_mpra_s
                   for r in per]
     (out / "report_mpra.json").write_text(json.dumps(table, indent=1))
     typer.echo("\n".join(lines))
+
+
+# ------------------------------------------------------------------------------------------------ the eQTL report
+
+@app.command("report-eqtl")
+def report_eqtl(out: Path, variants: Path = typer.Option(None, help="prep_eqtl_finemap.py's table (default: the one "
+                                                                    "scored)"), n_boot: int = 200) -> None:
+    """Fine-mapped eQTLs (``label`` 1) against their matched negatives (0), scored with ``--read-col tss`` on the
+    RNA head: a variant's score is the mean over the gene strand's channels of ``|log2((alt + 1) / (ref + 1))|`` at
+    the TSS (unsigned: the table has no direction). AUROC, average precision, and the share of pairs whose positive
+    outscores its negative; chr8/chr9 apart; distance to the TSS as the baseline (matched, so near chance)."""
+    lines, table = [], []
+    for d in sorted((out / "pred").iterdir()):
+        if not (d / "index.json").exists():
+            continue
+        info = json.loads((d / "index.json").read_text())
+        t = pl.read_parquet(variants or Path(info["variants"]))
+        t = t.rename({"position": "pos"}) if "pos" not in t.columns else t
+        sites = pl.read_parquet(d / "sites.parquet").with_row_index("at")
+        mag = np.abs(np.log2((np.load(d / "alt.npy") + EPS) / (np.load(d / "ref.npy") + EPS)))
+        ids = info["ids"]
+        by = {"+": [k for k, c in enumerate(ids) if c.endswith("_P")], "-": [k for k, c in enumerate(ids) if c.endswith("_M")]}
+        t = t.join(sites.select("chrom", "pos", "ref", "alt", "at", tss="read"), on=["chrom", "pos", "ref", "alt", "tss"])
+        score = np.array([mag[a, by[s] or slice(None)].mean() for a, s in zip(t["at"].to_numpy(), t["strand"].to_list())])
+        t = t.with_columns(score=pl.Series(score))
+        for nm, s in (("all", t), ("chr8/chr9 (held out)", t.filter("held_out")), ("other chromosomes", t.filter(~pl.col("held_out"))),
+                      ("within 10 kb of the TSS", t.filter(pl.col("distance").abs() <= 10_000)),
+                      ("beyond 10 kb", t.filter(pl.col("distance").abs() > 10_000))):
+            y = (s["label"] == 1).to_numpy()
+            if y.sum() < 10 or (~y).sum() < 10:
+                continue
+            v, dist = s["score"].to_numpy(), -np.abs(s["distance"].to_numpy()).astype(float)
+            pr = s.group_by("pair").agg(p=pl.col("score").filter(pl.col("label") == 1).max(),
+                                        q=pl.col("score").filter(pl.col("label") == 0).max()).drop_nulls()
+            row = dict(label=d.name, head=info["head"], context=info["context"], subset=nm, variants=s.height,
+                       positives=int(y.sum()), auroc=auroc(v, y), auroc_ci=ci(lambda i: auroc(v[i], y[i]), len(y), n_boot),
+                       ap=ap(v, y), chance=float(y.mean()), distance_auroc=auroc(dist, y), pairs=pr.height,
+                       pair_wins=float(((pr["p"] > pr["q"]).sum() + 0.5 * (pr["p"] == pr["q"]).sum()) / max(pr.height, 1)))
+            table.append(row)
+            lines.append(f"{d.name:20s} {nm:26s} n={s.height:6d} pos={row['positives']:5d} auroc={row['auroc']:.3f}"
+                         f"[{row['auroc_ci'][0]:.3f},{row['auroc_ci'][1]:.3f}] ap={row['ap']:.3f} (chance {row['chance']:.3f}) "
+                         f"pair wins={row['pair_wins']:.3f} of {pr.height} distance auroc={row['distance_auroc']:.3f}")
+    (out / "report_eqtl.json").write_text(json.dumps(table, indent=1))
+    typer.echo("\n".join(lines))
+
+
+def ap(score: np.ndarray, y: np.ndarray) -> float:
+    o = np.argsort(-score, kind="stable")
+    y = y[o].astype(np.float64)
+    return float((np.cumsum(y) / np.arange(1, len(y) + 1) * y).sum() / y.sum()) if y.sum() else float("nan")
 
 
 if __name__ == "__main__":
