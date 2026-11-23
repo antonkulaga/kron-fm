@@ -119,6 +119,8 @@ def score(bench: Path, checkpoints: list[str] = typer.Argument(..., help="LABEL=
           dnase_head: str = "dnase", splice_head: str = "splice", name: str = "hg38", device: str = "cuda",
           limit: int = typer.Option(0, help="the first N windows only (a smoke run; the label gets a suffix)"),
           dtype: str = typer.Option("bf16", help="bf16 | fp16 | fp32 (bf16 is emulated, slow, on Turing cards)"),
+          chunk: int = typer.Option(0, help="bases per encoder chunk (memory cap: e.g. 131072 runs a 1 Mb context "
+                                            "on an 11 GB card; 0: the whole window at once)"),
           shard: str = typer.Option("", help="i/n: windows k % n == i only, under BENCH/shards/; then merge")) -> None:
     """KronGenome's further heads on every window: predictions in the benchmark's form, under pred/<label>/."""
     sh = EK.parse_shard(shard)
@@ -153,6 +155,8 @@ def score(bench: Path, checkpoints: list[str] = typer.Argument(..., help="LABEL=
             got = rec.get(h, {})
             if got.get("ids") is not None and list(got["ids"]) != list(st["ids"]):
                 raise typer.BadParameter(f"{label}: head {h} was trained on channels {got['ids']}, the targets are {st['ids']}")
+        if chunk and not EK.capped_ok(model):
+            raise typer.BadParameter(f"{label}: --chunk needs a v2/v2l core without learned chunking")
         model = model.to(dev).eval()
         model.x_active = {dnase_head, splice_head}
         model.x_span = (flank, flank + WIN)                           # the heads run on the window only, as in training
@@ -168,7 +172,10 @@ def score(bench: Path, checkpoints: list[str] = typer.Argument(..., help="LABEL=
             seg = torch.zeros(1, context // unit, dtype=torch.long, device=dev)
             ctx = torch.zeros(1, dtype=torch.long, device=dev) if model.config.n_contexts > 0 else None
             with torch.no_grad(), EK.autocast(dev, dtype):
-                model(seq[None], seg, ctx)
+                if chunk:
+                    EK.forward_capped(model, seq, ctx, (flank, flank + WIN), chunk)
+                else:
+                    model(seq[None], seg, ctx)
             assert model.last_x_at == (flank, flank + WIN), model.last_x_at
             pd = model.last_x[dnase_head][0].float()[:, :len(ds.ids)]  # [WIN, 13]: the primary channels come first
                                                                           # (a head with --xhead-species has more)
@@ -182,7 +189,7 @@ def score(bench: Path, checkpoints: list[str] = typer.Argument(..., help="LABEL=
         np.save(out / "splice.npy", sp)
         (out / "index.json").write_text(json.dumps(dict(
             label=label, source=str(where), kind="KronGenome", step=int(state.get("step", -1)), context=context,
-            windows=rows, dtype=dtype, shard=list(sh) if sh[1] > 1 else None, xhead_kind=model.config.xhead_kind,
+            windows=rows, dtype=dtype, chunk=chunk, shard=list(sh) if sh[1] > 1 else None, xhead_kind=model.config.xhead_kind,
             xhead_layers=model.config.xhead_layers, n_layers=model.config.n_layers,
             commit=((state.get("run_record") or {}).get("source") or {}).get("commit"),
             seconds=round(time.time() - t0, 1), heads_run_on="the window's 131,072 bases (x_span), trunk on the whole context"),

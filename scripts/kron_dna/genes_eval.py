@@ -5,6 +5,7 @@ validation set: a species in no training genome, an older and a newer annotation
     uv run python scripts/kron_dna/genes_eval.py score OUT --name dmel_r6 --labels old=STORE --labels new=STORE \
         LABEL=CHECKPOINT [--dtype bf16|fp16|fp32] [--shard i/n]
     uv run python scripts/kron_dna/genes_eval.py merge OUT LABEL --shards n --labels old=STORE --labels new=STORE
+    uv run python scripts/kron_dna/genes_eval.py rescore OUT LABEL --labels old=STORE ...   (from saved logits, no card)
 
 For each window the model reads 1,048,576 bases centred on it; its ``genes`` head runs on the window's 131,072 bases
 (as ``splice_zeroshot.py``). Per annotation and channel (tss, polya, utr5, cds, utr3, ncexon, intron; per strand):
@@ -22,6 +23,7 @@ Writes ``OUT/<label>.genes.json`` with all of it and ``OUT/<label>.genes.npy`` (
 """
 from __future__ import annotations
 
+import bisect
 import importlib.util
 import json
 import time
@@ -61,12 +63,44 @@ def runs(x: np.ndarray) -> set:
     return out
 
 
-def exon_f1(call: np.ndarray, lab: np.ndarray) -> dict:
+def exon_f1(call: np.ndarray, lab: np.ndarray, tol: int = 0) -> dict:
     """Tiberius's exon level for CDS exons: a predicted exon (a run of CDS calls on one strand) is right only if an
-    annotated one (a run of CDS labels; isoforms pooled) has exactly its two ends."""
+    annotated one (a run of CDS labels; isoforms pooled) has exactly its two ends. ``tol`` > 0: both ends within
+    ``tol`` bases; precision counts the predicted exons with such a partner, recall the annotated ones."""
     p, t = runs(call), runs(lab)
-    tp = len(p & t)
-    return dict(f1=f1(tp, len(p) - tp, len(t) - tp), predicted=len(p), annotated=len(t), exact=tp)
+    if not tol:
+        tp = len(p & t)
+        return dict(f1=f1(tp, len(p) - tp, len(t) - tp), predicted=len(p), annotated=len(t), exact=tp)
+    hit_p, hit_t = near(p, t, tol), near(t, p, tol)
+    prec, rec = hit_p / max(len(p), 1), hit_t / max(len(t), 1)
+    return dict(f1=float(2 * prec * rec / max(prec + rec, 1e-12)), predicted=len(p), annotated=len(t),
+                matched_predicted=hit_p, matched_annotated=hit_t, tol=tol)
+
+
+def near(a: set, b: set, tol: int) -> int:
+    """How many runs of ``a`` have a run of ``b`` (same window) with both ends within ``tol`` bases."""
+    by = {}
+    for w, x, y in b:
+        by.setdefault(w, []).append((x, y))
+    for w in by:
+        by[w].sort()
+    n = 0
+    for w, x, y in a:
+        lst = by.get(w, [])
+        i = bisect.bisect_left(lst, (x - tol, -1))
+        while i < len(lst) and lst[i][0] <= x + tol:
+            if abs(lst[i][1] - y) <= tol:
+                n += 1
+                break
+            i += 1
+    return n
+
+
+def smooth(call: np.ndarray, gap: int = 20, short: int = 30) -> np.ndarray:
+    """``[n, L]`` calls with gaps of up to ``gap`` bases closed and runs under ``short`` bases dropped: the least
+    decoding that turns per-base calls into exons (no gene model; Tiberius and Helixer decode with an HMM)."""
+    from scipy.ndimage import binary_closing, binary_opening
+    return np.stack([binary_opening(binary_closing(c, np.ones(gap + 1, bool)), np.ones(short, bool)) for c in call])
 
 
 @app.command()
@@ -75,6 +109,8 @@ def score(out: Path, checkpoints: list[str] = typer.Argument(..., help="LABEL=CH
           windows_csv: Path = typer.Option(None, "--windows"), head: str = "genes", context: int = 1048576,
           device: str = "cuda",
           dtype: str = typer.Option("bf16", help="bf16 | fp16 | fp32 (bf16 is emulated, slow, on Turing cards)"),
+          chunk: int = typer.Option(0, help="bases per encoder chunk (memory cap: e.g. 131072 runs a 1 Mb context "
+                                            "on an 11 GB card; 0: the whole window at once)"),
           shard: str = typer.Option("", help="i/n: windows k % n == i only, written under OUT/shards/; then merge")
           ) -> None:
     sh = EK.parse_shard(shard)
@@ -91,6 +127,8 @@ def score(out: Path, checkpoints: list[str] = typer.Argument(..., help="LABEL=CH
         heads = [h[0] for h in model.config.xheads]
         if head not in heads:
             raise typer.BadParameter(f"{label}: no head {head!r} ({heads})")
+        if chunk and not EK.capped_ok(model):
+            raise typer.BadParameter(f"{label}: --chunk needs a v2/v2l core without learned chunking")
         model = model.to(dev).eval()
         model.x_active, model.x_span = {head}, (flank, flank + WIN)
         unit = 2 ** model.config.n_down
@@ -102,9 +140,13 @@ def score(out: Path, checkpoints: list[str] = typer.Argument(..., help="LABEL=CH
             seg = torch.zeros(1, context // unit, dtype=torch.long, device=dev)
             ctx = torch.zeros(1, dtype=torch.long, device=dev) if model.config.n_contexts > 0 else None
             with torch.no_grad(), EK.autocast(dev, dtype):
-                model(seq[None], seg, ctx)
+                if chunk:
+                    EK.forward_capped(model, seq, ctx, (flank, flank + WIN), chunk)
+                else:
+                    model(seq[None], seg, ctx)
             pred[j] = model.last_x[head][0][:, :len(ids)].float().clamp(-6e4, 6e4).cpu().numpy().astype(np.float16)
         info = dict(label=label, checkpoint=str(where), step=int(state.get("step", -1)), genome=name, dtype=dtype,
+                    context=context, chunk=chunk,
                     n_windows=win.height, seconds=round(time.time() - t0, 1))
         del model
         if dev.type == "cuda":
@@ -159,6 +201,17 @@ def merge(out: Path, label: str, shards: int = typer.Option(..., help="n, as in 
     finish(out, dict(infos[0], seconds=sum(i["seconds"] for i in infos), shards=shards), pred, lab, ids)
 
 
+@app.command()
+def rescore(out: Path, label: str, labels: list[str] = typer.Option(..., help="TAG=STORE, as given to score"),
+            windows_csv: Path = typer.Option(None, "--windows")) -> None:
+    """Every metric again from the saved logits (OUT/LABEL.genes.npy) and labels: no card."""
+    win = pl.read_csv(windows_csv or out / "windows.csv")
+    info = json.loads((out / f"{label}.genes.json").read_text())
+    info = {k: v for k, v in info.items() if k not in ("annotations", "disagreement")}
+    lab, ids = labels_of(labels, win)
+    finish(out, info, np.load(out / f"{label}.genes.npy"), lab, ids)
+
+
 def finish(out: Path, info: dict, pred: np.ndarray, lab: dict, ids: list[str]) -> None:
     """Every metric from the logits ``pred`` [windows, WIN, channels] against each annotation's labels."""
     label = info["label"]
@@ -167,6 +220,7 @@ def finish(out: Path, info: dict, pred: np.ndarray, lab: dict, ids: list[str]) -
     out.mkdir(parents=True, exist_ok=True)
     np.save(out / f"{label}.genes.npy", pred)         # the logits, so later metrics need no card
     call = pred > 0
+    sm_cds = {st: smooth(call[..., ids.index(f"cds_{st}")]) for st in ("plus", "minus")}
     res = dict(info, annotations={})
     for t, y in lab.items():
         per = {}
@@ -185,7 +239,21 @@ def finish(out: Path, info: dict, pred: np.ndarray, lab: dict, ids: list[str]) -
         tp_ = sum(v["exact"] for v in ex.values())
         summ["cds_exon_f1"] = f1(tp_, sum(v["predicted"] for v in ex.values()) - tp_,
                                  sum(v["annotated"] for v in ex.values()) - tp_)
-        res["annotations"][t] = dict(channels=per, cds_exons=ex, **summ)
+        variants = {}                                # the same exons after smoothing, and with ends within 10 bp
+        for nm, sm, tol in (("smoothed", True, 0), ("within10", False, 10), ("smoothed_within10", True, 10)):
+            per_st = {st: exon_f1(sm_cds[st] if sm else call[..., ids.index(f"cds_{st}")],
+                                  y[..., ids.index(f"cds_{st}")], tol) for st in ("plus", "minus")}
+            if tol:
+                P_, T_ = (sum(v[k] for v in per_st.values()) for k in ("predicted", "annotated"))
+                mp, ma = (sum(v[k] for v in per_st.values()) for k in ("matched_predicted", "matched_annotated"))
+                pr, rc = mp / max(P_, 1), ma / max(T_, 1)
+                variants[nm] = dict(f1=float(2 * pr * rc / max(pr + rc, 1e-12)), per_strand=per_st)
+            else:
+                tp2 = sum(v["exact"] for v in per_st.values())
+                variants[nm] = dict(f1=f1(tp2, sum(v["predicted"] for v in per_st.values()) - tp2,
+                                          sum(v["annotated"] for v in per_st.values()) - tp2), per_strand=per_st)
+            summ[f"cds_exon_f1_{nm}"] = variants[nm]["f1"]
+        res["annotations"][t] = dict(channels=per, cds_exons=ex, cds_exon_variants=variants, **summ)
     tags = list(lab)
     if len(tags) == 2:                           # where the two annotations disagree: whose side the head takes
         a, b = tags
@@ -203,7 +271,8 @@ def finish(out: Path, info: dict, pred: np.ndarray, lab: dict, ids: list[str]) -
     for t in tags:
         an = res["annotations"][t]
         typer.echo(f"{label} vs {t}: Genic F1 {an['genic_f1']:.3f}, Subgenic F1 {an['subgenic_f1']:.3f}, "
-                   f"CDS exon F1 {an['cds_exon_f1']:.3f}; AP "
+                   f"CDS exon F1 {an['cds_exon_f1']:.3f} (smoothed {an['cds_exon_f1_smoothed']:.3f}, ±10 bp "
+                   f"{an['cds_exon_f1_within10']:.3f}, both {an['cds_exon_f1_smoothed_within10']:.3f}); AP "
                    + ", ".join(f"{i} {v['ap']:.2f}" for i, v in an["channels"].items() if i.endswith("_plus")))
     if "disagreement" in res:
         for i, v in res["disagreement"].items():

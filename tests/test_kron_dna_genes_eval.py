@@ -62,10 +62,14 @@ def test_genes_eval_scores_two_annotations(tmp_path, monkeypatch):
     SZ.windows(out, name="toy", n=2, seed=0, context=131072, chroms="", keep=None, max_n=0.0)
     labs = [f"old={tmp_path / 'old'}", f"new={tmp_path / 'new'}"]
     GE.score(out, [f"m={tmp_path / 'ck.pt'}"], name="toy", labels=labs,
-             windows_csv=None, head="genes", context=131072, device="cpu", dtype="bf16", shard="")
+             windows_csv=None, head="genes", context=131072, device="cpu", dtype="bf16", shard="", chunk=0)
+    GE.score(out, [f"c={tmp_path / 'ck.pt'}"], name="toy", labels=labs,      # the memory cap: the same logits
+             windows_csv=None, head="genes", context=131072, device="cpu", dtype="bf16", shard="", chunk=16384)
+    assert np.allclose(np.load(out / "c.genes.npy").astype(np.float32), np.load(out / "m.genes.npy").astype(np.float32),
+                       rtol=1e-2, atol=1e-2)
     for i in (0, 1):                                    # the same in two shards, merged: the same logits and metrics
         GE.score(out, [f"s={tmp_path / 'ck.pt'}"], name="toy", labels=labs, windows_csv=None, head="genes",
-                 context=131072, device="cpu", dtype="fp32", shard=f"{i}/2")
+                 context=131072, device="cpu", dtype="fp32", shard=f"{i}/2", chunk=0)
     assert not (out / "s.genes.json").exists()
     GE.merge(out, "s", shards=2, labels=labs, windows_csv=None)
     assert np.array_equal(np.load(out / "s.genes.npy"), np.load(out / "m.genes.npy"))
