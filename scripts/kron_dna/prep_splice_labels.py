@@ -103,8 +103,11 @@ def main(out: Path, name: str = "hg38", gtf: Path = typer.Option(None)) -> None:
             share = {"AG": float(((two[:, 0] == code["A"]) & (two[:, 1] == code["G"])).mean())}
         check[key] = dict(sites=int(len(at)), **share)
         typer.echo(f"{key}: {len(at):,} sites, " + ", ".join(f"{k} {v:.4f}" for k, v in share.items()))
+    placed = float(ok.sum()) / max(len(ok), 1)
+    if placed < 0.5:        # chromosome names that do not match the layout place nothing: refuse, never pass empty
+        raise typer.Exit(f"only {placed:.1%} of {len(ok):,} introns lie on the layout: chromosome names or genome wrong")
     worst = min(min(check[k].get("GT", 1.0) + check[k].get("GC", 0.0), check[k].get("AG", 1.0)) for k in check)
-    if worst < 0.9:
+    if not worst >= 0.9:    # NaN (no site of a class) fails too
         raise typer.Exit(f"the canonical motif share is {worst:.3f} for one site class: offsets or strands are wrong")
 
     out.mkdir(parents=True, exist_ok=True)

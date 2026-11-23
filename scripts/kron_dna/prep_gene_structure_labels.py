@@ -188,8 +188,13 @@ def main(out: Path, name: str = typer.Option(...), gtf: Path = typer.Option(...)
         check["start_ATG"] = float(((codon[:, 0] == CODE["A"]) & (codon[:, 1] == CODE["T"])
                                     & (codon[:, 2] == CODE["G"])).mean())
     typer.echo(f"checks: {check}")
+    placed = check["introns_checked"] / max(check["introns"], 1)
+    if placed < 0.5 or not sum(counts.values()):  # names that do not match the layout place nothing: never pass empty
+        part.unlink()
+        raise typer.Exit(f"only {placed:.1%} of {check['introns']:,} introns lie on the layout: chromosome names "
+                         "(--chrom-prefix?) or genome wrong")
     worst = min(check["donor_GT"] + check["donor_GC"], check["acceptor_AG"], check.get("start_ATG", 1.0))
-    if worst < 0.85:
+    if not worst >= 0.85:                         # NaN fails too
         part.unlink()
         raise typer.Exit(f"a canonical motif share is {worst:.3f}: offsets or strands are wrong")
     os.replace(part, out / "labels.u16")
