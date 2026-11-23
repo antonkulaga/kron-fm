@@ -66,7 +66,7 @@ def run(tmp_path, monkeypatch, shift=0):
     g, gtf = build(tmp_path, shift)
     monkeypatch.setattr(GS, "interim_dir", lambda *a: g)
     out = tmp_path / "labels"
-    GS.main(out, name="toy", gtf=gtf, basic_only=False, chrom_prefix="")
+    GS.main(out, name="toy", gtf=gtf, basic_only=False, chrom_prefix="", source="")
     return out
 
 
@@ -114,7 +114,7 @@ def test_a_gff3_gives_the_same_labels(tmp_path, monkeypatch):
     gff = tmp_path / "gff" / "toy.gff3"
     gff.write_text("##gff-version 3\n" + "\n".join(lines) + "\n")
     monkeypatch.setattr(GS, "interim_dir", lambda *a: g)
-    GS.main(tmp_path / "gff" / "labels", name="toy", gtf=gff, basic_only=False, chrom_prefix="")
+    GS.main(tmp_path / "gff" / "labels", name="toy", gtf=gff, basic_only=False, chrom_prefix="", source="")
     a = np.fromfile(out / "labels.u16", dtype=np.uint16)
     b = np.fromfile(tmp_path / "gff" / "labels" / "labels.u16", dtype=np.uint16)
     assert np.array_equal(a, b) and a.any()
@@ -127,5 +127,5 @@ def test_chromosome_names_that_match_nothing_are_refused(tmp_path, monkeypatch):
     pl.read_parquet(g / "contigs.parquet").with_columns(chrom=pl.lit("chr1")).write_parquet(g / "contigs.parquet")
     monkeypatch.setattr(GS, "interim_dir", lambda *a: g)
     with pytest.raises(typer.Exit):
-        GS.main(tmp_path / "labels", name="toy", gtf=gtf, basic_only=False, chrom_prefix="")
+        GS.main(tmp_path / "labels", name="toy", gtf=gtf, basic_only=False, chrom_prefix="", source="")
     assert not (tmp_path / "labels" / "labels.u16").exists() and not (tmp_path / "labels" / "labels.json").exists()
