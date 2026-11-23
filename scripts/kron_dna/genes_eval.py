@@ -18,7 +18,15 @@ For each window the model reads 1,048,576 bases centred on it; its ``genes`` hea
 - where two annotations disagree on a base and channel, the share of those bases on which the head's call agrees
   with each of them (the newer annotation is the better one; does the head side with it).
 
-Writes ``OUT/<label>.genes.json`` with all of it and ``OUT/<label>.genes.npy`` (the logits, float16
+- the same exon level after decoding, since per-base calls are fragmented and their ends not base-exact (Tiberius
+  and Helixer decode with an HMM): calls smoothed (gaps to 20 bases closed, runs under 30 dropped); ends within 10
+  bases; **snapped**: each end of a smoothed exon moved to the splice head's strongest donor or acceptor site
+  within 48 bases; and **paired**: an exon between two of the splice head's sites (the low-end and high-end kind
+  of its strand, up to 3 kb apart) when the mean CDS probability between them is at least 0.5, internal coding
+  exons only. Both scored with exact ends; paired is the number to set beside Tiberius's.
+
+Writes ``OUT/<label>.splice.npy`` (the splice head's logits, float16 ``[windows, 131072, 4]``),
+``OUT/<label>.genes.json`` with all of it and ``OUT/<label>.genes.npy`` (the logits, float16
 ``[windows, 131072, 14]``, so a later metric needs no card), and prints the summary.
 """
 from __future__ import annotations
@@ -96,6 +104,54 @@ def near(a: set, b: set, tol: int) -> int:
     return n
 
 
+SITES = {"plus": (1, 0), "minus": (2, 3)}        # splice channels at an exon's low and high end: acceptor/donor +,
+                                                 # donor/acceptor - (channels: donor +, acceptor +, donor -, acceptor -)
+
+
+def snap(cds: np.ndarray, splice: np.ndarray, strand: str, reach: int = 48, thr: float = 0.0) -> set:
+    """Exons ``{(window, start, end)}`` from smoothed CDS calls ``[n, L]`` of one strand, each end moved to the
+    splice head's strongest site of the right kind within ``reach`` bases (logit above ``thr``), where there is one:
+    an exon ``[a, b)`` begins one base after the site at its low end (the acceptor on +, the donor on -: the
+    intron's last or first base) and ends on the site at its high end (the donor on +, the acceptor on -). An end
+    with no site near keeps the call's (a first or last coding exon ends at a codon, not a splice site). The least
+    decoder that gives exact ends; no gene model, no reading frame."""
+    lo_ch, hi_ch = SITES[strand]
+    out, L = set(), cds.shape[1]
+    for w, a, b in runs(cds):
+        s_lo = splice[w, max(a - 1 - reach, 0):min(a - 1 + reach + 1, L), lo_ch].astype(np.float32)
+        s_hi = splice[w, max(b - reach, 0):min(b + reach + 1, L), hi_ch].astype(np.float32)
+        a2 = max(a - 1 - reach, 0) + int(s_lo.argmax()) + 1 if s_lo.size and s_lo.max() > thr else a
+        b2 = max(b - reach, 0) + int(s_hi.argmax()) if s_hi.size and s_hi.max() > thr else b
+        if b2 > a2:
+            out.add((w, a2, b2))
+    return out
+
+
+def pair_exons(logit: np.ndarray, splice: np.ndarray, strand: str, cover: float = 0.5, longest: int = 3000,
+               thr: float = 0.0) -> set:
+    """Exons ``{(window, start, end)}`` between the splice head's sites: for every site at an exon's low end (logit
+    above ``thr``), the site at a high end within ``longest`` bases whose stretch between them has the highest mean
+    CDS probability, if that is at least ``cover``. Internal coding exons only (a first or last one ends at a codon);
+    exact ends by construction."""
+    lo_ch, hi_ch = SITES[strand]
+    prob = 1 / (1 + np.exp(-logit.astype(np.float32)))
+    out = set()
+    for w in range(prob.shape[0]):
+        cs = np.concatenate([[0.0], np.cumsum(prob[w], dtype=np.float64)])
+        los = np.flatnonzero(splice[w, :, lo_ch] > thr) + 1
+        his = np.flatnonzero(splice[w, :, hi_ch] > thr)
+        for a in los:
+            j = int(np.searchsorted(his, a + 1))
+            k = int(np.searchsorted(his, a + longest, side="right"))
+            if k > j:
+                b = his[j:k]
+                c = (cs[b] - cs[a]) / (b - a)
+                i = int(c.argmax())
+                if c[i] >= cover:
+                    out.add((w, int(a), int(b[i])))
+    return out
+
+
 def smooth(call: np.ndarray, gap: int = 20, short: int = 30) -> np.ndarray:
     """``[n, L]`` calls with gaps of up to ``gap`` bases closed and runs under ``short`` bases dropped: the least
     decoding that turns per-base calls into exons (no gene model; Tiberius and Helixer decode with an HMM)."""
@@ -107,6 +163,7 @@ def smooth(call: np.ndarray, gap: int = 20, short: int = 30) -> np.ndarray:
 def score(out: Path, checkpoints: list[str] = typer.Argument(..., help="LABEL=CHECKPOINT"),
           name: str = typer.Option(...), labels: list[str] = typer.Option(..., help="TAG=STORE, one per annotation"),
           windows_csv: Path = typer.Option(None, "--windows"), head: str = "genes", context: int = 1048576,
+          splice_head: str = typer.Option("splice", help="its logits are saved too, for the snapped exons ('' = no)"),
           device: str = "cuda",
           dtype: str = typer.Option("bf16", help="bf16 | fp16 | fp32 (bf16 is emulated, slow, on Turing cards)"),
           chunk: int = typer.Option(0, help="bases per encoder chunk (memory cap: e.g. 131072 runs a 1 Mb context "
@@ -130,10 +187,12 @@ def score(out: Path, checkpoints: list[str] = typer.Argument(..., help="LABEL=CH
         if chunk and not EK.capped_ok(model):
             raise typer.BadParameter(f"{label}: --chunk needs a v2/v2l core without learned chunking")
         model = model.to(dev).eval()
-        model.x_active, model.x_span = {head}, (flank, flank + WIN)
+        sp_head = splice_head if splice_head in heads else ""
+        model.x_active, model.x_span = {head, sp_head} - {""}, (flank, flank + WIN)
         unit = 2 ** model.config.n_down
         rows = [k for k in range(win.height) if EK.mine(k, sh)]
         pred = np.zeros((len(rows), WIN, len(ids)), dtype=np.float16)
+        sp = np.zeros((len(rows), WIN, 4), dtype=np.float16) if sp_head else None
         t0 = time.time()
         for j, (k, r) in enumerate((k, r) for k, r in enumerate(win.iter_rows(named=True)) if EK.mine(k, sh)):
             seq = torch.from_numpy(XB.codes_of(contigs, bases, r["chrom"], r["start"] - flank, r["end"] + flank)).to(dev)
@@ -145,6 +204,8 @@ def score(out: Path, checkpoints: list[str] = typer.Argument(..., help="LABEL=CH
                 else:
                     model(seq[None], seg, ctx)
             pred[j] = model.last_x[head][0][:, :len(ids)].float().clamp(-6e4, 6e4).cpu().numpy().astype(np.float16)
+            if sp_head:
+                sp[j] = model.last_x[sp_head][0][:, :4].float().clamp(-6e4, 6e4).cpu().numpy().astype(np.float16)
         info = dict(label=label, checkpoint=str(where), step=int(state.get("step", -1)), genome=name, dtype=dtype,
                     context=context, chunk=chunk,
                     n_windows=win.height, seconds=round(time.time() - t0, 1))
@@ -155,10 +216,12 @@ def score(out: Path, checkpoints: list[str] = typer.Argument(..., help="LABEL=CH
             d = out / "shards" / label
             d.mkdir(parents=True, exist_ok=True)
             np.save(d / f"{EK.tag(sh)}.npy", pred)
+            if sp is not None:
+                np.save(d / f"{EK.tag(sh)}.splice.npy", sp)
             (d / f"{EK.tag(sh)}.json").write_text(json.dumps(dict(info, rows=rows, shard=list(sh)), indent=1))
             typer.echo(f"{label}: shard {EK.tag(sh)}, {len(rows)} windows in {info['seconds']:.0f} s")
             continue
-        finish(out, info, pred, lab, ids)
+        finish(out, info, pred, lab, ids, sp)
 
 
 def ids_of(labels: list[str]) -> list[str]:
@@ -192,13 +255,17 @@ def merge(out: Path, label: str, shards: int = typer.Option(..., help="n, as in 
         raise typer.BadParameter(f"{label}: shards were scored on {infos[0]['n_windows']} windows, not {win.height}")
     lab, ids = labels_of(labels, win)
     pred = np.zeros((win.height, WIN, len(ids)), dtype=np.float16)
+    has_sp = all((d / f"{i}-of-{shards}.splice.npy").exists() for i in range(shards))
+    sp = np.zeros((win.height, WIN, 4), dtype=np.float16) if has_sp else None
     seen = np.zeros(win.height, dtype=int)
     for i, inf in enumerate(infos):
         pred[inf["rows"]] = np.load(d / f"{i}-of-{shards}.npy")
+        if has_sp:
+            sp[inf["rows"]] = np.load(d / f"{i}-of-{shards}.splice.npy")
         seen[inf["rows"]] += 1
     if not (seen == 1).all():
         raise typer.BadParameter(f"{label}: windows not covered exactly once")
-    finish(out, dict(infos[0], seconds=sum(i["seconds"] for i in infos), shards=shards), pred, lab, ids)
+    finish(out, dict(infos[0], seconds=sum(i["seconds"] for i in infos), shards=shards), pred, lab, ids, sp)
 
 
 @app.command()
@@ -209,11 +276,14 @@ def rescore(out: Path, label: str, labels: list[str] = typer.Option(..., help="T
     info = json.loads((out / f"{label}.genes.json").read_text())
     info = {k: v for k, v in info.items() if k not in ("annotations", "disagreement")}
     lab, ids = labels_of(labels, win)
-    finish(out, info, np.load(out / f"{label}.genes.npy"), lab, ids)
+    sp = out / f"{label}.splice.npy"
+    finish(out, info, np.load(out / f"{label}.genes.npy"), lab, ids, np.load(sp) if sp.exists() else None)
 
 
-def finish(out: Path, info: dict, pred: np.ndarray, lab: dict, ids: list[str]) -> None:
-    """Every metric from the logits ``pred`` [windows, WIN, channels] against each annotation's labels."""
+def finish(out: Path, info: dict, pred: np.ndarray, lab: dict, ids: list[str], splice: np.ndarray | None = None
+           ) -> None:
+    """Every metric from the logits ``pred`` [windows, WIN, channels] against each annotation's labels; with the
+    splice head's logits ``splice`` [windows, WIN, 4] also the snapped exons."""
     label = info["label"]
     for k in ("rows", "shard"):
         info.pop(k, None)
@@ -221,6 +291,11 @@ def finish(out: Path, info: dict, pred: np.ndarray, lab: dict, ids: list[str]) -
     np.save(out / f"{label}.genes.npy", pred)         # the logits, so later metrics need no card
     call = pred > 0
     sm_cds = {st: smooth(call[..., ids.index(f"cds_{st}")]) for st in ("plus", "minus")}
+    snapped = None
+    if splice is not None:
+        np.save(out / f"{label}.splice.npy", splice)
+        snapped = {"snapped": {st: snap(sm_cds[st], splice, st) for st in ("plus", "minus")},
+                   "paired": {st: pair_exons(pred[..., ids.index(f"cds_{st}")], splice, st) for st in ("plus", "minus")}}
     res = dict(info, annotations={})
     for t, y in lab.items():
         per = {}
@@ -253,6 +328,17 @@ def finish(out: Path, info: dict, pred: np.ndarray, lab: dict, ids: list[str]) -
                 variants[nm] = dict(f1=f1(tp2, sum(v["predicted"] for v in per_st.values()) - tp2,
                                           sum(v["annotated"] for v in per_st.values()) - tp2), per_strand=per_st)
             summ[f"cds_exon_f1_{nm}"] = variants[nm]["f1"]
+        for nm, dec in (snapped or {}).items():      # exons with their ends on the splice head's sites: exact ends
+            per_st = {}
+            for st in ("plus", "minus"):
+                tr = runs(y[..., ids.index(f"cds_{st}")])
+                tp2 = len(dec[st] & tr)
+                per_st[st] = dict(f1=f1(tp2, len(dec[st]) - tp2, len(tr) - tp2), predicted=len(dec[st]),
+                                  annotated=len(tr), exact=tp2)
+            tp2 = sum(v["exact"] for v in per_st.values())
+            variants[nm] = dict(f1=f1(tp2, sum(v["predicted"] for v in per_st.values()) - tp2,
+                                      sum(v["annotated"] for v in per_st.values()) - tp2), per_strand=per_st)
+            summ[f"cds_exon_f1_{nm}"] = variants[nm]["f1"]
         res["annotations"][t] = dict(channels=per, cds_exons=ex, cds_exon_variants=variants, **summ)
     tags = list(lab)
     if len(tags) == 2:                           # where the two annotations disagree: whose side the head takes
@@ -272,7 +358,10 @@ def finish(out: Path, info: dict, pred: np.ndarray, lab: dict, ids: list[str]) -
         an = res["annotations"][t]
         typer.echo(f"{label} vs {t}: Genic F1 {an['genic_f1']:.3f}, Subgenic F1 {an['subgenic_f1']:.3f}, "
                    f"CDS exon F1 {an['cds_exon_f1']:.3f} (smoothed {an['cds_exon_f1_smoothed']:.3f}, ±10 bp "
-                   f"{an['cds_exon_f1_within10']:.3f}, both {an['cds_exon_f1_smoothed_within10']:.3f}); AP "
+                   f"{an['cds_exon_f1_within10']:.3f}, both {an['cds_exon_f1_smoothed_within10']:.3f}"
+                   + (f", snapped to splice sites {an['cds_exon_f1_snapped']:.3f}, between site pairs "
+                      f"{an['cds_exon_f1_paired']:.3f}" if "cds_exon_f1_paired" in an else "")
+                   + "); AP "
                    + ", ".join(f"{i} {v['ap']:.2f}" for i, v in an["channels"].items() if i.endswith("_plus")))
     if "disagreement" in res:
         for i, v in res["disagreement"].items():

@@ -51,7 +51,7 @@ def test_genes_eval_scores_two_annotations(tmp_path, monkeypatch):
         (tmp_path / f"{tag}.gtf").write_text("\n".join(rows) + "\n")
         monkeypatch.setattr(GS, "interim_dir", lambda *a: g)
         GS.main(tmp_path / tag, name="toy", gtf=tmp_path / f"{tag}.gtf", basic_only=False, chrom_prefix="", source="", split=None)
-    cfg = G.KronGenomeConfig(**{**small("v2").config.to_dict(), "xheads": [["genes", 14]], "xhead_kind": "kron",
+    cfg = G.KronGenomeConfig(**{**small("v2").config.to_dict(), "xheads": [["genes", 14], ["splice", 4]], "xhead_kind": "kron",
                                 "xhead_bin": 4, "xhead_width": 64})
     torch.manual_seed(0)
     model = G.KronGenome(cfg)
@@ -62,13 +62,13 @@ def test_genes_eval_scores_two_annotations(tmp_path, monkeypatch):
     SZ.windows(out, name="toy", n=2, seed=0, context=131072, chroms="", keep=None, max_n=0.0)
     labs = [f"old={tmp_path / 'old'}", f"new={tmp_path / 'new'}"]
     GE.score(out, [f"m={tmp_path / 'ck.pt'}"], name="toy", labels=labs,
-             windows_csv=None, head="genes", context=131072, device="cpu", dtype="bf16", shard="", chunk=0)
+             windows_csv=None, head="genes", splice_head="splice", context=131072, device="cpu", dtype="bf16", shard="", chunk=0)
     GE.score(out, [f"c={tmp_path / 'ck.pt'}"], name="toy", labels=labs,      # the memory cap: the same logits
-             windows_csv=None, head="genes", context=131072, device="cpu", dtype="bf16", shard="", chunk=16384)
+             windows_csv=None, head="genes", splice_head="splice", context=131072, device="cpu", dtype="bf16", shard="", chunk=16384)
     assert np.allclose(np.load(out / "c.genes.npy").astype(np.float32), np.load(out / "m.genes.npy").astype(np.float32),
                        rtol=1e-2, atol=1e-2)
     for i in (0, 1):                                    # the same in two shards, merged: the same logits and metrics
-        GE.score(out, [f"s={tmp_path / 'ck.pt'}"], name="toy", labels=labs, windows_csv=None, head="genes",
+        GE.score(out, [f"s={tmp_path / 'ck.pt'}"], name="toy", labels=labs, windows_csv=None, head="genes", splice_head="splice",
                  context=131072, device="cpu", dtype="fp32", shard=f"{i}/2", chunk=0)
     assert not (out / "s.genes.json").exists()
     GE.merge(out, "s", shards=2, labels=labs, windows_csv=None)
@@ -76,6 +76,21 @@ def test_genes_eval_scores_two_annotations(tmp_path, monkeypatch):
     rs = json.loads((out / "s.genes.json").read_text())
     r = json.loads((out / "m.genes.json").read_text())
     assert rs["annotations"] == r["annotations"] and rs["shards"] == 2
+    assert np.array_equal(np.load(out / "s.splice.npy"), np.load(out / "m.splice.npy"))   # the splice logits too
+    assert np.load(out / "m.splice.npy").shape == (2, 131072, 4)
+    assert {"cds_exon_f1_snapped", "cds_exon_f1_paired"} <= set(r["annotations"]["new"])
+    # the decoders on a made-up window: an exon [100, 200) on +, acceptor at 99 and donor at 200; calls blurred
+    logit = np.full((1, 400), -5.0, np.float32)
+    logit[0, 90:130] = 5
+    logit[0, 136:215] = 5                                # a gap and wrong ends
+    sp4 = np.full((1, 400, 4), -9.0, np.float32)
+    sp4[0, 99, 1], sp4[0, 200, 0] = 9, 9                 # acceptor +, donor +
+    assert GE.pair_exons(logit, sp4, "plus") == {(0, 100, 200)}
+    assert GE.snap(GE.smooth(logit > 0), sp4, "plus") == {(0, 100, 200)}
+    spm = np.full((1, 400, 4), -9.0, np.float32)
+    spm[0, 99, 2], spm[0, 200, 3] = 9, 9                 # on -: the donor below the exon, the acceptor above
+    assert GE.pair_exons(logit, spm, "minus") == {(0, 100, 200)} and GE.pair_exons(logit, spm, "plus") == set()
+    assert GE.exon_f1(np.array([[0, 1, 1, 1, 0]], bool), np.array([[0, 0, 1, 1, 1]], bool), tol=1)["f1"] == 1.0
     assert set(r["annotations"]) == {"old", "new"} and r["n_windows"] == 2 and r["step"] == 7
     assert 0 <= r["annotations"]["new"]["genic_f1"] <= 1 and 0 <= r["annotations"]["new"]["cds_exon_f1"] <= 1
     assert r["annotations"]["old"]["cds_exons"]["plus"]["annotated"] > 0
