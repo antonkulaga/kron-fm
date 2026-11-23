@@ -973,10 +973,10 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                                                 "--jepa-guard-cap x; triggered again at the cap: save and stop with "
                                                 "exit code 42)"),
                  jepa_guard_windows: int = typer.Option(8, help="with --jepa-guard: number of fixed monitoring windows"),
-                 jepa_guard_from: str = typer.Option("train", help="with --jepa-guard: where its fixed windows come from: "
-                                                     "train (default; review 23 Nov: the guard steers training, so "
-                                                     "it must not decide on the held-out chromosomes) or heldout "
-                                                     "(the old behaviour)"),
+                 jepa_guard_from: str = typer.Option("heldout", help="with --jepa-guard: where its fixed windows come "
+                                                     "from: heldout (default, as runs before 23 Nov did, so their "
+                                                     "comparisons hold) or train (review 23 Nov: the guard steers "
+                                                     "training, so the production launchers pass train)"),
                  jepa_guard_window: int = typer.Option(131072, help="with --jepa-guard: bases per monitoring window"),
                  jepa_guard_rank: float = typer.Option(0.5, help="with --jepa-guard: entropy-rank trigger, a share "
                                                        "of its running maximum"),
