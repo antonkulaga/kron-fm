@@ -50,32 +50,7 @@ def sha256(path: Path) -> str:
     return h.hexdigest()
 
 
-def read_gtf(gtf: Path, basic_only: bool, source: str = "") -> pl.DataFrame:
-    """exon, CDS, stop_codon and start_codon rows of a GTF or GFF3 (by name or its ``##gff-version 3`` line): chrom,
-    type, start0 (0-based), end (exclusive), strand, tid (GTF transcript_id; GFF3 the row's first Parent)."""
-    opener = gzip.open if str(gtf).endswith(".gz") else open
-    rows = []
-    want = {"exon", "CDS", "stop_codon", "start_codon"}
-    tid_re = re.compile(r'transcript_id "([^"]+)"')        # GTF
-    parent_re = re.compile(r'(?:^|;)Parent=([^;,]+)')      # GFF3: an exon's or CDS's (first) parent transcript
-    gff3 = ".gff" in str(gtf).lower()
-    with opener(gtf, "rt") as f:
-        for line in f:
-            if line.startswith("#"):
-                if line.startswith("##gff-version 3"):
-                    gff3 = True
-                continue
-            c = line.rstrip("\n").split("\t")
-            if len(c) < 9 or c[2] not in want or c[6] not in "+-" or (source and c[1] != source):
-                continue
-            if basic_only and not ('basic' in (re.search(r'(?:^|;)tag=([^;]*)', c[8]) or [None, ""])[1].split(",")
-                                       if gff3 else 'tag "basic"' in c[8]):
-                continue
-            m = (parent_re if gff3 else tid_re).search(c[8])
-            if m:
-                rows.append((c[0], c[2], int(c[3]) - 1, int(c[4]), c[6], m.group(1)))
-    return pl.DataFrame(rows, schema=["chrom", "type", "start0", "end", "strand", "tid"], orient="row")
-
+from kron_dna.prep.features import introns, read_features as read_gtf  # noqa: E402  (shared, B23)
 
 def intervals(g: pl.DataFrame) -> dict[str, pl.DataFrame]:
     """Per label kind, [start0, end) intervals with chrom and strand (points as 1-base intervals)."""
@@ -99,9 +74,7 @@ def intervals(g: pl.DataFrame) -> dict[str, pl.DataFrame]:
     left, right = left.filter(pl.col("e") > pl.col("s")), right.filter(pl.col("e") > pl.col("s"))
     out["utr5"] = pl.concat([left.filter(plus), right.filter(~plus)])
     out["utr3"] = pl.concat([right.filter(plus), left.filter(~plus)])
-    out["intron"] = (ex.sort("tid", "start0").with_columns(nxt=pl.col("start0").shift(-1).over("tid"))
-                     .filter(pl.col("nxt").is_not_null() & (pl.col("nxt") > pl.col("end")))
-                     .select("chrom", "strand", s="end", e="nxt"))
+    out["intron"] = introns(g, 1)
     return out
 
 

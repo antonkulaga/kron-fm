@@ -45,20 +45,10 @@ def sha256(path: Path) -> str:
     return h.hexdigest()
 
 
-def introns_of(exons: pl.DataFrame) -> pl.DataFrame:
-    """GENCODE exons (chrom, start, end 1-based closed, strand, transcript_id) -> distinct introns as 0-based
-    half-open ``[i0, i1)`` with their strand."""
-    return (exons.sort("transcript_id", "start")
-            .with_columns(nxt=pl.col("start").shift(-1).over("transcript_id"))
-            .filter(pl.col("nxt").is_not_null())
-            .select("chrom", "strand", i0=pl.col("end").cast(pl.Int64), i1=pl.col("nxt").cast(pl.Int64) - 1)
-            .filter(pl.col("i1") - pl.col("i0") >= 4).unique())
-
-
 def main(out: Path, name: str = "hg38", gtf: Path = typer.Option(None),
          split: Path = typer.Option(None, help="uint8 per base, 1 = training: positives are also counted there for "
                                                "the head's class weights (default: the genome's ntv3/split.u8)")) -> None:
-    import polars_bio as pb
+    from kron_dna.prep.features import introns as introns_rule, read_features
 
     gtf = gtf or input_dir("regulation", "gencode") / "gencode.basic.gtf.gz"
     src = interim_dir("genome", name)
@@ -66,9 +56,8 @@ def main(out: Path, name: str = "hg38", gtf: Path = typer.Option(None),
         raise typer.BadParameter("OUT_DIR lies inside the prepared genome; choose a new path")
     index = pl.read_parquet(src / "contigs.parquet")
     bases = np.memmap(src / "bases.u8", dtype=np.uint8, mode="r")
-    exons = (pb.scan_gtf(str(gtf), attr_fields=["transcript_id"]).filter(pl.col("type") == "exon")
-             .select(["chrom", "start", "end", "strand", "transcript_id"]).collect())
-    introns = introns_of(exons).filter(pl.col("strand").is_in(["+", "-"]))
+    # the shared reader and intron rule (B23); 4 bases at least, as these labels always took
+    introns = introns_rule(read_features(gtf), 4).rename({"s": "i0", "e": "i1"})
     chrom = introns["chrom"].to_numpy().astype(str)
     plus = introns["strand"].to_numpy() == "+"
     first, last = introns["i0"].to_numpy(), introns["i1"].to_numpy() - 1      # the intron's two end bases
