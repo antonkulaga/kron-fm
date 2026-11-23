@@ -136,7 +136,7 @@ def test_galaxy_active2_unpacks_by_device_and_day_and_reads_inverted_10_hz(tmp_p
     recs = list(data.recordings)
     assert [r.recording for r in recs] == ["ab12/2024-10-03", "ab12/2024-10-04", "cd34/2024-10-05"]
     lengths = [len(r.load()) for r in recs]
-    assert lengths == [600, 600, 1200]  # the doubled stamp is averaged; the grid spans the times
+    assert lengths == [600, 600, 1200]  # the doubled stamp is spread; the grid spans the times
     x = recs[2].load()
     assert recs[2].fs == 10.0 and np.isfinite(x).all() and x.mean() == pytest.approx(-2.6e6, rel=0.01)
 
@@ -521,3 +521,18 @@ def test_dreamt_reads_e4_bvp_with_ages_and_disease_labels_and_is_restricted(tmp_
     assert [r.recording for r in recs] == ["S900/0", "S901/0"] and recs[0].fs == 64.0
     assert np.allclose(recs[0].signal, synthetic_ppg(60.0, 64.0), atol=1e-4)
     assert is_restricted("dreamt")
+
+
+def test_samples_stamped_together_are_spread_not_averaged():
+    from kron_ppg.watch_readers import spread_ties
+
+    t = np.array([0.0, 0.1, 0.1, 0.3, 0.4])
+    assert np.allclose(spread_ties(t, 0.1), [0.0, 0.1, 0.2, 0.3, 0.4])
+    assert np.allclose(spread_ties(np.array([0.0, 0.0, 0.0]), 0.1), [0.0, 0.1, 0.2])
+    # a 10 Hz sine with every other pair stamped once keeps its amplitude on the grid
+    tt = np.arange(200) / 10.0
+    x = np.sin(2 * np.pi * 2.0 * tt)
+    stamped = tt.copy()
+    stamped[1::4] = stamped[0::4]
+    y = uniform(stamped, x, 10.0)
+    assert np.allclose(y, x[: len(y)], atol=1e-9)

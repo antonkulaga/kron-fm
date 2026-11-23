@@ -54,14 +54,29 @@ def sessions(t: np.ndarray, x: np.ndarray, fs: float) -> Iterator[tuple[int, np.
             yield j, uniform(t[a:b], x[a:b], fs)
 
 
+def spread_ties(t: np.ndarray, step: float) -> np.ndarray:
+    """Sorted times with each run of equal stamps spread evenly over the step to the next stamp (the last run by
+    ``step``), so ``k`` samples stamped together become ``k`` samples in sequence, never piled on one time."""
+    if len(t) < 2 or np.all(np.diff(t) > 0):
+        return t
+    first = np.r_[True, np.diff(t) != 0]
+    start = np.flatnonzero(first)
+    run = np.diff(np.r_[start, len(t)])
+    nxt = np.r_[t[start[1:]], t[start[-1]] + run[-1] * step]
+    width = np.minimum((nxt - t[start]) / run, step)  # never spread wider than one nominal sample
+    i = np.arange(len(t)) - np.repeat(start, run)
+    return t + i * np.repeat(width, run)
+
+
 def uniform(t: np.ndarray, x: np.ndarray, fs: float) -> np.ndarray:
     """Samples ``x`` taken at times ``t`` (seconds, possibly jittered or unordered), linearly interpolated onto a
-    grid at ``fs`` from the first time; samples sharing a time (a batch stamped once) are averaged. Grid points
-    inside a gap longer than :data:`MAX_GAP_S`, or next to a NaN sample, are NaN."""
+    grid at ``fs`` from the first time; samples sharing a time (a batch stamped once) are spread evenly, in file
+    order, over the step to the next time (:func:`spread_ties`), so a watch that stamps two samples together keeps
+    its rate. Grid points inside a gap longer than :data:`MAX_GAP_S`, or next to a NaN sample, are NaN."""
     keep = np.isfinite(t)
-    t, x = t[keep], np.asarray(x, np.float64)[keep]
-    t, inverse, counts = np.unique(t, return_inverse=True, return_counts=True)
-    x = np.bincount(inverse, weights=x, minlength=len(t)) / counts
+    t, x = np.asarray(t, np.float64)[keep], np.asarray(x, np.float64)[keep]
+    order = np.argsort(t, kind="stable")
+    t, x = spread_ties(t[order], 1.0 / fs), x[order]
     if len(t) < 2:
         return np.full(len(t), np.nan)
     grid = t[0] + np.arange(int(np.floor((t[-1] - t[0]) * fs)) + 1) / fs
