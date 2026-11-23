@@ -216,12 +216,14 @@ Fixed (tests added):
   now refused.
 - **The app recipe's order** (above).
 
-Open, to fix with a re-preparation of the wrist sets and a rerun:
+Readers fixed and rerun (9d92235): samples stamped together are spread over the step to the next stamp instead
+of averaged (about 6 % of Galaxy Active 2 steps), and GalaxyPPG is placed on its time grid, so a dropout is a gap
+(2 gaps in 23 people). The eight open wrist sets re-prepared this way give the same c1 open-data head: **4.27 y vs
+4.36 y** on the same 214 people, paired difference -0.09 y (-0.21 to +0.04), so no number above moves. PulseWatch
+is left as it is: its windows are its 30 s segments, so none crosses a join; only the band-pass runs across them.
 
-- **Gaps are not kept everywhere.** GalaxyPPG uses its timestamps only for the rate, so a dropout is spliced
-  shut; the Galaxy Active 2 reader averages samples stamped together, halving its rate in places; PulseWatch joins
-  its 30 s segments end to end. A window can then cross a gap. The timing logic lives in three versions and should
-  move into the shared preparation step.
+Still open:
+
 - **Pretraining saw the open wrist people** (without ages) that the open-data head is fitted and scored on. No age
   leaks, and Aurora and DREAMT stay outside pretraining, so the Aurora and DREAMT numbers are clean; the per-device
   offsets of the open sets are measured on devices the encoder had seen.
