@@ -12,9 +12,9 @@ the gene's variants (effects whose factors are all zero are unused and skipped),
 (gene, variant, pip; float32) and deletes the download. A finished tissue is skipped on a rerun.
 
 ``assemble``: a positive is a (variant, gene) pair with PIP >= ``--pos`` in some tissue (the tissues listed); a
-negative candidate is a variant tested for that gene whose PIP stays below ``--neg`` in every tissue that tested it
-and is below ``--neg`` for every gene. Each positive gets ``--per`` negatives of the same gene, those whose distance
-to the gene's TSS (GENCODE gene start, strand-aware) is closest to the positive's. SNVs only, chr1-22 and X; the
+negative is a variant tested for the same gene in the positive's first tissue that never reaches ``--neg`` for any
+gene in any tissue. Each positive gets ``--per`` negatives, those whose distance to the gene's TSS (GENCODE gene
+start, strand-aware) is closest to the positive's, each negative used once. SNVs only, chr1-22 and X; the
 reference allele is checked against the prepared genome. ``held_out`` marks hg38 chr8/chr9. ``pair`` ties each
 negative to its positive.
 """
@@ -111,61 +111,77 @@ def assemble(meta: Path, work: Path, out: Path, gtf: Path = typer.Option(...), g
     missing = [q for q in names if not (work / "pip" / f"{q}.parquet").exists()]
     if missing:
         raise SystemExit(f"{len(missing)} of {len(names)} tissues not done: {missing[:5]}")
-    allp = pl.concat([pl.scan_parquet(work / "pip" / f"{q}.parquet").with_columns(tissue=pl.lit(names[q]))
-                      for q in names])
-    best = allp.group_by("gene", "variant").agg(
-        max_pip=pl.col("pip").max(), tissues=pl.col("tissue").filter(pl.col("pip") >= pos).sort()).collect()
-    v_max = best.group_by("variant").agg(v_pip=pl.col("max_pip").max())
-    best = best.join(v_max, on="variant")
-    sp = pl.col("variant").str.split("_")
-    best = best.with_columns(chrom=sp.list.get(0), position=sp.list.get(1).cast(pl.Int64) - 1,
-                             ref=sp.list.get(2), alt=sp.list.get(3))
+    scan = lambda q: pl.scan_parquet(work / "pip" / f"{q}.parquet")                       # noqa: E731
+    # pass 1: the positives, and every variant that reaches --neg for any gene in any tissue (never a negative)
+    P = pl.concat([scan(q).filter(pl.col("pip") >= pos).with_columns(dataset=pl.lit(q)) for q in names]).collect()
+    B = pl.concat([scan(q).filter(pl.col("pip") >= neg).select("variant") for q in names]).unique().collect(
+        engine="streaming")
+    P = P.group_by("gene", "variant").agg(max_pip=pl.col("pip").max(), datasets=pl.col("dataset").sort())
+    P = P.with_columns(dataset=pl.col("datasets").list.first(),
+                       tissues=pl.col("datasets").list.eval(pl.element().replace_strict(names)))
     keep = [f"chr{c}" for c in [*map(str, range(1, 23)), "X"]]
-    best = best.filter(pl.col("chrom").is_in(keep) & (pl.col("ref").str.len_chars() == 1)
-                       & (pl.col("alt").str.len_chars() == 1))
+
+    def parsed(df: pl.DataFrame) -> pl.DataFrame:
+        sp = pl.col("variant").str.split("_")
+        return df.with_columns(chrom=sp.list.get(0), position=sp.list.get(1).cast(pl.Int64) - 1, ref=sp.list.get(2),
+                               alt=sp.list.get(3)).filter(pl.col("chrom").is_in(keep) & (pl.col("ref").str.len_chars() == 1)
+                                                          & (pl.col("alt").str.len_chars() == 1))
     tss = tss_of(gtf)
-    best = best.join(tss, on="gene", how="inner").filter(pl.col("chrom") == pl.col("chrom_tss"))
-    best = best.with_columns(distance=(pl.col("position") - pl.col("tss")) * pl.when(pl.col("strand") == "+").then(1)
-                             .otherwise(-1))
-    P = best.filter(pl.col("max_pip") >= pos).with_columns(label=pl.lit(1))
-    N = best.filter((pl.col("max_pip") < neg) & (pl.col("v_pip") < neg))
-    picked, used = [], set()
-    Ng = {g: d.sort("distance") for g, d in N.group_by("gene")}
-    for k, r in enumerate(P.sort("gene", "variant").iter_rows(named=True)):
-        d = Ng.get((r["gene"],))
-        if d is None:
-            continue
-        dd = d.with_columns(gap=(pl.col("distance").abs() - abs(r["distance"])).abs()).sort("gap", "variant")
-        n = 0
-        for c in dd.iter_rows(named=True):
-            if (c["gene"], c["variant"]) in used:
+    sign = pl.when(pl.col("strand") == "+").then(1).otherwise(-1)
+    P = parsed(P).join(tss, on="gene", how="inner").filter(pl.col("chrom") == pl.col("chrom_tss"))
+    P = P.with_columns(distance=(pl.col("position") - pl.col("tss")) * sign).sort("gene", "variant")
+    P = P.with_row_index("pair")
+    # pass 2, per tissue: negatives for the positives first found there, tested for the same gene in that tissue
+    negs = []
+    for q, Pq in P.group_by("dataset"):
+        genes = Pq["gene"].unique()
+        C = parsed(scan(q[0]).filter(pl.col("gene").is_in(genes.implode()) & (pl.col("pip") < neg)).collect())
+        C = C.join(B, on="variant", how="anti").join(tss, on="gene").with_columns(
+            distance=(pl.col("position") - pl.col("tss")) * sign).with_columns(ad=pl.col("distance").abs())
+        cand = {g[0]: d.sort("ad") for g, d in C.group_by("gene")}
+        for r in Pq.sort("pair").iter_rows(named=True):
+            d = cand.get(r["gene"])
+            if d is None or not d.height:
                 continue
-            used.add((c["gene"], c["variant"]))
-            picked.append({**{x: c[x] for x in N.columns}, "pair": k})
-            n += 1
-            if n == per:
-                break
-        r["pair"] = k
-        picked.append(r)
-    t = pl.DataFrame([{x: p.get(x) for x in [*N.columns, "pair"]} | {"label": int(p.get("label") or 0)}
-                      for p in picked], infer_schema_length=None)
+            ad = d["ad"].to_numpy()
+            used = np.zeros(len(ad), bool) if "used" not in d.columns else d["used"].to_numpy()
+            order = np.argsort(np.abs(ad - abs(r["distance"])), kind="stable")
+            pick = [i for i in order if not used[i]][:per]
+            used[pick] = True
+            cand[r["gene"]] = d.with_columns(used=pl.Series(used))
+            for i in pick:
+                negs.append(dict(d.row(int(i), named=True), pair=r["pair"], max_pip=None, tissues=[names[q[0]]]))
+    cols = ["pair", "gene", "gene_name", "variant", "chrom", "position", "ref", "alt", "tss", "strand", "distance",
+            "max_pip", "tissues"]
+    N = pl.DataFrame(negs, infer_schema_length=None).select([c for c in cols if c != "max_pip"]).with_columns(
+        max_pip=pl.lit(None, pl.Float32), label=pl.lit(0)) if negs else None
+    t = pl.concat([P.select(cols).with_columns(pl.col("max_pip").cast(pl.Float32), label=pl.lit(1)),
+                   *([N.select([*cols, "label"])] if N is not None else [])]).sort("pair", "label", descending=[False, True])
     src = interim_dir("genome", genome)
     idx = pl.read_parquet(src / "contigs.parquet")
     bases = np.memmap(src / "bases.u8", dtype=np.uint8, mode="r")
     code = {c: i for i, c in enumerate("ACGT")}
-    ok = []
-    for r in t.iter_rows(named=True):
-        hit = idx.filter((pl.col("chrom") == r["chrom"]) & (pl.col("start") <= r["position"])
-                         & (pl.col("end") > r["position"]))
-        ok.append(bool(hit.height) and int(bases[hit["offset"][0] + r["position"] - hit["start"][0]])
-                  == code.get(r["ref"], -1))
+    ok = np.zeros(t.height, bool)
+    for c, d in t.with_row_index("i").group_by("chrom"):
+        ci = idx.filter(pl.col("chrom") == c[0]).sort("start")
+        starts, ends, offs = ci["start"].to_numpy(), ci["end"].to_numpy(), ci["offset"].to_numpy()
+        pos_ = d["position"].to_numpy()
+        k = np.searchsorted(starts, pos_, side="right") - 1
+        inside = (k >= 0) & (pos_ < ends[np.clip(k, 0, None)])
+        got = np.full(len(pos_), 255)
+        got[inside] = bases[offs[k[inside]] + pos_[inside] - starts[k[inside]]]
+        ok[d["i"].to_numpy()] = got == np.array([code.get(x, -1) for x in d["ref"].to_list()])
     t = t.with_columns(ref_ok=pl.Series(ok), held_out=pl.col("chrom").is_in(HELD))
     out.parent.mkdir(parents=True, exist_ok=True)
-    t.drop("v_pip").write_parquet(out)
-    summ = dict(pairs=int(t.filter(pl.col("label") == 1).height), negatives=int(t.filter(pl.col("label") == 0).height),
+    t.write_parquet(out)
+    pos_n = int((t["label"] == 1).sum())
+    summ = dict(positives=pos_n, negatives=int((t["label"] == 0).sum()),
+                positives_without_negative=pos_n - int(t.filter(pl.col("label") == 0)["pair"].n_unique()),
                 ref_mismatch=int((~t["ref_ok"]).sum()),
                 held_out_positives=int(t.filter((pl.col("label") == 1) & pl.col("held_out")).height),
-                pos=pos, neg=neg, per=per, tissues=len(names), release="eQTL Catalogue r7, QTS000015 (GTEx v8)")
+                genes=int(t.filter(pl.col("label") == 1)["gene"].n_unique()), pos=pos, neg=neg, per=per,
+                tissues=len(names), excluded_variants_reaching_neg=B.height,
+                release="eQTL Catalogue r7, QTS000015 (GTEx v8), SuSiE")
     out.with_suffix(".json").write_text(json.dumps(summ, indent=1))
     typer.echo(json.dumps(summ))
 

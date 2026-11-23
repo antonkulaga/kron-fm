@@ -5,6 +5,7 @@ them once all ``n`` are there)."""
 from __future__ import annotations
 
 import contextlib
+import math
 
 import torch
 import typer
@@ -40,3 +41,61 @@ def mine(k: int, shard: tuple[int, int]) -> bool:
 
 def tag(shard: tuple[int, int]) -> str:
     return f"{shard[0]}-of-{shard[1]}"
+
+
+# --------------------------------------------------------------------------------- the memory-capped forward
+
+def capped_ok(model) -> bool:
+    c = model.config
+    return c.arch in ("v2", "v2l") and not c.chunk_ratio
+
+
+def core_capped(model, seq: torch.Tensor, ctx: torch.Tensor | None, chunk: int) -> torch.Tensor:
+    """The core states ``[1, bins, d_model]`` of a window ``seq`` ``[L]``, its encoder run ``chunk`` bases at a time
+    (each with :func:`genome.split_halo` bases of real sequence on both sides, its own stretch kept), so the per-base
+    activations never span the whole window. Equal to :meth:`KronGenome.forward`'s core up to round-off (v2/v2l
+    normalise per position only)."""
+    from kron_dna import genome as G
+    unit = 2 ** model.config.n_down
+    if chunk % unit:
+        raise typer.BadParameter(f"--chunk must be a multiple of {unit}")
+    L, halo = seq.shape[-1], G.split_halo(model.config)
+    parts = []
+    for s in range(0, L, chunk):
+        lo, hi, e = max(0, s - halo), min(L, s + chunk + halo), min(L, s + chunk)
+        x, _ = model.encode(seq[None, lo:hi])
+        parts.append(x[..., (s - lo) // unit:(e - lo) // unit])
+    h = torch.cat(parts, dim=-1).transpose(1, 2)
+    if model.context is not None:
+        h = h + model.context_rows(ctx, 1, seq.device).unsqueeze(1).to(h.dtype)
+    cu = torch.tensor([0, h.shape[1]], dtype=torch.int32, device=seq.device)
+    return model.run_core(h, cu)
+
+
+def decode_span(model, seq: torch.Tensor, core: torch.Tensor, span: tuple[int, int]) -> dict:
+    """The further heads on bases ``span`` of the window, from its core states: the encoder's skips and the decoder
+    run only over the span plus a halo (aligned to the local track's restart points, so it restarts where a whole
+    forward would). Sets and returns ``model.last_x``; ``model.last_x_at`` is in window coordinates."""
+    from kron_dna import genome as G
+    c = model.config
+    unit, L, halo = 2 ** c.n_down, seq.shape[-1], G.split_halo(c)
+    step = c.local_span if c.local_width else unit
+    step = step * unit // math.gcd(step, unit)
+    lo = max(0, (span[0] - halo) // step * step)
+    hi = min(L, -(-(span[1] + halo) // step) * step)
+    _, skips = model.encode(seq[None, lo:hi])
+    x = model.add_local(model.decode(core[:, lo // unit:hi // unit].transpose(1, 2), skips), skips)
+    keep = model.x_span
+    model.x_span = (span[0] - lo, span[1] - lo)
+    try:
+        last, at = model.run_xheads(x)
+    finally:
+        model.x_span = keep
+    model.last_x, model.last_x_at = last, (at[0] + lo, at[1] + lo)
+    return last
+
+
+def forward_capped(model, seq: torch.Tensor, ctx: torch.Tensor | None, span: tuple[int, int], chunk: int) -> dict:
+    """The further heads' outputs on ``span`` as :meth:`KronGenome.forward` gives them with ``x_span = span``, at the
+    memory of a ``chunk``-base window plus the span (no main-head outputs)."""
+    return decode_span(model, seq, core_capped(model, seq, ctx, chunk), span)

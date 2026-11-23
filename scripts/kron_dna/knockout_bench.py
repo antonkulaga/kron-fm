@@ -2,7 +2,7 @@
 Gasperini 2019, ...; ``prep_crispri_pairs.py``), as Enformer, Borzoi and AlphaGenome report them.
 
     uv run python scripts/kron_dna/knockout_bench.py score OUT LABEL=CHECKPOINT [...] [--pairs PAIRS.parquet]
-        [--max-pairs N] [--e5 200] [--dtype bf16|fp16|fp32] [--shard i/n]
+        [--max-pairs N] [--e5 200] [--dtype bf16|fp16|fp32] [--shard i/n] [--chunk 131072]
     uv run python scripts/kron_dna/knockout_bench.py merge OUT LABEL --shards n      (after every --shard i/n)
     uv run python scripts/kron_dna/knockout_bench.py report OUT
 
@@ -83,8 +83,8 @@ def channels_of(store) -> dict:
 class Runner:
     """A model's pieces, so a forward can be run whole or as encoder+core and decoder apart (E5)."""
 
-    def __init__(self, model, head: str, dev, dtype: str = "bf16") -> None:
-        self.m, self.head, self.dev, self.dtype = model, head, dev, dtype
+    def __init__(self, model, head: str, dev, dtype: str = "bf16", chunk: int = 0) -> None:
+        self.m, self.head, self.dev, self.dtype, self.chunk = model, head, dev, dtype, chunk
         self.unit = 2 ** model.config.n_down
         self.ctx = torch.zeros(1, dtype=torch.long, device=dev) if model.config.n_contexts > 0 else None
 
@@ -95,11 +95,17 @@ class Runner:
         L = seq.shape[-1]
         seg = torch.zeros(1, L // self.unit, dtype=torch.long, device=self.dev)
         with torch.no_grad(), self.ac():
-            self.m(seq[None], seg, self.ctx)
+            if self.chunk:
+                EK.forward_capped(self.m, seq, self.ctx, self.m.x_span, self.chunk)
+            else:
+                self.m(seq[None], seg, self.ctx)
         return self.m.last_x[self.head][0].float()
 
     def core(self, seq: torch.Tensor):
         m = self.m
+        if self.chunk:                              # skips are rebuilt over the head span at decode
+            with torch.no_grad(), self.ac():
+                return EK.core_capped(m, seq, self.ctx, self.chunk), seq
         with torch.no_grad(), self.ac():
             x, skips = m.encode(seq[None])
             h = x.transpose(1, 2)
@@ -110,6 +116,10 @@ class Runner:
 
     def decode(self, core: torch.Tensor, skips) -> torch.Tensor:
         m = self.m
+        if self.chunk:                              # ``skips`` is the window's sequence here
+            with torch.no_grad(), self.ac():
+                EK.decode_span(m, skips, core, m.x_span)
+            return m.last_x[self.head][0].float()
         with torch.no_grad(), self.ac():
             x = m.add_local(m.decode(core.transpose(1, 2), skips), skips)
             m.last_x, m.last_x_at = m.run_xheads(x)
@@ -135,6 +145,8 @@ def score(out: Path, checkpoints: list[str] = typer.Argument(..., help="LABEL=CH
                                                                        "all (whole elements kept); 0: every pair"),
           e5: int = 0, block: int = 4096, seed: int = 0, device: str = "cuda",
           dtype: str = typer.Option("bf16", help="bf16 | fp16 | fp32 (bf16 is emulated, slow, on Turing cards)"),
+          chunk: int = typer.Option(0, help="bases per encoder chunk (memory cap: e.g. 131072 runs a 1 Mb context "
+                                            "on an 11 GB card; 0: the whole window at once)"),
           shard: str = typer.Option("", help="i/n: windows k % n == i only, written under OUT/shards/; then merge")
           ) -> None:
     sh = EK.parse_shard(shard)
@@ -193,7 +205,9 @@ def score(out: Path, checkpoints: list[str] = typer.Argument(..., help="LABEL=CH
             typer.echo(f"{label}: no JEPA predictor (or a chunked/v3 core): E5 skipped")
         model = model.to(dev).eval()
         model.x_active = {head}
-        R = Runner(model, head, dev, dtype)
+        if chunk and not EK.capped_ok(model):
+            raise typer.BadParameter(f"{label}: --chunk needs a v2/v2l core without learned chunking")
+        R = Runner(model, head, dev, dtype, chunk)
         consts = store.consts(dev)
         n_ch = len(store.ids)
 
@@ -236,7 +250,7 @@ def score(out: Path, checkpoints: list[str] = typer.Argument(..., help="LABEL=CH
         info = dict(label=label, source=str(where), step=int(state.get("step", -1)), context=context, head=head,
                     store=str(store.path), channels={f"{c}{s}": v for (c, s), v in chans.items()}, tss_flank=tss_flank,
                     edge=edge, max_pairs=max_pairs, seed=seed, e5=e5 if e5_ok else 0, block=block,
-                    pairs_table=str(pairs), dtype=dtype, windows=els.height, pairs_scored=res.height, dropped=dropped,
+                    pairs_table=str(pairs), dtype=dtype, chunk=chunk, windows=els.height, pairs_scored=res.height, dropped=dropped,
                     seconds=round(time.time() - t0, 1),
                     commit=((state.get("run_record") or {}).get("source") or {}).get("commit"))
         if sh[1] > 1:                                   # a shard: its part, joined by merge once all n are there

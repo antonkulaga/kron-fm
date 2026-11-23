@@ -49,6 +49,7 @@ def test_targets_score_and_report_run_end_to_end(genomes, tmp_path, monkeypatch,
     """A small KronGenome with KronLSTM heads, saved as a checkpoint, scored on two windows of the test genome with
     context; a second source (a copy with noise) gives the paired comparison; the report writes every table."""
     import json
+    import shutil
 
     import polars as pl
     import torch
@@ -104,7 +105,14 @@ def test_targets_score_and_report_run_end_to_end(genomes, tmp_path, monkeypatch,
     assert np.allclose(np.load(m / "dnase_128.npy"), np.load(d / "dnase_128.npy"), atol=1e-5)
     assert np.array_equal(np.load(m / "splice.npy"), np.load(d / "splice.npy"))
     assert json.loads((m / "index.json").read_text())["windows"] == [0, 1]
-    import shutil
+    res = run("score", bench, f"capped={tmp_path / 'ck.pt'}", "--context", 768, "--device", "cpu", "--name", "hgt",
+              "--chunk", 256)                            # the memory cap: the same predictions
+    assert res.exit_code == 0, res.output + repr(res.exception)
+    c = bench / "pred" / "capped"
+    assert np.allclose(np.load(c / "dnase_128.npy"), np.load(d / "dnase_128.npy"), rtol=1e-4, atol=1e-4)
+    assert np.allclose(np.load(c / "splice.npy").astype(np.float32), np.load(d / "splice.npy").astype(np.float32),
+                       rtol=1e-2, atol=1e-2)
+    shutil.rmtree(c)
     shutil.rmtree(m)                                     # the report below compares two sources
     other = bench / "pred" / "noisy"                     # a second source on the same windows
     other.mkdir()
