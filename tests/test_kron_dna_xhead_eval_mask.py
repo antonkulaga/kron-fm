@@ -43,3 +43,13 @@ def test_average_precision_ignores_masked_positions():
     b.add(pred, want, pmask=pm)
     assert a.value()[0] < 1.0
     assert b.value()[0] == 1.0
+
+
+def test_a_pack_bucket_can_be_empty():
+    """The case cli.short() now guards (D crashed on gen.choice(0), 23 Nov): a length whose rung no contig of the
+    table has gives a bucket without members."""
+    from kron_dna import packing as PK
+    ladder = PK.row_ladder(1 << 20, 128)
+    b = PK.Buckets(np.array([1 << 20, (1 << 20) - 5]), None, ladder)
+    short_len = ladder[-1][0] // 2                  # shorter than any contig of the table
+    assert len(b.cell(short_len).members) == 0

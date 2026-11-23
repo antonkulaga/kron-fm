@@ -1657,6 +1657,8 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
         if key not in pack_cells:
             pack_cells[key] = PK.Buckets(lengths.to_numpy(), p_, PK.row_ladder(window_, pack_unit))
         cell_ = pack_cells[key].cell(length)
+        if not len(cell_.members):    # a bucket with no contig to draw further rows from (D crashed on one, 23 Nov,
+            return window_, 0, None   # in gen.choice(0)): this row is not packed - one padded row, as without packing
         return cell_.row, cell_.n - 1, cell_
 
     def sample(table, window=window, batch=None, gen=None, flip=False, mito_table=None, share=0.0, annot=0.0,
