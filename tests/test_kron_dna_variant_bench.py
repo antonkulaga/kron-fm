@@ -189,3 +189,17 @@ def test_label_head_and_mfass_report(genomes, tmp_path, monkeypatch, device):
     assert res.exit_code == 0, res.output + repr(res.exception)
     rep = json.loads((out / "report_mfass.json").read_text())
     assert rep[0]["variants"] == t.height and 0 <= rep[0]["ap"] <= 1
+
+
+def test_vexseq_exon_ends():
+    """Vex-seq's distances to the splice sites have no zero and follow the transcript: an exon [100, 150) is
+    recovered from a variant inside it, before it and after it, on either strand."""
+    s = importlib.util.spec_from_file_location("prep_vexseq", Path(__file__).parents[1] / "scripts/kron_dna/prep_vexseq.py")
+    m = importlib.util.module_from_spec(s)
+    s.loader.exec_module(m)
+    # plus strand: first exon base is 3SS +1, last is 5SS -1; last intron base 3SS -1, first intron base 5SS +1
+    assert m.ends(100, 1, -50, "+") == (100, 150) and m.ends(149, 50, -1, "+") == (100, 150)
+    assert m.ends(99, -1, -51, "+") == (100, 150) and m.ends(150, 51, 1, "+") == (100, 150)
+    # minus strand: the 3' splice site is at the high end
+    assert m.ends(149, 1, -50, "-") == (100, 150) and m.ends(100, 50, -1, "-") == (100, 150)
+    assert m.ends(150, -1, -51, "-") == (100, 150) and m.ends(99, 51, 1, "-") == (100, 150)

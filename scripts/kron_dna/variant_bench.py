@@ -491,7 +491,7 @@ def report_lentimpra(out: Path, variants: Path = typer.Option(None, help="prep_l
 @app.command("report-mfass")
 def report_mfass(out: Path, variants: Path = typer.Option(None, help="prep_mfass.py's table (default: the one scored)"),
                  n_boot: int = 200) -> None:
-    """Splice-disrupting variants (MFASS; ``sdv``: dPSI <= -0.5) from the splice head, scored with ``--head splice
+    """Splice-disrupting variants (MFASS, or Vex-seq's table from ``prep_vexseq.py``; ``sdv``: dPSI <= -0.5) from the splice head, scored with ``--head splice
     --read-col exon_mid --flank-col half``: a variant's prediction is the change (alt - ref) of the exon's acceptor
     and donor logits (each the highest of its strand's channel over the exon and 3 bases beyond), averaged. Average
     precision and AUROC of the predicted loss for ``sdv``, Spearman with the measured dPSI; per region, chr8/chr9
@@ -518,11 +518,12 @@ def report_mfass(out: Path, variants: Path = typer.Option(None, help="prep_mfass
             v = -s["pred"].to_numpy()
             row = dict(label=d.name, subset=nm, variants=s.height, sdv=int(y.sum()), chance=float(y.mean()), ap=ap(v, y),
                        ap_ci=ci(lambda i: ap(v[i], y[i]), len(y), n_boot), auroc=auroc(v, y),
-                       spearman_dpsi=spearman(s["pred"].to_numpy(), s["dpsi"].to_numpy()))
+                       spearman_dpsi=spearman(s["pred"].to_numpy(), s["dpsi"].to_numpy()),
+                       pearson_dpsi=float(np.corrcoef(s["pred"].to_numpy(), s["dpsi"].to_numpy())[0, 1]))
             table.append(row)
             lines.append(f"{d.name:20s} {nm:22s} n={s.height:6d} sdv={row['sdv']:4d} ap={row['ap']:.3f}"
                          f"[{row['ap_ci'][0]:.3f},{row['ap_ci'][1]:.3f}] (chance {row['chance']:.3f}) auroc={row['auroc']:.3f} "
-                         f"rho(dPSI)={row['spearman_dpsi']:.3f}")
+                         f"rho(dPSI)={row['spearman_dpsi']:.3f} r={row['pearson_dpsi']:.3f}")
     (out / "report_mfass.json").write_text(json.dumps(table, indent=1))
     typer.echo("\n".join(lines))
 
