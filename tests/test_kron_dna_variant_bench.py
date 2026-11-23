@@ -122,3 +122,19 @@ def test_score_merge_and_asb_report(genomes, tmp_path, monkeypatch, device):
     res = run("report-eqtl", out, "--variants", tmp_path / "eqtl.parquet", "--n-boot", 5)
     assert res.exit_code == 0, res.output + repr(res.exception)
     assert (out / "report_eqtl.json").exists()
+    # elements read once (lentiMPRA's shape): the reference readout of the same places, and the probe report
+    el = pl.DataFrame(dict(chrom=["chr1"] * 4 + ["chr8"] * 2, pos=[1500, 3100, 2000, 2600, 1200, 1500])).with_columns(
+        ref=pl.lit(""), alt=pl.lit(""), cell=pl.lit("K562"), activity=pl.Series(rng.normal(size=6)),
+        fold=pl.Series([1, 2, 1, 2, 1, 2]), held_out=pl.col("chrom") == "chr8")
+    el.write_parquet(tmp_path / "el.parquet")
+    out2 = tmp_path / "bench2"
+    res = run("score", out2, f"m={tmp_path / 'ck.pt'}", *[tmp_path / "el.parquet" if x == tmp_path / "v.parquet" else x for x in base],
+              "--ref-only", "--batch", 3)
+    assert res.exit_code == 0, res.output + repr(res.exception)
+    r2, s2 = np.load(out2 / "pred" / "m" / "ref.npy"), pl.read_parquet(out2 / "pred" / "m" / "sites.parquet")
+    assert np.array_equal(r2, np.load(out2 / "pred" / "m" / "alt.npy")) and s2.height == 6
+    k2 = s2.with_row_index("k").filter((pl.col("chrom") == "chr1") & (pl.col("pos") == 1500))["k"][0]
+    assert np.allclose(r2[k2], ref[a], rtol=1e-4, atol=1e-4)                        # the variant run's reference
+    res = run("report-lentimpra", out2)
+    assert res.exit_code == 0, res.output + repr(res.exception)
+    assert json.loads((out2 / "report_lentimpra.json").read_text())[0]["elements"] == 6

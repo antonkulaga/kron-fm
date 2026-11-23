@@ -6,7 +6,7 @@ binding benchmark (ADASTRA, ``prep_asb.py``) and any table of the same shape (MP
         [--batch 1] [--dtype bf16|fp16|fp32] [--shard i/n] [--chunk 131072]
     uv run python scripts/kron_dna/variant_bench.py merge OUT LABEL --shards n       (after every --shard i/n)
     uv run python scripts/kron_dna/variant_bench.py report-asb OUT [--variants T.parquet]
-    uv run python scripts/kron_dna/variant_bench.py report-mpra OUT | report-eqtl OUT
+    uv run python scripts/kron_dna/variant_bench.py report-mpra OUT | report-eqtl OUT | report-lentimpra OUT
 
 ``score``: the table's distinct sites (``chrom``, ``pos`` 0-based, ``ref``, ``alt``, and the read position: ``pos``,
 or ``--read-col``, e.g. a gene's TSS). One window of ``--context`` bases per site, centred between the variant and
@@ -100,6 +100,8 @@ def score(out: Path, checkpoints: list[str] = typer.Argument(..., help="LABEL=CH
           read_col: str = typer.Option("", help="the column of the read position (default: the variant's own)"),
           max_variants: int = 0, name: str = "hg38", context: int = 131072, edge: int = 4096, flank: int = 192,
           batch: int = typer.Option(1, help="sites per forward (each is two sequences)"), seed: int = 0,
+          ref_only: bool = typer.Option(False, help="read the reference only (a table of elements, as lentiMPRA's: "
+                                                    "ref and alt empty); alt.npy is then ref.npy"),
           device: str = "cuda", dtype: str = typer.Option("bf16", help="bf16 | fp16 | fp32"),
           chunk: int = typer.Option(0, help="bases per encoder chunk (memory cap; 0: the whole window at once)"),
           shard: str = typer.Option("", help="i/n: sites k % n == i only, written under OUT/shards/; then merge")) -> None:
@@ -165,12 +167,13 @@ def score(out: Path, checkpoints: list[str] = typer.Argument(..., help="LABEL=CH
             if not pend:
                 return
             span = pend[0][3]
-            seqs = torch.from_numpy(np.stack([s for p in pend for s in (p[1], p[2])])).to(dev)
+            n_seq = 1 if ref_only else 2
+            seqs = torch.from_numpy(np.stack([s for p in pend for s in (p[1], p[2])[:n_seq]])).to(dev)
             sig = signal(seqs, span)
             res = (span[1] - span[0]) // sig.shape[1]         # bases per row of the head's output
             for j, (k, _, _, _, rel) in enumerate(pend):
                 a, b = max((rel - flank - span[0]) // res, 0), (rel + flank - span[0]) // res + 1
-                ref_out[k], alt_out[k] = sig[2 * j, a:b].sum(0), sig[2 * j + 1, a:b].sum(0)
+                ref_out[k], alt_out[k] = sig[n_seq * j, a:b].sum(0), sig[n_seq * j + n_seq - 1, a:b].sum(0)
                 done[k] = True
             pend.clear()
 
@@ -192,7 +195,7 @@ def score(out: Path, checkpoints: list[str] = typer.Argument(..., help="LABEL=CH
         kept = mine.filter(pl.Series(done)).drop("w_lo")
         info = dict(label=label, source=str(ck), step=int(state.get("step", -1)), head=head, store=str(store.path),
                     ids=list(store.ids), context=context, edge=edge, flank=flank, where=where, read_col=read_col,
-                    max_variants=max_variants, seed=seed, variants=str(variants), dtype=dtype, chunk=chunk,
+                    max_variants=max_variants, seed=seed, ref_only=ref_only, variants=str(variants), dtype=dtype, chunk=chunk,
                     sites_in_table=n_all, sites_in_window=sites.height, sites_scored=kept.height,
                     ref_mismatch=int((~done).sum()), seconds=round(time.time() - t0, 1),
                     commit=((state.get("run_record") or {}).get("source") or {}).get("commit"))
@@ -419,6 +422,60 @@ def report_eqtl(out: Path, variants: Path = typer.Option(None, help="prep_eqtl_f
                          f"[{row['auroc_ci'][0]:.3f},{row['auroc_ci'][1]:.3f}] ap={row['ap']:.3f} (chance {row['chance']:.3f}) "
                          f"pair wins={row['pair_wins']:.3f} of {pr.height} distance auroc={row['distance_auroc']:.3f}")
     (out / "report_eqtl.json").write_text(json.dumps(table, indent=1))
+    typer.echo("\n".join(lines))
+
+
+# ------------------------------------------------------------------------------------------------ the lentiMPRA report
+
+def ridge_cv(x: np.ndarray, y: np.ndarray, fold: np.ndarray, lam: float = 100.0) -> np.ndarray:
+    """Out-of-fold ridge predictions of ``y`` from ``x`` (standardised on each training part), by the given folds."""
+    out = np.full(len(y), np.nan)
+    for f in np.unique(fold):
+        te = fold == f
+        mu, sd = x[~te].mean(0), x[~te].std(0) + 1e-6
+        a, b = (x[~te] - mu) / sd, (x[te] - mu) / sd
+        w = np.linalg.solve(a.T @ a + lam * np.eye(a.shape[1]), a.T @ (y[~te] - y[~te].mean()))
+        out[te] = b @ w + y[~te].mean()
+    return out
+
+
+@app.command("report-lentimpra")
+def report_lentimpra(out: Path, variants: Path = typer.Option(None, help="prep_lentimpra.py's table (default: the one "
+                                                                         "scored)"), lam: float = 100.0) -> None:
+    """lentiMPRA activity of native 200-bp elements (Agarwal et al. 2025) against the head's prediction at their
+    place in the genome (scored with ``--ref-only``), per cell line: Pearson of the measured ``log2(RNA/DNA)`` with
+    (a) the mean ``log1p`` signal over the cell line's own channels, where the store has them, and (b) a ridge probe
+    on every channel's ``log1p`` signal, fitted out-of-fold on the paper's ten folds (their Table S6 gives Enformer,
+    Sei and MPRALegNet on the same folds). chr8/chr9 elements apart (probe fitted on the others)."""
+    lines, table = [], []
+    for d in sorted((out / "pred").iterdir()):
+        if not (d / "index.json").exists():
+            continue
+        info = json.loads((d / "index.json").read_text())
+        t = pl.read_parquet(variants or Path(info["variants"])).filter(pl.col("activity").is_not_null())
+        sites = pl.read_parquet(d / "sites.parquet").with_row_index("at")
+        x_all = np.log1p(np.load(d / "ref.npy")).astype(np.float64)
+        t = t.join(sites.select("chrom", "pos", "at"), on=["chrom", "pos"])
+        meta = Path(info["store"]) / "binned.json"
+        tracks = json.loads(meta.read_text())["tracks"] if meta.exists() else []
+        for (cell,), s in t.group_by("cell", maintain_order=True):
+            y, x = s["activity"].to_numpy(), x_all[s["at"].to_numpy()]
+            own = [k for k, tr in enumerate(tracks) if norm(str(tr.get("biosample", ""))) == norm(cell)]
+            held = s["held_out"].to_numpy()
+            oof = ridge_cv(x, y, s["fold"].to_numpy(), lam)
+            pear = lambda a, b: float(np.corrcoef(a, b)[0, 1]) if len(a) > 2 else float("nan")
+            row = dict(label=d.name, head=info["head"], cell=cell, elements=s.height, own_channels=len(own),
+                       probe_pearson=pear(oof, y), probe_by_fold=[pear(oof[s["fold"].to_numpy() == f], y[s["fold"].to_numpy() == f])
+                                                                  for f in sorted(set(s["fold"].to_list()))],
+                       own_pearson=pear(x[:, own].mean(1), y) if own else None, held_out=int(held.sum()))
+            if held.sum() > 50:                          # the probe fitted on the other chromosomes
+                ho = ridge_cv(x, y, held.astype(int), lam)
+                row["probe_pearson_held_out"] = pear(ho[held], y[held])
+            table.append(row)
+            lines.append(f"{d.name:20s} {cell:6s} n={s.height:6d} probe={row['probe_pearson']:.3f} "
+                         f"held-out chr8/chr9={row.get('probe_pearson_held_out', float('nan')):.3f} "
+                         + (f"own({len(own)})={row['own_pearson']:.3f}" if own else "own: none"))
+    (out / "report_lentimpra.json").write_text(json.dumps(table, indent=1))
     typer.echo("\n".join(lines))
 
 
