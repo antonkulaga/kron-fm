@@ -35,6 +35,7 @@ ROUTES = {
     ("labels", "genes"): ("prep_gene_structure_labels.py", None),
     ("split", "syntenic"): ("prep_syntenic_split.py", None),
     ("split", "orthologs"): ("prep_ortholog_split.py", None),
+    ("eval", "crispri"): ("prep_crispri_pairs.py", None),
     ("check", "histone"): ("check_chip_store.py", "keep"),
     ("check", "tf"): ("check_chip_store.py", "keep"),
     ("check", "accessibility"): ("check_chip_store.py", "keep"),
