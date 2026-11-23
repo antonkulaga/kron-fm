@@ -114,6 +114,13 @@ def test_score_merge_and_asb_report(genomes, tmp_path, monkeypatch, device):
     assert res.exit_code == 0, res.output + repr(res.exception)
     rm = next(r for r in json.loads((out / "report_mpra.json").read_text()) if r["label"] == "m")
     assert rm["variants"] == n - 1 and -1 <= rm["spearman_all"] <= 1 and rm["own_channels"] == 0
+    # the human-vs-chimp report reads the same table shape, with a test statistic and a count of substitutions
+    mp.with_columns(differential=pl.lit(True), n_subs=pl.lit(1), t=pl.col("effect")).write_parquet(tmp_path / "hsub.parquet")
+    res = run("report-hsub", out, "--variants", tmp_path / "hsub.parquet", "--min-rows", 3, "--n-boot", 5)
+    assert res.exit_code == 0, res.output + repr(res.exception)
+    rh = [r for r in json.loads((out / "report_hsub.json").read_text()) if r["label"] == "m"]
+    assert {r["subset"] for r in rh} >= {"confident", "differential"} and rh[0]["fragments"] == n - 1
+    assert 0 <= next(r for r in rh if r["subset"] == "differential")["auroc_all"] <= 1
     # the eQTL report: the same sites as a positive/negative table read at "the TSS" (here each variant's position)
     eq = t.select("chrom", "ref", "alt", "held_out", position="pos", tss="pos").with_row_index("k").with_columns(
         label=(pl.col("k") % 2).cast(pl.Int32), pair=(pl.col("k") // 2).cast(pl.Int64), strand=pl.lit("+"),

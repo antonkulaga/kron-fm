@@ -28,6 +28,7 @@ intervals.
 from __future__ import annotations
 
 import json
+import re
 import time
 from pathlib import Path
 
@@ -385,6 +386,56 @@ def report_mpra(out: Path, variants: Path = typer.Option(None, help="prep_mpra_s
                   f"spearman={r['spearman_all']:.3f}" + (f" own({r['own_channels']})={r['pearson_own']:.3f}" if r["own_channels"] else "")
                   for r in per]
     (out / "report_mpra.json").write_text(json.dumps(table, indent=1))
+    typer.echo("\n".join(lines))
+
+
+@app.command("report-hsub")
+def report_hsub(out: Path, variants: Path = typer.Option(None, help="prep_hsub_mpra.py's table (default: the one scored)"),
+                cells: str = typer.Option("^H9$|neural progenitor|neuronal stem|neurosphere", help="regex on a track's "
+                                          "biosample: the assay's cell type"), n_boot: int = 200, min_rows: int = 20) -> None:
+    """Human-versus-chimpanzee fragments (``prep_hsub_mpra.py``; scored with ``--read-col centre --flank-col half``):
+    the head's predicted change, the mean over channels of ``log2((alt + 1) / (ref + 1))`` at the fragment, against
+    the measured chimp-over-human effect. Over the confident fragments Pearson and Spearman; over the differential
+    ones (fdr < 0.05) the AUROC of the direction as well. All channels, and those of the assay's cell type
+    (``--cells``); chr8/chr9 and single-substitution fragments apart."""
+    lines, table = [], []
+    for d in sorted((out / "pred").iterdir()):
+        if not (d / "index.json").exists():
+            continue
+        info = json.loads((d / "index.json").read_text())
+        t = pl.read_parquet(variants or Path(info["variants"])).filter("confident")
+        sites = pl.read_parquet(d / "sites.parquet").with_row_index("at")
+        delta = np.log2((np.load(d / "alt.npy") + EPS) / (np.load(d / "ref.npy") + EPS))
+        t = t.join(sites.select("chrom", "pos", "ref", "alt", "at", centre="read"), on=["chrom", "pos", "ref", "alt", "centre"])
+        meta = Path(info["store"]) / "binned.json"
+        tracks = json.loads(meta.read_text())["tracks"] if meta.exists() else []
+        own = [k for k, tr in enumerate(tracks) if re.search(cells, str(tr.get("biosample", "")))]
+        rows = t["at"].to_numpy()
+        t = t.with_columns(pred_all=pl.Series(delta[rows].mean(1).astype(np.float64)),
+                           pred_own=pl.Series(delta[rows][:, own].mean(1).astype(np.float64)) if own else pl.lit(None, dtype=pl.Float64))
+        subsets = [("confident", t), ("differential", t.filter("differential")),
+                   ("differential, chr8/chr9", t.filter(pl.col("differential") & pl.col("held_out"))),
+                   ("differential, other chrom.", t.filter(pl.col("differential") & ~pl.col("held_out"))),
+                   ("differential, 1 substitution", t.filter(pl.col("differential") & (pl.col("n_subs") == 1))),
+                   ("differential, top 200 by |t|", t.filter("differential").sort(pl.col("t").abs(), descending=True).head(200))]
+        for nm, s in subsets:
+            if s.height < min_rows:
+                continue
+            y = s["effect"].to_numpy()
+            row = dict(label=d.name, head=info["head"], subset=nm, fragments=s.height, own_channels=len(own))
+            for k in ("all", "own") if own else ("all",):
+                v = s[f"pred_{k}"].to_numpy()
+                row[f"pearson_{k}"] = float(np.corrcoef(v, y)[0, 1]) if v.std() > 0 else float("nan")
+                row[f"spearman_{k}"] = spearman(v, y)
+                if nm != "confident":
+                    row[f"auroc_{k}"] = auroc(v, y > 0)
+                    row[f"auroc_{k}_ci"] = ci(lambda i: auroc(v[i], y[i] > 0), len(y), n_boot)
+            table.append(row)
+            lines.append(f"{d.name:20s} {nm:30s} n={s.height:6d} " + " ".join(
+                f"{k}: r={row[f'pearson_{k}']:.3f} rho={row[f'spearman_{k}']:.3f}"
+                + (f" auroc={row[f'auroc_{k}']:.3f}[{row[f'auroc_{k}_ci'][0]:.3f},{row[f'auroc_{k}_ci'][1]:.3f}]" if f"auroc_{k}" in row else "")
+                for k in (("all", "own") if own else ("all",))) + f" (own channels {len(own)})")
+    (out / "report_hsub.json").write_text(json.dumps(table, indent=1))
     typer.echo("\n".join(lines))
 
 
