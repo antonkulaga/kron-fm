@@ -65,3 +65,18 @@ def test_numpy_targets_equal_the_heads_torch_targets():
     np.testing.assert_allclose(got, ref.numpy(), rtol=2e-5, atol=1e-5)
     back = T.encode_u8(T.decode_u8(u8[:, 0], scales[0]), float(scales[0]))   # the encoding inverts its decoding
     assert np.abs(back.astype(int) - u8[:, 0]).max() <= 1
+
+
+def test_one_intron_rule_with_a_minimum_length(tmp_path):
+    """The shared reader and intron rule: GTF and GFF3 give the same table; gaps shorter than min_len are not introns."""
+    from kron_dna.prep import features as F
+    gtf = tmp_path / "a.gtf"
+    gtf.write_text("".join(f"c1\tX\texon\t{a}\t{b}\t.\t+\t.\ttranscript_id \"t\";\n"
+                           for a, b in ((1, 100), (103, 200), (301, 400))))
+    gff = tmp_path / "a.gff3"
+    gff.write_text("##gff-version 3\n" + "".join(f"c1\tX\texon\t{a}\t{b}\t.\t+\t.\tParent=t\n"
+                                                for a, b in ((1, 100), (103, 200), (301, 400))))
+    a, b = F.read_features(gtf), F.read_features(gff)
+    assert a.drop("tid").equals(b.drop("tid"))
+    assert sorted(F.introns(a, 1).select("s", "e").rows()) == [(100, 102), (200, 300)]
+    assert F.introns(a, 4).select("s", "e").rows() == [(200, 300)]          # the 2-base gap is not a splice intron
