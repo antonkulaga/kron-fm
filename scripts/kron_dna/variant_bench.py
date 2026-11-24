@@ -45,6 +45,8 @@ from kron_dna import xheads as X
 app = typer.Typer(add_completion=False)
 BIN = 128
 EPS = 1.0
+PAIR_TEST = ["chr3", "chr10", "chr16"]      # prep_cf_pairs.py trains no counterfactual pair on these: an arm trained
+PT = pl.col("chrom").is_in(PAIR_TEST)       # on its pairs is quoted on chr8/chr9 and on these ("pair test") only
 CODE = {"A": 0, "C": 1, "G": 2, "T": 3, "N": 4}
 KEY = ["chrom", "pos", "ref", "alt", "read"]
 STORES = {"chiptf": "chip-tf-v1-bin128", "chiphr": "chip-histone-rest-v1-bin128", "chip492b": "chip-histone-core-v1-bin128",
@@ -301,6 +303,7 @@ def report_asb(out: Path, variants: Path = typer.Option(None, help="the ASB tabl
         for tier in r["match"].unique().sort():
             s = r.filter(pl.col("match") == tier)
             subsets += [(f"{tier}", s), (f"{tier}, chr8/chr9 (held out)", s.filter("held_out")),
+                        (f"{tier}, chr3/chr10/chr16 (pair test)", s.filter(PT)),
                         (f"{tier}, other chromosomes", s.filter(~pl.col("held_out"))),
                         (f"{tier}, with a motif hit", s.filter(pl.col("motif_conc") != "No Hit")),
                         (f"{tier}, no motif hit", s.filter(pl.col("motif_conc") == "No Hit"))]
@@ -364,7 +367,8 @@ def report_mpra(out: Path, variants: Path = typer.Option(None, help="prep_mpra_s
             y, rows = s["effect"].to_numpy(), s["at"].to_numpy()
             own = cells.get(norm(s["cell"][0]), [])
             row = dict(label=d.name, head=info["head"], experiment=exp, element=s["element"][0], kind=s["kind"][0],
-                       cell=s["cell"][0], primary=bool(s["primary"][0]), held_out=bool(s["held_out"][0]), variants=s.height,
+                       cell=s["cell"][0], primary=bool(s["primary"][0]), held_out=bool(s["held_out"][0]),
+                       pair_test=s["chrom"][0] in PAIR_TEST, variants=s.height,
                        own_channels=len(own))
             for k, v in (("all", delta[rows].mean(1)), ("own", delta[rows][:, own].mean(1) if own else None)):
                 if v is not None:
@@ -376,6 +380,7 @@ def report_mpra(out: Path, variants: Path = typer.Option(None, help="prep_mpra_s
         for nm, rs in (("primary experiments", prim), ("promoters", [r for r in prim if r["kind"] == "promoter"]),
                        ("enhancers", [r for r in prim if r["kind"] == "enhancer"]),
                        ("chr8/chr9 (held out)", [r for r in prim if r["held_out"]]),
+                       ("chr3/10/16 (pair test)", [r for r in prim if r["pair_test"]]),
                        ("with own cell line", [r for r in prim if r["own_channels"]])):
             if rs:
                 mean = lambda k: float(np.mean(v)) if (v := [r[k] for r in rs if np.isfinite(r.get(k, np.nan))]) else float("nan")
@@ -415,6 +420,7 @@ def report_hsub(out: Path, variants: Path = typer.Option(None, help="prep_hsub_m
                            pred_own=pl.Series(delta[rows][:, own].mean(1).astype(np.float64)) if own else pl.lit(None, dtype=pl.Float64))
         subsets = [("confident", t), ("differential", t.filter("differential")),
                    ("differential, chr8/chr9", t.filter(pl.col("differential") & pl.col("held_out"))),
+                   ("differential, chr3/10/16 (pair test)", t.filter(pl.col("differential") & PT)),
                    ("differential, other chrom.", t.filter(pl.col("differential") & ~pl.col("held_out"))),
                    ("differential, 1 substitution", t.filter(pl.col("differential") & (pl.col("n_subs") == 1))),
                    ("differential, top 200 by |t|", t.filter("differential").sort(pl.col("t").abs(), descending=True).head(200))]
@@ -462,7 +468,8 @@ def report_eqtl(out: Path, variants: Path = typer.Option(None, help="prep_eqtl_f
         t = t.join(sites.select("chrom", "pos", "ref", "alt", "at", tss="read"), on=["chrom", "pos", "ref", "alt", "tss"])
         score = np.array([mag[a, by[s] or slice(None)].mean() for a, s in zip(t["at"].to_numpy(), t["strand"].to_list())])
         t = t.with_columns(score=pl.Series(score))
-        for nm, s in (("all", t), ("chr8/chr9 (held out)", t.filter("held_out")), ("other chromosomes", t.filter(~pl.col("held_out"))),
+        for nm, s in (("all", t), ("chr8/chr9 (held out)", t.filter("held_out")), ("chr3/chr10/chr16 (pair test)", t.filter(PT)),
+                      ("other chromosomes", t.filter(~pl.col("held_out"))),
                       ("within 10 kb of the TSS", t.filter(pl.col("distance").abs() <= 10_000)),
                       ("beyond 10 kb", t.filter(pl.col("distance").abs() > 10_000))):
             y = (s["label"] == 1).to_numpy()
@@ -548,9 +555,13 @@ def report_lentimpra(out: Path, variants: Path = typer.Option(None, help="prep_l
             if held.sum() > 50:                          # the probe fitted on the other chromosomes
                 ho = ridge_cv(x, y, held.astype(int), lam)
                 row["probe_pearson_held_out"] = pear(ho[held], y[held])
+            pt = s["chrom"].is_in(PAIR_TEST).to_numpy()
+            if pt.sum() > 50:                            # likewise for the pair-test chromosomes
+                row["probe_pearson_pair_test"] = pear(ridge_cv(x, y, pt.astype(int), lam)[pt], y[pt])
             table.append(row)
             lines.append(f"{d.name:20s} {cell:6s} {group:9s} n={s.height:6d} probe={row['probe_pearson']:.3f} "
                          f"held-out chr8/chr9={row.get('probe_pearson_held_out', float('nan')):.3f} "
+                         f"pair-test chr3/10/16={row.get('probe_pearson_pair_test', float('nan')):.3f} "
                          + (f"own({len(own)})={row['own_pearson']:.3f}" if own else "own: none") + f"  [{head}, {x.shape[1]} channels]")
     (out / "report_lentimpra.json").write_text(json.dumps(table, indent=1))
     typer.echo("\n".join(lines))
@@ -579,7 +590,8 @@ def report_mfass(out: Path, variants: Path = typer.Option(None, help="prep_mfass
         own = {"+": [ch["acceptor_plus"], ch["donor_plus"]], "-": [ch["acceptor_minus"], ch["donor_minus"]]}
         pred = np.array([delta[a, own[s]].mean() for a, s in zip(t["at"].to_numpy(), t["strand"].to_list())])
         t = t.with_columns(pred=pl.Series(pred))
-        subsets = [("all", t), ("chr8/chr9 (held out)", t.filter("held_out")), ("other chromosomes", t.filter(~pl.col("held_out")))]
+        subsets = [("all", t), ("chr8/chr9 (held out)", t.filter("held_out")), ("chr3/chr10/chr16 (pair test)", t.filter(PT)),
+                   ("other chromosomes", t.filter(~pl.col("held_out")))]
         subsets += [(str(r), t.filter(pl.col("region") == r)) for r in t["region"].drop_nulls().unique().sort()]
         for nm, s in subsets:
             y = s["sdv"].to_numpy().astype(bool)
