@@ -41,6 +41,7 @@ class Pair:
     sign: float                     # -1, 0, +1
     weight: float
     del_span: tuple[int, int] | None
+    table: str = ""
 
 
 def channels_for(ids: list[str], channel_ids, strand) -> np.ndarray:
@@ -89,13 +90,25 @@ class CfPairs:
             ds = (int(r["del_start"]), int(r["del_end"])) if ("del_start" in cols and r.get("del_start") is not None
                                                               and not (r["ref"] or r["alt"])) else None
             e = float(r["effect"]) if r["effect"] is not None else 0.0
+            if "regulated" in cols and r.get("regulated") is False:    # a measured absence (CRISPRi): no sign
+                e = 0.0
             self.pairs.append(Pair(r["chrom"], int(r["pos"]), r["ref"] or "", r["alt"] or "", int(r["read_pos"]),
-                                   r["head"], ch, float(np.sign(e)), float(r["weight"] or 0.0), ds))
+                                   r["head"], ch, float(np.sign(e)), float(r["weight"] or 0.0), ds, r["_table"]))
         self.pairs = [p for p in self.pairs if p.weight > 0]
         self.counts["pairs"] = len(self.pairs)
+        self.by_table: dict[str, list[int]] = {}
+        for k, p in enumerate(self.pairs):
+            self.by_table.setdefault(p.table, []).append(k)
 
     def sample(self, rng: np.random.Generator, k: int) -> list[Pair]:
-        return [self.pairs[i] for i in rng.integers(0, len(self.pairs), k)]
+        """``k`` pairs, each from a table drawn uniformly (allelic binding alone has ~90 % of the rows, so a
+        uniform draw over rows would be that table only), then a row of it uniformly."""
+        names = sorted(self.by_table)
+        out = []
+        for _ in range(k):
+            rows = self.by_table[names[int(rng.integers(0, len(names)))]]
+            out.append(self.pairs[rows[int(rng.integers(0, len(rows)))]])
+        return out
 
 
 def codes_of(contigs: pl.DataFrame, read, chrom: str, lo: int, hi: int) -> np.ndarray:

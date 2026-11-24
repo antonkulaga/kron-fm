@@ -104,3 +104,17 @@ def test_option_checks(genomes, tmp_path, monkeypatch):
     root, parent, store, child = XT.setup(genomes, tmp_path, monkeypatch)
     res, _ = run(cli, monkeypatch, root, tmp_path / "bad", child + ["--cf-weight", "1.0"])
     assert res.exit_code != 0 and "needs --cf-pairs" in MGT.flat(res.output)
+
+
+def test_tables_drawn_evenly_and_crispri_absences_unsigned(tmp_path):
+    big = table([("chr1", 100 + 10 * k, "A", "G", 120 + 10 * k, "dnase", ["F0"], 1.0, 1.0, "train") for k in range(90)])
+    small = table([("chr2", 100 + 10 * k, "A", "G", 120 + 10 * k, "dnase", ["F0"], 1.0, 1.0, "train") for k in range(10)])
+    small = small.with_columns(pl.Series("regulated", [k < 2 for k in range(10)]))
+    big.write_parquet(tmp_path / "big.parquet")
+    small.write_parquet(tmp_path / "small.parquet")
+    cf = CF.CfPairs([tmp_path / "big.parquet", tmp_path / "small.parquet"], {"dnase": ["F0"]}, {"chr8"}, 1024)
+    got = cf.sample(np.random.default_rng(0), 2000)
+    share = sum(p.table == "small" for p in got) / len(got)
+    assert 0.45 < share < 0.55
+    signs = [p.sign for p in cf.pairs if p.table == "small"]
+    assert signs.count(0.0) == 8 and signs.count(1.0) == 2
