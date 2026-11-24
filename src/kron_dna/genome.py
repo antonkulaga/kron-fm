@@ -82,6 +82,10 @@ class KronGenomeConfig:
     local_span: int = 8192      # the local track's state restarts every this many bases (bounded memory)
     chunk_length_feature: bool = False  # with chunking: tell the core each chunk's log-length (time-aware gating)
     jepa: bool = False          # a predictor of an EMA target's core states from the masked input's (JEPA-DNA)
+    jepa_pred_kind: str = "mlp"  # the JEPA predictor: "mlp" (per bin, as before) or "context" (a mask embedding
+                                # at hidden bins, then bidirectional KronLSTM layers over the core states and a residual
+                                # readout that starts as the identity, so it begins as the masked core: JepaContextPredictor)
+    jepa_pred_layers: int = 2   # context: KronLSTM layers of the predictor
     n_contexts: int = 0         # v2: learned context embeddings added to the core's input bins: 0 nuclear, else
                                 # the organelle's NCBI genetic code table (2 vertebrate mito, 5 invertebrate, ...)
     n_ntv3: int = 0             # quantitative per-base assay tracks (NTv3 bigwigs): one output per track, predicted
@@ -103,6 +107,43 @@ class KronGenomeConfig:
 
     def to_dict(self) -> dict:
         return asdict(self)
+
+
+class JepaContextPredictor(nn.Module):
+    """A JEPA predictor that reads context (genome-train --jepa-pred context): a learned mask embedding is added at the
+    hidden bins, ``layers`` bidirectional KronLSTM blocks run over the core states of each packed row, and a residual
+    readout zero-initialised, so at the start it returns the core states as they are (the masked core, the
+    baseline it must beat)."""
+
+    def __init__(self, c: "KronGenomeConfig") -> None:
+        super().__init__()
+        self.mask = nn.Parameter(torch.zeros(c.d_model))
+        self.layers = nn.ModuleList(BiKronLSTMBlock(c.d_model, c.n_heads, c.ff_units, c.dropout, c.n_layers + i)
+                                    for i in range(c.jepa_pred_layers))
+        self.out_norm = nn.RMSNorm(c.d_model, eps=1e-5)
+        self.out = nn.Linear(c.d_model, c.d_model)
+        nn.init.zeros_(self.out.weight)
+        nn.init.zeros_(self.out.bias)
+
+    def forward(self, core: torch.Tensor, cu: torch.Tensor, hidden: torch.Tensor | None = None) -> torch.Tensor:
+        h = core if hidden is None else core + hidden.unsqueeze(-1).to(core.dtype) * self.mask.to(core.dtype)
+        for layer in self.layers:
+            h = layer(h, cu)
+        return core + self.out(self.out_norm(h))
+
+
+def make_jepa_predictor(c: "KronGenomeConfig") -> nn.Module | None:
+    """The config's JEPA predictor, or None without ``jepa``."""
+    if not c.jepa:
+        return None
+    if c.jepa_pred_kind == "context":
+        if c.arch == "v3" or c.chunk_ratio:
+            raise ValueError("jepa_pred_kind context needs arch v1, v2 or v2l without learned chunking")
+        return JepaContextPredictor(c)
+    if c.jepa_pred_kind != "mlp":
+        raise ValueError(f"jepa_pred_kind must be mlp or context, got {c.jepa_pred_kind!r}")
+    return nn.Sequential(nn.RMSNorm(c.d_model, eps=1e-5), nn.Linear(c.d_model, 2 * c.d_model), nn.GELU(),
+                         nn.Linear(2 * c.d_model, c.d_model))
 
 
 def one_hot(seq: torch.Tensor) -> torch.Tensor:
@@ -333,8 +374,8 @@ class KronGenome(nn.Module):
         self.last_ntv3 = None
         self._init_xheads(c, widths[0])
         self.context = nn.Embedding(c.n_contexts, c.d_model) if c.n_contexts else None
-        self.jepa_pred = nn.Sequential(nn.RMSNorm(c.d_model, eps=1e-5), nn.Linear(c.d_model, 2 * c.d_model), nn.GELU(),
-                                       nn.Linear(2 * c.d_model, c.d_model)) if c.jepa else None
+        self.jepa_pred = make_jepa_predictor(c)
+        self.jepa_hidden, self.jepa_decode_pred = None, False
         self.last_jepa = None
         if c.n_epigenomes:
             hid = 256
@@ -518,8 +559,8 @@ class KronGenome(nn.Module):
         self.context = nn.Embedding(c.n_contexts, c.d_model) if c.n_contexts else None
         if self.context is not None:
             nn.init.zeros_(self.context.weight)
-        self.jepa_pred = nn.Sequential(nn.RMSNorm(c.d_model, eps=1e-5), nn.Linear(c.d_model, 2 * c.d_model), nn.GELU(),
-                                       nn.Linear(2 * c.d_model, c.d_model)) if c.jepa else None
+        self.jepa_pred = make_jepa_predictor(c)
+        self.jepa_hidden, self.jepa_decode_pred = None, False
         self.last_jepa = self.last_epi = self.last_ratio_loss = self.last_chunks = None
         self.checkpoint_core = False
         if c.n_epigenomes:
@@ -621,9 +662,9 @@ class KronGenome(nn.Module):
         core = self.run_core(h.reshape(1, b * bins, -1), cu,
                              checkpoint=self.checkpoint_core and torch.is_grad_enabled()).reshape(b, bins, -1)
         # inside forward, so data-parallel training syncs the predictor's gradients
-        self.last_jepa = self.jepa_pred(core) if self.jepa_pred is not None and self.training else None
+        self.last_jepa = self.predict_jepa(core, cu) if self.jepa_pred is not None and self.training else None
         self.last_epi = self.epigenome_logits(core) if self.config.n_epigenomes else None
-        x = self.add_local(self.decode(core.transpose(1, 2), skips), skips)
+        x = self.add_local(self.decode(self.core_to_decode(core).transpose(1, 2), skips), skips)
         tracks = self.tracks(x).transpose(1, 2) if self.tracks is not None else None   # [B, L, n_tracks]
         self.last_ntv3 = self.ntv3(x).transpose(1, 2) if self.ntv3 is not None else None
         self.last_x, self.last_x_at = self.run_xheads(x)
@@ -715,6 +756,23 @@ class KronGenome(nn.Module):
             skips.append(x)
             x = F.max_pool1d(block(x), 2)
         return x, skips
+
+    def predict_jepa(self, core: torch.Tensor, cu: torch.Tensor | None = None) -> torch.Tensor:
+        """The JEPA predictor on core states ``[B, bins, d]``: per bin (``mlp``), or reading the packed rows ``cu`` with
+        the hidden bins ``self.jepa_hidden`` [B, bins] bool (None: no mask embedding) marked (``context``)."""
+        if isinstance(self.jepa_pred, JepaContextPredictor):
+            if cu is None:
+                b_, n_ = core.shape[:2]
+                cu = torch.arange(0, b_ * n_ + 1, n_, device=core.device, dtype=torch.int32)
+            return self.jepa_pred(core, cu, self.jepa_hidden)
+        return self.jepa_pred(core)
+
+    def core_to_decode(self, core: torch.Tensor) -> torch.Tensor:
+        """The core states the decoder reads: ``core``, or with ``jepa_decode_pred`` (genome-train --jepa-decode-pred,
+        training only) the predictor's states at the hidden bins, so the decoder and the heads train on them."""
+        if not (self.training and self.jepa_decode_pred and self.last_jepa is not None and self.jepa_hidden is not None):
+            return core
+        return torch.where(self.jepa_hidden.unsqueeze(-1), self.last_jepa.to(core.dtype), core)
 
     def run_core(self, h: torch.Tensor, cu: torch.Tensor, checkpoint: bool = False) -> torch.Tensor:
         """The KronLSTM core over ``[1, N, d_model]`` packed bins; ``checkpoint`` recomputes each layer in backward."""
@@ -878,17 +936,18 @@ class KronGenome(nn.Module):
         cu = torch.cat([starts, torch.tensor([flat.numel()], device=dev0)]).to(torch.int32)
         core = self.run_core(h.reshape(1, b * bins, -1), cu,
                              checkpoint=self.checkpoint_core and torch.is_grad_enabled()).reshape(b, bins, -1)
-        self.last_jepa = self.jepa_pred(core) if self.jepa_pred is not None and self.training else None
+        self.last_jepa = self.predict_jepa(core, cu) if self.jepa_pred is not None and self.training else None
         self.last_epi = self.epigenome_logits(core) if self.config.n_epigenomes else None
         self.last_ntv3 = None
         self.last_x = {}
         if core_only:
             return [], core
         pieces = []
+        core_dec = self.core_to_decode(core)
         for k, (_, rows, start, end, lo, hi) in enumerate(plan):
             d, r = devices[k], reps[devices[k]]
             skips = enc[k][0]
-            y = r.decode(core[rows, lo // unit:hi // unit].transpose(1, 2).to(d), skips)
+            y = r.decode(core_dec[rows, lo // unit:hi // unit].transpose(1, 2).to(d), skips)
             y = y[:, :, start - lo:end - lo]                          # heads are per position: crop first
             pieces.append(SplitPiece(rows=rows, start=start, end=end, device=d, logits=r.head(y).transpose(1, 2),
                                      tracks=r.tracks(y).transpose(1, 2) if r.tracks is not None else None,

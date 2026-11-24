@@ -960,6 +960,24 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                                                       "keeps positions inside blocks out of the masked-base, NTv3 "
                                                       "track, epigenome and --labels track losses; include scores "
                                                       "them there as elsewhere"),
+                 jepa_pred: str = typer.Option("mlp", help="with --jepa-weight: the predictor, mlp (per bin, as "
+                                               "before) or context (a mask embedding at hidden bins and "
+                                               "--jepa-pred-layers bidirectional KronLSTM layers over the core "
+                                               "states; it starts as the masked core). A change needs --init"),
+                 jepa_pred_layers: int = typer.Option(2, help="with --jepa-pred context: its KronLSTM layers"),
+                 jepa_loss: str = typer.Option("cos", help="with --jepa-weight: cos (1 - cosine on raw core states, as "
+                                               "before), zcos (1 - cosine after centring and scaling each dimension "
+                                               "by running statistics of the target states: the states share a "
+                                               "large common direction, which raw cosine rewards), or zcos-mse "
+                                               "(zcos plus the mean squared error of the standardised states, so "
+                                               "the norm is fixed too)"),
+                 jepa_decode_pred: bool = typer.Option(False, help="with --jepa-block-share and --jepa-block-heads "
+                                                       "include: the decoder reads the predictor's states at the "
+                                                       "hidden bins, so the heads' losses there train the predictor "
+                                                       "(the predictor's output must decode)"),
+                 freeze_trunk_until: int = typer.Option(0, help="until this step only the JEPA predictor trains (the "
+                                                        "other parameters' gradients are dropped before the "
+                                                        "update): a warm-up of a new predictor on a frozen model"),
                  jepa_log_every: int = typer.Option(0, help="with --jepa-weight: also write a jepa.csv row (and print "
                                                     "it) every this many steps; 0: only at evaluations, and only "
                                                     "with --jepa-block-share"),
@@ -1167,6 +1185,15 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                                  "--arch v3")
     if jepa_on not in ("hidden", "all") or jepa_block_heads not in ("exclude", "include"):
         raise typer.BadParameter("--jepa-on must be hidden or all, --jepa-block-heads exclude or include")
+    if jepa_pred not in ("mlp", "context") or jepa_loss not in ("cos", "zcos", "zcos-mse") or jepa_pred_layers < 1:
+        raise typer.BadParameter("--jepa-pred must be mlp or context, --jepa-loss cos, zcos or zcos-mse, "
+                                 "--jepa-pred-layers >= 1")
+    if jepa_weight <= 0 and (jepa_pred != "mlp" or jepa_loss != "cos" or jepa_decode_pred or freeze_trunk_until):
+        raise typer.BadParameter("--jepa-pred, --jepa-loss, --jepa-decode-pred and --freeze-trunk-until need "
+                                 "--jepa-weight > 0")
+    if jepa_decode_pred and (jepa_block_share <= 0 or jepa_block_heads != "include"):
+        raise typer.BadParameter("--jepa-decode-pred needs --jepa-block-share > 0 and --jepa-block-heads include "
+                                 "(the heads must be scored inside the blocks for the decoded states to train)")
     if jepa_log_every < 0 or (jepa_log_every > 0 and jepa_weight <= 0):
         raise typer.BadParameter("--jepa-log-every must be >= 0 and needs --jepa-weight > 0")
     if jepa_block_share > 0:
@@ -1194,6 +1221,7 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
             raise typer.BadParameter(f"--jepa-block-len: {err}") from None
     guard = G.jepa_guard_new()          # --jepa-guard state; with off its factor stays 1 and the loss is as before
     guard_saved = None                  # the state a resumed checkpoint carries
+    jnorm_saved = None                  # --jepa-loss zcos: the running target statistics a resumed checkpoint carries
     teacher_saved, resumed = None, False
     xstage_saved = None
     jepa_log = main and jepa_weight > 0 and (jepa_block_share > 0 or jepa_log_every > 0 or jepa_guard != "off")
@@ -1928,6 +1956,7 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                                 xhead_width=xhead_width,
                                 n_tracks=len(G.TRACKS) if labels else 0, arch=arch, head_hidden=head_hidden,
                                 n_contexts=n_contexts, n_in_extra=n_in_extra, jepa=jepa_weight > 0,
+                                jepa_pred_kind=jepa_pred, jepa_pred_layers=jepa_pred_layers,
                                 n_epigenomes=n_epi if epigenome_weight > 0 else 0, chunk_ratio=chunk_ratio,
                                 n_ntv3=len(ntv3["ids"]) if ntv3 else 0,
                                 chunk_length_feature=chunk_length_feature,
@@ -2111,6 +2140,7 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
         step, hours = state["step"], state.get("hours", 0.0)
         say(f"resumed at step {step}")
         guard_saved = state.get("jepa_guard")
+        jnorm_saved = state.get("jepa_norm")
         teacher_saved, resumed = state.get("jepa_target"), True
         xstage_saved = state.get("xstage")
     elif init is not None and not bench:
@@ -2257,6 +2287,31 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
         elif jepa_ema > 0 and resumed:
             say("note: the checkpoint carries no EMA teacher (older code): the teacher restarts as a copy of the "
                 "resumed weights")
+    # --jepa-loss zcos: running per-dimension mean and variance of the target's core states (momentum 0.99), the
+    # frame the loss is taken in; carried in the checkpoint so a resumption keeps its frame
+    jnorm = {k_: v_.to(dev) for k_, v_ in jnorm_saved.items()} if jnorm_saved and jepa_loss != "cos" else {}
+    if jepa_weight > 0:
+        model.jepa_decode_pred = jepa_decode_pred
+        if jepa_pred != "mlp" or jepa_loss != "cos" or jepa_decode_pred or freeze_trunk_until:
+            say(f"jepa step 2: predictor {jepa_pred}" + (f" ({jepa_pred_layers} KronLSTM layers)" if jepa_pred == "context"
+                else "") + f", loss {jepa_loss}" + (", decoder reads the predictor at hidden bins" if jepa_decode_pred
+                else "") + (f", only the predictor trains until step {freeze_trunk_until}" if freeze_trunk_until else "")
+                + ("; target statistics restored" if jnorm else ""))
+
+    def jnorm_frame(want: torch.Tensor, keep: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Updates the running statistics from this batch's target states at ``keep`` bins (training) and returns
+        (mean, std) [d]."""
+        with torch.no_grad():
+            z_ = want.float()[keep]
+            if z_.shape[0] > 1:
+                m_, v_ = z_.mean(0), z_.var(0)
+                if not jnorm:
+                    jnorm.update(mu=m_, var=v_)
+                else:
+                    jnorm["mu"].lerp_(m_, 0.01)
+                    jnorm["var"].lerp_(v_, 0.01)
+        return jnorm["mu"], jnorm["var"].clamp_min(1e-6).sqrt()
+
     train_model = model
     if world > 1:
         train_model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[dev.index])
@@ -2398,6 +2453,7 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
             # gradients, without their activations at every other base. Evaluation scores whole windows.
             model.x_span = XH.span_of(x_ok, unit) if model.training and x_now else None
         parts_log = {} if jepa_log and model.training else None        # this micro-batch's loss terms, for jepa.csv
+        model.jepa_hidden = blk_bins if model.training else None       # the context predictor and --jepa-decode-pred
         # --split-cards: training windows only (``unsplit``: the --mito-slice part, whole on the first card)
         split_now = split_devs is not None and model.training and not unsplit
         with autocast:
@@ -2539,10 +2595,19 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                 else:
                     _, want_core, _ = target(seq.to(dev), seg.to(dev), ctx.to(dev) if ctx_on else None, **tgt_kw)
             keep_bins = seg.to(dev) == 0                                # not padding
-            cos = F.cosine_similarity(model.last_jepa.float(), want_core.float(), dim=-1)
+            if jepa_loss == "cos":
+                frame = None
+                cos = F.cosine_similarity(model.last_jepa.float(), want_core.float(), dim=-1)
+                dist = 1 - cos
+            else:                       # --jepa-loss zcos: both sides in the target's standardised frame
+                frame = jnorm_frame(want_core, keep_bins)
+                zp_ = (model.last_jepa.float() - frame[0]) / frame[1]
+                zt_ = (want_core.float() - frame[0]) / frame[1]
+                cos = F.cosine_similarity(zp_, zt_, dim=-1)
+                dist = 1 - cos + ((zp_ - zt_).pow(2).mean(-1) if jepa_loss == "zcos-mse" else 0.0)
             if blk_bins is None:
-                jepa_losses.append(float((1 - cos)[keep_bins].mean().detach()))
-                mlm = mlm + jepa_weight * (1 - cos)[keep_bins].mean()
+                jepa_losses.append(float(dist[keep_bins].mean().detach()))
+                mlm = mlm + jepa_weight * dist[keep_bins].mean()
                 z = ctx_core.float()[keep_bins]                         # [N, d] context core states, no padding
             else:
                 # block JEPA: the loss is a mean over the hidden bins (--jepa-on all: over every non-padding bin).
@@ -2551,7 +2616,7 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                 # model's summary of a blanked stretch and need not follow the same distribution.
                 vis_bins = keep_bins & ~blk_bins
                 on_bins = blk_bins if jepa_on == "hidden" else keep_bins
-                jepa_term = (1 - cos)[on_bins].mean() if bool(on_bins.any()) else cos.sum() * 0.0
+                jepa_term = dist[on_bins].mean() if bool(on_bins.any()) else cos.sum() * 0.0
                 jepa_losses.append(float(jepa_term.detach()))
                 mlm = mlm + jepa_weight * jepa_term
                 z = ctx_core.float()[vis_bins]
@@ -2560,7 +2625,11 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                     hid_ = blk_bins if blk_bins is not None else torch.zeros_like(keep_bins)
                     vis_ = keep_bins & ~hid_
                     d_pred = 1 - cos.detach()
-                    d_copy = 1 - F.cosine_similarity(ctx_core.detach().float(), want_core.float(), dim=-1)
+                    if frame is None:
+                        d_copy = 1 - F.cosine_similarity(ctx_core.detach().float(), want_core.float(), dim=-1)
+                    else:               # zcos: the copy baseline in the same frame, so the two compare
+                        d_copy = 1 - F.cosine_similarity((ctx_core.detach().float() - frame[0]) / frame[1],
+                                                         (want_core.float() - frame[0]) / frame[1], dim=-1)
                     nan_ = float("nan")
 
                     def mean_on(x, m):
@@ -2806,7 +2875,12 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                 xo_ = x_.masked_fill(torch.from_numpy(pick_)[None].to(dev), G.MASK_CHANNEL)
                 xo_, _, _, _ = G.hide_blocks(xo_, None, torch.from_numpy(hid_)[None].to(dev), unit)
                 _, o_, _ = model(xo_, seg_)
-                p_ = model.jepa_pred(o_)
+                if hasattr(model, "predict_jepa"):     # the context predictor reads the hidden bins
+                    model.jepa_hidden = torch.from_numpy(hid_)[None].to(dev)
+                    p_ = model.predict_jepa(o_)
+                    model.jepa_hidden = None
+                else:
+                    p_ = model.jepa_pred(o_)
                 for l_, v_ in ((cl_, c_), (tg_, t_), (on_, o_), (pr_, p_)):
                     l_.append(v_.float()[0])
         hid_all = torch.from_numpy(np.stack([h_ for _, _, h_ in guard_win])).to(dev)
@@ -2883,6 +2957,10 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
             for n_, p_ in model.named_parameters():                # so AdamW leaves their moments and step count as
                 if not n_.startswith("xheads."):                   # the checkpoint had them and they do not enter the
                     p_.grad = None                                 # clip norm (review 23 Nov)
+        if step < freeze_trunk_until:   # --freeze-trunk-until: the predictor's warm-up on the frozen model
+            for n_, p_ in model.named_parameters():
+                if not n_.startswith("jepa_pred."):
+                    p_.grad = None
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         if xstage is not None:          # each group's rate: the run's schedule (the line above) as a share of --lr,
             x_rates = XH.set_rates(opt, xstage, sorted(x_step),               # times the group's own peak and warmup
@@ -3159,6 +3237,7 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                              if xstage is not None else {}),
                           **({"jepa_target": target.state_dict()} if target is not None and jepa_ema > 0 else {}),
                           **({"jepa_guard": dict(guard, std_mins=list(guard["std_mins"]))} if jepa_guard != "off" else {}),
+                          **({"jepa_norm": {k_: v_.cpu() for k_, v_ in jnorm.items()}} if jnorm else {}),
                           **({"genomes": [dict(name=g_.name, share=g_.share, context=g_.context,
                                                held_out=g_.val["chrom"].unique(maintain_order=True).to_list())
                                           for g_ in genomes]} if genomes else {})}, ckpt)

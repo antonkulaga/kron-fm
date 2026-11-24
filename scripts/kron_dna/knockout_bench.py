@@ -127,7 +127,7 @@ class Runner:
 
     def pred(self, core: torch.Tensor) -> torch.Tensor:
         with torch.no_grad(), self.ac():
-            return self.m.jepa_pred(core).float()
+            return self.m.predict_jepa(core).float()
 
 
 def readout(p_sig: np.ndarray, rel_tss: int, span_lo: int, ch: int, flank: int) -> float:

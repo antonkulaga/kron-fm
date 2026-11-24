@@ -120,7 +120,9 @@ def main(checkpoints: list[Path] = typer.Argument(..., help="checkpoint files wi
                 _, nt_clean = heads_of(model, core_c, skips_c)
                 hb = torch.tensor(hid, device=dev)
                 near = torch.tensor(nearest_visible(hid), device=dev)
-                pred = model.jepa_pred(core_m)
+                model.jepa_hidden = hb[None]
+                pred = model.predict_jepa(core_m)
+                model.jepa_hidden = None
                 # the JEPA loss is 1 - cosine, so the predictor's norm is free: rescale each predicted state to the norm
                 # of the masked core's state at that bin (available at inference), and to the clean state's norm
                 # (an oracle norm, the ceiling of the direction alone)
