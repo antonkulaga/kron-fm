@@ -2,6 +2,7 @@
 shell scripts per cluster; this names no machine (data under ``$KRON_FM_DATA``, jobs through ``slurm/submit.sh``).
 
     uv run python scripts/kron_dna/prep_source.py genome NAME [--manifest sources.toml] [--as OTHER_NAME] [--dry-run]
+    uv run python scripts/kron_dna/prep_source.py verify NAME        (rebuild under NAME.verify and compare with NAME)
     uv run python scripts/kron_dna/prep_source.py list [--manifest sources.toml]
     slurm/submit.sh cpu genome-NAME uv run python scripts/kron_dna/prep_source.py genome NAME      (as a job)
 
@@ -42,7 +43,7 @@ def plan(name: str, entry: dict, out_name: str | None = None) -> list[dict]:
     """The steps of a genome entry: ``fetch`` (url -> path) and ``run`` (a script's arguments), each with the path
     whose existence means done."""
     n = out_name or name
-    acc, src = entry["accession"], input_dir("genome", n)
+    acc, src = entry["accession"], input_dir("genome", name)       # downloads belong to the entry, whatever it is built as
     fasta, gtf = src / f"{acc}_genomic.fna.gz", src / f"{acc}_genomic.gtf.gz"
     steps = [dict(kind="fetch", url=assembly_url(acc, "genomic.fna.gz"), path=fasta, done=fasta)]
     if entry.get("annotation"):
@@ -98,6 +99,42 @@ def genome(name: str, manifest: Path = None, as_name: str = typer.Option("", "--
             fetch(s["url"], s["path"])
         else:
             subprocess.run([sys.executable, str(HERE / s["script"]), *s["args"]], check=True)
+
+
+def digest(path: Path) -> str:
+    import hashlib
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        while chunk := f.read(1 << 24):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+@app.command()
+def verify(name: str, manifest: Path = None, keep: bool = False) -> None:
+    """Rebuilds the entry under ``NAME.verify`` from its downloads and compares it with the prepared ``NAME``: the
+    bases, the contig table, the gene labels and the split. Exit 1 on any difference (the rebuild is then kept);
+    the rebuild is removed when all agree, unless ``--keep``."""
+    import shutil
+
+    import polars as pl
+    other = f"{name}.verify"
+    genome(name, manifest, other, False)
+    a, b = interim_dir("genome", name), interim_dir("genome", other)
+    ta, tb = a.parent.parent / "tracks" / name, a.parent.parent / "tracks" / other
+    pairs = [(a / "bases.u8", b / "bases.u8")] + [(p, tb / p.relative_to(ta)) for p in sorted(ta.rglob("*"))
+                                                    if p.suffix in (".u8", ".u16") and (tb / p.relative_to(ta)).exists()]
+    same = pl.read_parquet(a / "contigs.parquet").equals(pl.read_parquet(b / "contigs.parquet"))
+    typer.echo(f"{name}: contigs.parquet {'same' if same else 'DIFFERENT'}")
+    for x, y in pairs:
+        ok = digest(x) == digest(y)
+        same &= ok
+        typer.echo(f"{name}: {x.relative_to(a.parent.parent)} {'same' if ok else 'DIFFERENT'}")
+    typer.echo(f"{name}: {'VERIFIED' if same else 'NOT REPRODUCED'} from the manifest entry")
+    if same and not keep:
+        shutil.rmtree(b)
+        shutil.rmtree(tb, ignore_errors=True)
+    raise typer.Exit(0 if same else 1)
 
 
 @app.command("list")
