@@ -57,6 +57,11 @@ def test_score_merge_and_asb_report(genomes, tmp_path, monkeypatch, device):
     two = bases[r1["offset"] + 2800:r1["offset"] + 2802]
     if (two < 4).all():
         rows.append(dict(chrom="chr1", pos=2800, ref=letters[two[0]] + letters[two[1]], alt=letters[two[0]]))
+    blk = bases[r1["offset"] + 2000:r1["offset"] + 2070]                            # a 70-base block with three changes:
+    if (blk < 4).all():                                                             # same length, so not too long
+        new = blk.copy()
+        new[[0, 30, 69]] = (new[[0, 30, 69]] + 1) % 4
+        rows.append(dict(chrom="chr1", pos=2000, ref="".join(letters[x] for x in blk), alt="".join(letters[x] for x in new)))
     rng = np.random.default_rng(0)
     n = len(rows)
     t = pl.DataFrame(rows).with_columns(
@@ -80,6 +85,7 @@ def test_score_merge_and_asb_report(genomes, tmp_path, monkeypatch, device):
     ref, alt = np.load(d / "ref.npy"), np.load(d / "alt.npy")
     assert info["ref_mismatch"] == 1 and info["ids"] == ["F0", "F1", "F2"] and sites.height == n - 1
     assert ref.shape == alt.shape == (n - 1, 3) and (ref > 0).all()
+    assert sites.filter(pl.col("ref").str.len_chars() == 70).height == int((blk < 4).all())    # the long block is scored
     a, b = (sites.with_row_index("k").filter((pl.col("chrom") == "chr1") & (pl.col("pos") == 1500))["k"]).to_list()
     assert np.array_equal(ref[a], ref[b]) and not np.allclose(alt[a], alt[b])      # one reference, two alternatives
     assert not np.allclose(ref, alt)

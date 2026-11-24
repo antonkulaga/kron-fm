@@ -119,8 +119,10 @@ def score(out: Path, checkpoints: list[str] = typer.Argument(..., help="LABEL=CH
     sites = sites.with_columns(w_lo=((pl.col("pos") + pl.col("read")) // 2 // BIN) * BIN - context // 2)
     inside = lambda c: (pl.col(c) >= pl.col("w_lo") + edge) & (pl.col(c) < pl.col("w_lo") + context - edge)
     n_all = sites.height
-    sites = sites.filter(inside("pos") & inside("read") & (pl.col("ref").str.len_chars() <= 64)
-                         & (pl.col("alt").str.len_chars() <= 64))
+    lr, la = pl.col("ref").str.len_chars(), pl.col("alt").str.len_chars()
+    sites = sites.filter(inside("pos") & inside("read") & (((lr <= 64) & (la <= 64)) | ((lr == la) & (lr <= 1024))))
+    if sites.height < n_all:        # an indel over 64 bases shifts too much; a same-length block (several
+        typer.echo(f"{n_all - sites.height} of {n_all} sites left out: outside the window's core or too long")   # substitutions) may be long
     mine = sites.filter(pl.col("site") % sh[1] == sh[0])
     bases = np.memmap(src / "bases.u8", dtype=np.uint8, mode="r")
     contigs = pl.read_parquet(src / "contigs.parquet")
