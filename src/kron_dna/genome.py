@@ -910,7 +910,8 @@ class KronGenome(nn.Module):
         unit = 2 ** c.n_down
         halo = split_halo(c) if halo is None else int(halo)
         # a local track restarts every local_span bases: pieces cut there hold whole segments of it (exact)
-        plan = split_plan(b, length, len(devices), unit, halo, by, align=c.local_span if c.local_width else 0)
+        plan = split_plan(b, length, len(devices), unit, halo, by,
+                          **({"align": c.local_span} if c.local_width else {}))
         by = plan[0][0]
         reps = {}
         enc = []                                                      # per piece: (skips, its core-input bins)
