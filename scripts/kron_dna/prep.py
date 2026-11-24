@@ -13,6 +13,7 @@ script unchanged on the shared ``kron_dna.prep`` base.
     uv run python scripts/kron_dna/prep.py split syntenic CHAIN OUT --name mm10
     uv run python scripts/kron_dna/prep.py split orthologs GTF OUT --name tgut_btaegut7 --gene-info INFO --orthologs ORTH
     uv run python scripts/kron_dna/prep.py eval crispri|asb|mpra-satmut|lentimpra|mfass|vexseq|hsub-mpra|exp-starr OUT.parquet INPUTS...   (benchmark tables)
+    uv run python scripts/kron_dna/prep.py train cf-pairs OUT_DIR --credible DIR                     (counterfactual training pairs)
     uv run python scripts/kron_dna/prep.py check histone|tf|accessibility|rna STORE GENOME [--gtf GTF]
 
 Every subcommand takes exactly the arguments of the script it names (``--help`` after it shows them).
@@ -44,6 +45,7 @@ ROUTES = {
     ("eval", "vexseq"): ("prep_vexseq.py", None),        # uv run --with pyliftover
     ("eval", "hsub-mpra"): ("prep_hsub_mpra.py", None),  # uv run --with pyliftover
     ("eval", "exp-starr"): ("prep_exp_starr.py", None),  # uv run --with pyliftover
+    ("train", "cf-pairs"): ("prep_cf_pairs.py", None),
     ("check", "histone"): ("check_chip_store.py", "keep"),
     ("check", "tf"): ("check_chip_store.py", "keep"),
     ("check", "accessibility"): ("check_chip_store.py", "keep"),
