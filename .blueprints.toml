@@ -86,3 +86,18 @@ job_prefix = "kron-"
 [digest.jobs]
 cmd = "bash kit:drivers/slurm/digest-jobs.sh"
 pinned = true
+
+[seat.writer]
+# The KronGenome paper, written as the work happens (Anton, 2026-11-24). Reads kron-fm only; writes to the private
+# paper repository (docs/seats/WRITER.md).
+roles = "reviser"
+presence = false
+wake_people = "kron-fm"
+wake_from = "kron-fm/dna-trainer kron-fm/dna-builder kron-fm/ppg-trainer */secretary"
+
+[seat.writer.zulip]
+pool = "~/.config/agent-seat-blueprints/zulip/pool"
+
+# the desk's answers to this seat's questions, each said once (D133)
+[seat.writer.watch.desk]
+cmd = "sh kit:bin/py.sh kit:classes/desk/watch-answers.py kron-fm writer"
