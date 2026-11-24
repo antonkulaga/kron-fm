@@ -53,3 +53,21 @@ def test_the_manifest_is_complete_and_names_no_machine(tmp_path, monkeypatch):
     res = CliRunner().invoke(PS.app, ["genome", "dsim_prin31", "--dry-run"])
     assert res.exit_code == 0 and "prep_ortholog_split.py" in res.output and not any(tmp_path.iterdir())
     assert CliRunner().invoke(PS.app, ["genome", "nope", "--dry-run"]).exit_code != 0
+
+
+def test_downloads_are_recorded(tmp_path):
+    """A file already there gets its SOURCE.json row after the fact; a second call changes nothing."""
+    import json
+    d = tmp_path / "genome" / "toy"
+    d.mkdir(parents=True)
+    f = d / "GCA_000000002.1_Toy_genomic.fna.gz"
+    f.write_bytes(b"ACGT" * 10)
+    entry = dict(accession="GCA_000000002.1_Toy", species="Toy species")
+    PS.record(f, "https://example.org/toy.fna.gz", entry, "toy")
+    m = json.loads((d / "SOURCE.json").read_text())
+    row = m["files"][0]
+    assert m["source"] == "toy" and m["domain"] == "genome" and "INSDC" in m["license"] and "GCA_000000002.1" in m["homepage"]
+    assert row["file"] == f.name and row["bytes"] == 40 and len(row["sha256"]) == 64 and row["url"].endswith("toy.fna.gz")
+    before = (d / "SOURCE.json").read_text()
+    PS.record(f, "https://example.org/toy.fna.gz", entry, "toy")
+    assert (d / "SOURCE.json").read_text() == before

@@ -9,7 +9,8 @@ shell scripts per cluster; this names no machine (data under ``$KRON_FM_DATA``, 
 ``genome``: fetches the assembly's FASTA (and GTF, with ``annotation``) from NCBI into ``input/genome/NAME``, then
 runs ``prep_species_genome.py`` (``min_seq``, ``held``), ``prep_gene_structure_labels.py`` and, with ``orthologs``,
 ``prep_ortholog_split.py`` against NCBI Gene's human table and ortholog pairs (fetched once into
-``input/genome/hg38/ncbi``). A step whose output exists is skipped, so a rerun continues. ``--as`` prepares the
+``input/genome/hg38/ncbi``). Every download gets its row in the folder's ``SOURCE.json`` (URL, size, SHA-256, time,
+licence), also one made before this command existed. A step whose output exists is skipped, so a rerun continues. ``--as`` prepares the
 entry under another name (a rebuild to compare with the existing one). ``--dry-run`` prints the steps only.
 """
 from __future__ import annotations
@@ -17,11 +18,11 @@ from __future__ import annotations
 import subprocess
 import sys
 import tomllib
-import urllib.request
 from pathlib import Path
 
 import typer
 
+from kron_core import download as DL
 from kron_core.paths import input_dir, interim_dir
 
 app = typer.Typer(add_completion=False)
@@ -69,13 +70,40 @@ def plan(name: str, entry: dict, out_name: str | None = None) -> list[dict]:
     return steps
 
 
-def fetch(url: str, path: Path) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + ".part")
-    with urllib.request.urlopen(url) as r, open(tmp, "wb") as f:       # honours http(s)_proxy
-        while chunk := r.read(1 << 22):
-            f.write(chunk)
-    tmp.rename(path)
+LICENCE = {"GCF": "NCBI RefSeq: public domain in the United States (NCBI data usage policy)",
+           "GCA": "GenBank / INSDC: free and unrestricted access and use (INSDC policy); cite the submitters",
+           "gene": "NCBI Gene: public domain in the United States (NCBI data usage policy)"}
+
+
+def record(path: Path, url: str, entry: dict | None, name: str, fetched: dict | None = None) -> None:
+    """Writes the file's row into its folder's ``SOURCE.json`` (kron_core.download's record: URL, size, SHA-256,
+    time, licence). ``fetched``: the row a download just returned; without it the file was already there and is
+    recorded after the fact (its modification time as the download time)."""
+    from datetime import datetime, timezone
+    folder = path.parent
+    old = DL.read_manifest(folder) or {}
+    rows = {e["file"]: e for e in old.get("files", [])}
+    if fetched is None:
+        if path.name in rows and rows[path.name].get("bytes") == path.stat().st_size:
+            return
+        when = datetime.fromtimestamp(path.stat().st_mtime, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        fetched = {"file": path.name, "url": url, "bytes": path.stat().st_size, "sha256": DL.sha256(path),
+                   "downloaded_at": when, "recorded": "after the download, from the manifest entry"}
+    rows[path.name] = fetched
+    acc = (entry or {}).get("accession", "")
+    src = DL.Source(name=folder.name, domain=folder.parent.name,
+                    description=old.get("description") or (f"{entry['species']}: NCBI assembly {acc}" if entry else
+                                                           "NCBI Gene tables (human gene info, ortholog pairs)"),
+                    license=old.get("license") or LICENCE.get(acc[:3] if entry else "gene", ""),
+                    citation=old.get("citation", ""),
+                    homepage=old.get("homepage") or (f"https://www.ncbi.nlm.nih.gov/datasets/genome/{'_'.join(acc.split('_')[:2])}/"
+                                                     if entry else "https://ftp.ncbi.nlm.nih.gov/gene/DATA/"),
+                    notes=old.get("notes") or ({"manifest_entry": name} if entry else {}))
+    DL.write_manifest(folder, src, [rows[k] for k in sorted(rows)])
+
+
+def fetch(url: str, path: Path, entry: dict | None = None, name: str = "") -> None:
+    record(path, url, entry, name, DL.download_file(url, path))        # honours http(s)_proxy; resumes a .part
 
 
 def manifest_of(path: Path | None) -> dict:
@@ -91,12 +119,14 @@ def genome(name: str, manifest: Path = None, as_name: str = typer.Option("", "--
         what = f"fetch {s['url']} -> {s['path']}" if s["kind"] == "fetch" else f"{s['script']} {' '.join(s['args'])}"
         if Path(s["done"]).exists() and (s["kind"] != "fetch" or Path(s["done"]).stat().st_size > 0):
             typer.echo(f"done already: {what}")
+            if s["kind"] == "fetch" and not dry_run:        # a download made before the record existed gets its row
+                record(s["path"], s["url"], entries[name] if "/genomes/all/" in s["url"] else None, name)
             continue
         typer.echo(what)
         if dry_run:
             continue
         if s["kind"] == "fetch":
-            fetch(s["url"], s["path"])
+            fetch(s["url"], s["path"], entries[name] if "/genomes/all/" in s["url"] else None, name)
         else:
             subprocess.run([sys.executable, str(HERE / s["script"]), *s["args"]], check=True)
 
