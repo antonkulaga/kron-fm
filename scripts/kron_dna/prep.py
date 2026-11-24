@@ -1,6 +1,7 @@
 """One entry point for every data-preparation step (B23): a subcommand per adapter, each running the existing
 script unchanged on the shared ``kron_dna.prep`` base.
 
+    uv run python scripts/kron_dna/prep.py source genome NAME | source list           (a manifest entry end to end: sources.toml)
     uv run python scripts/kron_dna/prep.py genome species FASTA --name dmel_r6 --keep 2L+2R+...
     uv run python scripts/kron_dna/prep.py genome pangenome part|assemble INDEX WORK ...
     uv run python scripts/kron_dna/prep.py encode select OUT.tsv --assembly mm10
@@ -28,6 +29,8 @@ HERE = Path(__file__).resolve().parent
 ROUTES = {
     ("genome", "species"): ("prep_species_genome.py", None),
     ("genome", "pangenome"): ("prep_pangenome.py", None),
+    ("source", "genome"): ("prep_source.py", "keep"),
+    ("source", "list"): ("prep_source.py", "keep"),
     ("encode", "select"): ("encode_select.py", None),
     ("encode", "fetch"): ("encode_fetch.py", None),
     ("tracks", "binned"): ("prep_bigwig_binned.py", None),

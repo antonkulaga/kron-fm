@@ -1,0 +1,231 @@
+# The genomes kron-fm prepares from NCBI assemblies, one table per genome: what `prep.py source genome NAME` reads.
+# No machine or cluster name belongs here: where data lives is $KRON_FM_DATA, how jobs are submitted is slurm/env.sh.
+#
+#   accession   the assembly's folder name on NCBI's genomes FTP (GCF_... RefSeq, GCA_... GenBank)
+#   annotation  true: the assembly's own GTF gives the gene-structure labels (tracks/NAME/gene-structure-refseq)
+#   min_seq     sequences shorter than this are left out
+#   held        "auto": one or two chromosomes nearest 9 % of the bases are held out; "": none (a benchmark genome)
+#   orthologs   true: also hold out the genes orthologous to human chr8/chr9 (tracks/NAME/split-orthologs-v1)
+#   role        train | benchmark (never trained on: an unseen-genome or answer-key test)
+#   verified    true: rebuilt from this entry by the command (24 Nov 2026 on); false: prepared earlier by hand with
+#               these settings as far as recorded, min_seq not recorded: rebuild and compare before relying on it
+
+[genome.acar_ranocar3]
+species = "Green anole"
+accession = "GCF_035594765.1_rAnoCar3.1.pri"
+annotation = true
+min_seq = 200000
+held = "auto"
+orthologs = true
+role = "train"
+verified = false
+
+[genome.agam_nwf1]
+species = "Malaria mosquito"
+accession = "GCF_943734735.2_idAnoGambNW_F1_1"
+annotation = true
+min_seq = 200000
+held = "auto"
+orthologs = true
+role = "train"
+verified = true
+
+[genome.amel_hav31]
+species = "Honeybee"
+accession = "GCF_003254395.2_Amel_HAv3.1"
+annotation = true
+min_seq = 200000
+held = "auto"
+orthologs = true
+role = "train"
+verified = false
+
+[genome.amis_rallmis1]
+species = "American alligator"
+accession = "GCF_030867095.1_rAllMis1"
+annotation = true
+min_seq = 200000
+held = "auto"
+orthologs = true
+role = "train"
+verified = false
+
+[genome.apla_pekin_t2t]
+species = "Pekin duck"
+accession = "GCF_047663525.1_IASCAAS_PekinDuck_T2T"
+annotation = true
+min_seq = 200000
+held = "auto"
+orthologs = true
+role = "train"
+verified = false
+
+[genome.cmyd_rchemyd1]
+species = "Green sea turtle"
+accession = "GCF_015237465.2_rCheMyd1.pri.v2"
+annotation = true
+min_seq = 200000
+held = "auto"
+orthologs = true
+role = "train"
+verified = false
+
+[genome.dleu_asm228892v3]
+species = "Beluga"
+accession = "GCF_002288925.2_ASM228892v3"
+annotation = true
+min_seq = 200000
+held = ""
+orthologs = false
+role = "benchmark"
+verified = false
+
+[genome.dpse_mv25]
+species = "Drosophila pseudoobscura"
+accession = "GCF_009870125.1_UCI_Dpse_MV25"
+annotation = true
+min_seq = 200000
+held = "auto"
+orthologs = true
+role = "train"
+verified = true
+
+[genome.drer_grcz13ab]
+species = "Zebrafish"
+accession = "GCF_052040795.2_GRCz13ab"
+annotation = true
+min_seq = 200000
+held = "auto"
+orthologs = true
+role = "train"
+verified = false
+
+[genome.dsim_prin31]
+species = "Drosophila simulans"
+accession = "GCF_016746395.2_Prin_Dsim_3.1"
+annotation = true
+min_seq = 200000
+held = "auto"
+orthologs = true
+role = "train"
+verified = true
+
+[genome.dvir_dvirrs2]
+species = "Drosophila virilis"
+accession = "GCF_003285735.1_DvirRS2"
+annotation = true
+min_seq = 200000
+held = ""
+orthologs = false
+role = "benchmark"
+verified = false
+
+[genome.dyak_tai18e2]
+species = "Drosophila yakuba"
+accession = "GCF_016746365.2_Prin_Dyak_Tai18E2_2.1"
+annotation = true
+min_seq = 200000
+held = "auto"
+orthologs = true
+role = "train"
+verified = true
+
+[genome.fnau_bfalnau1]
+species = "Lesser kestrel"
+accession = "GCF_017639655.2_bFalNau1.pat"
+annotation = true
+min_seq = 200000
+held = ""
+orthologs = false
+role = "benchmark"
+verified = false
+
+[genome.gacu_fgasacu3]
+species = "Three-spined stickleback"
+accession = "GCF_964276395.1_fGasAcu3.hap1.1"
+annotation = true
+min_seq = 200000
+held = "auto"
+orthologs = true
+role = "train"
+verified = true
+
+[genome.nfur_grzrimd1]
+species = "Turquoise killifish"
+accession = "GCF_043380555.1_NfurGRZ-RIMD1"
+annotation = true
+min_seq = 200000
+held = "auto"
+orthologs = true
+role = "train"
+verified = true
+
+[genome.olat_hdrr31]
+species = "Medaka"
+accession = "GCF_053564925.1_Olatipes_Hd-rR_3.1"
+annotation = true
+min_seq = 200000
+held = "auto"
+orthologs = true
+role = "train"
+verified = false
+
+[genome.rtyp_asm164234v2]
+species = "Whale shark"
+accession = "GCF_001642345.1_ASM164234v2"
+annotation = true
+min_seq = 200000
+held = ""
+orthologs = false
+role = "benchmark"
+verified = false
+
+[genome.smic_asm5609953v2]
+species = "Greenland shark (PNAS 2026 assembly)"
+accession = "GCA_056099535.2_ASM5609953v2"
+annotation = false
+min_seq = 200000
+held = "auto"
+orthologs = false
+role = "train"
+verified = true
+
+[genome.smic_fli1]
+species = "Greenland shark (FLI assembly, the annotation answer key)"
+accession = "GCF_052327205.1_FLI_Smic_1.0"
+annotation = true
+min_seq = 200000
+held = "auto"
+orthologs = true
+role = "benchmark"
+verified = true
+
+[genome.tgut_btaegut7]
+species = "Zebra finch"
+accession = "GCF_048771995.1_bTaeGut7.mat"
+annotation = true
+min_seq = 200000
+held = "auto"
+orthologs = true
+role = "train"
+verified = false
+
+[genome.trub_ftakrub13]
+species = "Fugu"
+accession = "GCF_901000725.3_fTakRub1.3"
+annotation = true
+min_seq = 200000
+held = "auto"
+orthologs = true
+role = "train"
+verified = true
+
+[genome.xtro_xtro10]
+species = "Western clawed frog"
+accession = "GCF_000004195.4_UCB_Xtro_10.0"
+annotation = true
+min_seq = 200000
+held = "auto"
+orthologs = true
+role = "train"
+verified = false
