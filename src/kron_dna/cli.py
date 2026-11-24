@@ -985,6 +985,15 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                  cf_window: int = typer.Option(131072, help="with --cf-pairs: bases read around each pair"),
                  cf_temp: float = typer.Option(0.1, help="with --cf-pairs: the change (log1p units) per unit of the "
                                                 "logistic sign loss"),
+                 jepa_edits: float = typer.Option(0.0, help="with --jepa-block-share, self-made counterfactuals "
+                                                  "(JEPA step 2b), at this weight: on a window of its own an edit "
+                                                  "(a shuffled, reverse-complemented or blanked segment) is made "
+                                                  "outside the hidden blocks; the predictor on the edited, hidden "
+                                                  "input must match the target's states of the edited window, and "
+                                                  "its change from the clean input the target's change (0: off)"),
+                 jepa_edit_every: int = typer.Option(1, help="with --jepa-edits: on every Nth step"),
+                 jepa_edit_window: int = typer.Option(131072, help="with --jepa-edits: bases of the edit window"),
+                 jepa_edit_len: str = typer.Option("128:1024", help="with --jepa-edits: LO:HI edit lengths in bases"),
                  freeze_trunk_until: int = typer.Option(0, help="until this step only the JEPA predictor trains (the "
                                                         "other parameters' gradients are dropped before the "
                                                         "update): a warm-up of a new predictor on a frozen model"),
@@ -1201,6 +1210,10 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
     if jepa_weight <= 0 and (jepa_pred != "mlp" or jepa_loss != "cos" or jepa_decode_pred or freeze_trunk_until):
         raise typer.BadParameter("--jepa-pred, --jepa-loss, --jepa-decode-pred and --freeze-trunk-until need "
                                  "--jepa-weight > 0")
+    if jepa_edits < 0 or jepa_edit_every < 1 or (jepa_edits > 0 and (jepa_block_share <= 0 or jepa_edit_window % unit
+                                                                      or jepa_edit_window <= 0)):
+        raise typer.BadParameter(f"--jepa-edits needs --jepa-block-share > 0 and --jepa-edit-window a positive "
+                                 f"multiple of {unit}; --jepa-edit-every >= 1")
     if cf_weight < 0 or cf_batch < 1 or cf_every < 1 or cf_temp <= 0 or (cf_weight > 0 and not cf_pairs):
         raise typer.BadParameter("--cf-weight >= 0 (and > 0 needs --cf-pairs), --cf-batch and --cf-every >= 1, "
                                  "--cf-temp > 0")
@@ -2342,6 +2355,79 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                     jnorm["var"].lerp_(v_, 0.01)
         return jnorm["mu"], jnorm["var"].clamp_min(1e-6).sqrt()
 
+    edit_lo, edit_hi = (int(v_) for v_ in jepa_edit_len.split(":"))
+    edit_rng = np.random.default_rng([seed, rank, 2043, step]) if jepa_edits > 0 else None
+    edit_blk_rng = np.random.default_rng([seed, rank, 2047, step]) if jepa_edits > 0 else None
+    edit_tab = train_idx.filter(pl.col("len") >= jepa_edit_window) if jepa_edits > 0 else None
+    if jepa_edits > 0:
+        if edit_tab.height == 0:
+            raise typer.BadParameter(f"--jepa-edits: no training contig of {jepa_edit_window:,} bases")
+        say(f"jepa step 2b: self-made edits at weight {jepa_edits:g} every {jepa_edit_every} step(s), "
+            f"{jepa_edit_window:,}-base windows, edits {edit_lo}-{edit_hi} bases (shuffle, reverse complement, N)")
+
+    def edit_loss() -> tuple[torch.Tensor | None, dict]:
+        """--jepa-edits: one window, clean and edited, both hidden in the same blocks; the predictor's states at the
+        hidden bins against the target's for the edited window, and its change (edited - clean) against the
+        target's change, in the --jepa-loss frame."""
+        p_ = edit_tab["len"].to_numpy() / edit_tab["len"].sum()
+        for _ in range(20):
+            r_ = edit_tab.row(int(edit_rng.choice(edit_tab.height, p=p_)), named=True)
+            at_ = int(r_["offset"]) + int(edit_rng.integers(0, int(r_["len"]) - jepa_edit_window + 1))
+            s_ = XH.read_rows(bases, at_, at_ + jepa_edit_window).astype(np.int64)
+            if (s_ < 4).mean() >= 0.95:
+                break
+        else:
+            return None, {}
+        n_bins = jepa_edit_window // unit
+        hid_ = G.block_mask(np.zeros((1, n_bins), dtype=np.int64), s_[None], unit, jepa_block_share, block_lo,
+                            block_hi, edit_blk_rng)[0]
+        vis_ = np.flatnonzero(~np.repeat(hid_, unit))
+        if not hid_.any() or len(vis_) < edit_hi * 2:
+            return None, {}
+        e_len = int(edit_rng.integers(edit_lo, edit_hi + 1))
+        e_at = int(vis_[edit_rng.integers(0, len(vis_))])
+        e_at = min(e_at, jepa_edit_window - e_len)
+        if np.repeat(hid_, unit)[e_at:e_at + e_len].any():     # the edit stays outside every block
+            return None, {}
+        ed_ = s_.copy()
+        kind_ = int(edit_rng.integers(0, 3))
+        seg_ = ed_[e_at:e_at + e_len]
+        if kind_ == 0:
+            ed_[e_at:e_at + e_len] = seg_[edit_rng.permutation(e_len)]
+        elif kind_ == 1:
+            ed_[e_at:e_at + e_len] = np.where(seg_ < 4, 3 - seg_, seg_)[::-1]
+        else:
+            ed_[e_at:e_at + e_len] = 4
+        seqs_ = torch.from_numpy(np.stack([s_, ed_])).to(dev)
+        segm_ = torch.zeros(2, n_bins, dtype=torch.long, device=dev)
+        ctx_ = torch.zeros(2, dtype=torch.long, device=dev) if ctx_on else None
+        hb_ = torch.from_numpy(np.stack([hid_, hid_])).to(dev)
+        inp_, _, _, _ = G.hide_blocks(seqs_.clone(), None, hb_, unit)
+        old_ = (model.x_active, getattr(model, "jepa_hidden", None), getattr(model, "jepa_decode_pred", False))
+        try:
+            model.x_active, model.jepa_hidden, model.jepa_decode_pred = set(), hb_, False
+            with torch.no_grad(), autocast:
+                _, want_, _ = target(seqs_, segm_, ctx_)
+            with autocast:
+                train_model(inp_, segm_, ctx_)
+            pred_ = model.last_jepa.float()
+        finally:
+            model.x_active, model.jepa_hidden, model.jepa_decode_pred = old_
+        want_ = want_.float()
+        if jepa_loss == "cos":
+            mu_, sd_ = torch.zeros_like(want_[0, 0]), torch.ones_like(want_[0, 0])
+        else:
+            mu_, sd_ = jnorm_frame(want_, torch.ones_like(hb_)) if not jnorm else (jnorm["mu"], jnorm["var"].clamp_min(1e-6).sqrt())
+        zp_, zt_ = (pred_ - mu_) / sd_, (want_ - mu_) / sd_
+        h1_ = hb_[1]
+        d_e = (1 - F.cosine_similarity(zp_[1], zt_[1], dim=-1))[h1_].mean()
+        dp_, dt_ = (zp_[1] - zp_[0])[h1_], (zt_[1] - zt_[0])[h1_]
+        d_delta = (dp_ - dt_).pow(2).mean()
+        st_ = dict(kind=("shuffle", "revcomp", "N")[kind_], length=e_len, edited=float(d_e.detach()),
+                   delta_mse=float(d_delta.detach()), target_change=float(dt_.pow(2).mean().detach()),
+                   delta_cos=float(F.cosine_similarity(dp_.flatten(), dt_.flatten(), dim=0).detach()))
+        return d_e + d_delta, st_
+
     train_model = model
     if world > 1:
         train_model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[dev.index])
@@ -2954,6 +3040,16 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
             ((loss + track_weight * track if track is not None else loss) / grad_accum).backward()
             if bench_grads is not None and step == 0:
                 bench_losses.append(float(loss.detach()))
+        if jepa_edits > 0 and step % jepa_edit_every == 0:   # --jepa-edits: its own window and backward
+            e_loss, e_st = edit_loss()
+            if e_loss is not None:
+                (jepa_edits * e_loss).backward()
+                if main:
+                    with open(out / "edits.csv", "a") as fh_:
+                        if fh_.tell() == 0:
+                            fh_.write("step,kind,length,edited,delta_mse,target_change,delta_cos\n")
+                        fh_.write(f"{step + 1},{e_st['kind']},{e_st['length']},{e_st['edited']:.5f},"
+                                  f"{e_st['delta_mse']:.5f},{e_st['target_change']:.5f},{e_st['delta_cos']:.4f}\n")
         if cf is not None and step % cf_every == 0:   # --cf-pairs: the sign loss, its own backward
             cf_loss, cf_st = CF.pair_loss(model, cf.sample(cf_rng, cf_batch), cf_contigs,
                                           lambda a_, b_: XH.read_rows(bases, a_, b_), cf_consts, XH.signal_of,

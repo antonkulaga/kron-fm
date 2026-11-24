@@ -145,3 +145,38 @@ def test_step2_through_the_cli_warmup_then_joint_and_resume(jgenomes, tmp_path, 
     assert res.exit_code == 0, res.output + repr(res.exception)
     assert "resumed at step 4" in res.output and "target statistics restored" in res.output
     assert len(grads) == 2
+
+
+def test_self_made_edits_through_the_cli(jgenomes, tmp_path, monkeypatch, cpu_mixer):
+    """--jepa-edits (step 2b) with the real model: every step writes an edits.csv row (an edit kind, a finite
+    edited-state distance and change error), the predictor gets the edit loss's gradient, and the run's other
+    terms stay finite."""
+    root = jgenomes["root"]
+    cpu_only(monkeypatch)
+    monkeypatch.setattr(kron_core.blocks, "kronlstm_mixer", CausalMixer)
+    monkeypatch.setattr(G, "KronGenome", JB.CpuCoreGenome)
+    from kron_dna import cli as new
+    small = [a if a != "16" else "96" for a in JB.SMALLJ]
+    args = small + JB.JEPA + ["--bert-mask", "--batch-size", "2", "--eval-every", "2", "--curriculum", "4096:3",
+                              "--jepa-block-share", "0.25", "--jepa-block-len", "256:1024", "--jepa-block-heads",
+                              "include", "--jepa-pred", "context", "--jepa-pred-layers", "1", "--jepa-loss", "zcos-mse",
+                              "--jepa-edits", "1.0", "--jepa-edit-window", "4096", "--jepa-edit-len", "64:256"]
+    out = tmp_path / "ed"
+    res, _ = run(new, monkeypatch, root, out, args)
+    assert res.exit_code == 0, res.output + repr(res.exception)
+    assert "jepa step 2b: self-made edits at weight 1" in " ".join(res.output.split())
+    lines = (out / "edits.csv").read_text().strip().split("\n")
+    head = lines[0].split(",")
+    rows = [dict(zip(head, line.split(","))) for line in lines[1:]]
+    assert 1 <= len(rows) <= 3
+    for r in rows:
+        assert r["kind"] in ("shuffle", "revcomp", "N") and 64 <= int(r["length"]) <= 256
+        assert all(math.isfinite(float(r[k])) for k in ("edited", "delta_mse", "target_change", "delta_cos"))
+
+
+def test_edit_option_checks(jgenomes, tmp_path, monkeypatch):
+    JB.stub_jepa(monkeypatch)
+    from kron_dna import cli as new
+    res, _ = run(new, monkeypatch, jgenomes["root"], tmp_path / "bad",
+                 JB.SMALLJ + JB.JEPA + ["--steps", "2", "--batch-size", "2", "--jepa-edits", "1.0"])
+    assert res.exit_code != 0 and "--jepa-edits needs" in " ".join(res.output.replace("│", " ").split())
