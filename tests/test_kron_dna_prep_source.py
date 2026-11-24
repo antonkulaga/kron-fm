@@ -46,7 +46,7 @@ def test_the_manifest_is_complete_and_names_no_machine(tmp_path, monkeypatch):
     assert len(genomes) >= 22
     for n, e in genomes.items():
         assert {"species", "accession", "annotation", "min_seq", "held", "orthologs", "role", "verified"} <= set(e), n
-        assert e["role"] in ("train", "benchmark") and e["held"] in ("", "auto")
+        assert e["role"] in ("train", "benchmark") and (e["held"] in ("", "auto") or all(h.startswith(("NC_", "CM")) for h in e["held"].split("+")))
         PS.plan(n, e)                                                              # every entry plans
     assert "/data/" not in text and "partition" not in text.lower().replace("no machine or cluster", "")
     monkeypatch.setenv("KRON_FM_DATA", str(tmp_path))

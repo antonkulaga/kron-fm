@@ -4,28 +4,32 @@
 #   accession   the assembly's folder name on NCBI's genomes FTP (GCF_... RefSeq, GCA_... GenBank)
 #   annotation  true: the assembly's own GTF gives the gene-structure labels (tracks/NAME/gene-structure-refseq)
 #   min_seq     sequences shorter than this are left out
-#   held        "auto": one or two chromosomes nearest 9 % of the bases are held out; "": none (a benchmark genome)
+#   held        the held-out chromosomes, '+'-joined, as each genome was prepared (first chosen by "auto": one or two
+#               chromosomes nearest 9 % of the bases; written out here because that rule has changed once already);
+#               "auto" for a new entry, then replace it by what was picked; "": none (a benchmark genome)
 #   orthologs   true: also hold out the genes orthologous to human chr8/chr9 (tracks/NAME/split-orthologs-v1)
 #   role        train | benchmark (never trained on: an unseen-genome or answer-key test)
-#   verified    true: rebuilt from this entry by the command (24 Nov 2026 on); false: prepared earlier by hand with
-#               these settings as far as recorded, min_seq not recorded: rebuild and compare before relying on it
+#   verified    true: `prep.py source verify NAME` rebuilt the entry and found the prepared genome, contig table,
+#               gene labels and split identical (the 13 prepared by hand before the manifest: 24 Nov 2026, after
+#               their min_seq and held-out names were corrected here; D. simulans and D. yakuba likewise), or the
+#               genome was prepared that day by the same steps with these settings
 
 [genome.acar_ranocar3]
 species = "Green anole"
 accession = "GCF_035594765.1_rAnoCar3.1.pri"
 annotation = true
-min_seq = 200000
-held = "auto"
+min_seq = 1000000
+held = "NC_085846.1+NC_085847.1"
 orthologs = true
 role = "train"
-verified = false
+verified = true
 
 [genome.agam_nwf1]
 species = "Malaria mosquito"
 accession = "GCF_943734735.2_idAnoGambNW_F1_1"
 annotation = true
 min_seq = 200000
-held = "auto"
+held = "NC_064600.1"
 orthologs = true
 role = "train"
 verified = true
@@ -34,58 +38,58 @@ verified = true
 species = "Honeybee"
 accession = "GCF_003254395.2_Amel_HAv3.1"
 annotation = true
-min_seq = 200000
-held = "auto"
+min_seq = 1000000
+held = "NC_037651.1+NC_037652.1"
 orthologs = true
 role = "train"
-verified = false
+verified = true
 
 [genome.amis_rallmis1]
 species = "American alligator"
 accession = "GCF_030867095.1_rAllMis1"
 annotation = true
-min_seq = 200000
-held = "auto"
+min_seq = 1000000
+held = "NC_081829.1+NC_081830.1"
 orthologs = true
 role = "train"
-verified = false
+verified = true
 
 [genome.apla_pekin_t2t]
 species = "Pekin duck"
 accession = "GCF_047663525.1_IASCAAS_PekinDuck_T2T"
 annotation = true
 min_seq = 200000
-held = "auto"
+held = "NC_092591.1+NC_092593.1"
 orthologs = true
 role = "train"
-verified = false
+verified = true
 
 [genome.cmyd_rchemyd1]
 species = "Green sea turtle"
 accession = "GCF_015237465.2_rCheMyd1.pri.v2"
 annotation = true
-min_seq = 200000
-held = "auto"
+min_seq = 1000000
+held = "NC_051250.2+NC_057854.1"
 orthologs = true
 role = "train"
-verified = false
+verified = true
 
 [genome.dleu_asm228892v3]
 species = "Beluga"
 accession = "GCF_002288925.2_ASM228892v3"
 annotation = true
-min_seq = 200000
+min_seq = 1000000
 held = ""
 orthologs = false
 role = "benchmark"
-verified = false
+verified = true
 
 [genome.dpse_mv25]
 species = "Drosophila pseudoobscura"
 accession = "GCF_009870125.1_UCI_Dpse_MV25"
 annotation = true
 min_seq = 200000
-held = "auto"
+held = "NC_046680.1"
 orthologs = true
 role = "train"
 verified = true
@@ -95,17 +99,17 @@ species = "Zebrafish"
 accession = "GCF_052040795.2_GRCz13ab"
 annotation = true
 min_seq = 200000
-held = "auto"
+held = "NC_141027.1+NC_141030.1"
 orthologs = true
 role = "train"
-verified = false
+verified = true
 
 [genome.dsim_prin31]
 species = "Drosophila simulans"
 accession = "GCF_016746395.2_Prin_Dsim_3.1"
 annotation = true
 min_seq = 200000
-held = "auto"
+held = "NC_052525.2"
 orthologs = true
 role = "train"
 verified = true
@@ -118,14 +122,14 @@ min_seq = 200000
 held = ""
 orthologs = false
 role = "benchmark"
-verified = false
+verified = true
 
 [genome.dyak_tai18e2]
 species = "Drosophila yakuba"
 accession = "GCF_016746365.2_Prin_Dyak_Tai18E2_2.1"
 annotation = true
 min_seq = 200000
-held = "auto"
+held = "NC_052528.2"
 orthologs = true
 role = "train"
 verified = true
@@ -134,18 +138,18 @@ verified = true
 species = "Lesser kestrel"
 accession = "GCF_017639655.2_bFalNau1.pat"
 annotation = true
-min_seq = 200000
+min_seq = 1000000
 held = ""
 orthologs = false
 role = "benchmark"
-verified = false
+verified = true
 
 [genome.gacu_fgasacu3]
 species = "Three-spined stickleback"
 accession = "GCF_964276395.1_fGasAcu3.hap1.1"
 annotation = true
 min_seq = 200000
-held = "auto"
+held = "NC_135700.1+NC_135704.1"
 orthologs = true
 role = "train"
 verified = true
@@ -155,7 +159,7 @@ species = "Turquoise killifish"
 accession = "GCF_043380555.1_NfurGRZ-RIMD1"
 annotation = true
 min_seq = 200000
-held = "auto"
+held = "NC_091753.1+NC_091756.1"
 orthologs = true
 role = "train"
 verified = true
@@ -164,28 +168,28 @@ verified = true
 species = "Medaka"
 accession = "GCF_053564925.1_Olatipes_Hd-rR_3.1"
 annotation = true
-min_seq = 200000
-held = "auto"
+min_seq = 1000000
+held = "NC_136237.1+NC_136251.1"
 orthologs = true
 role = "train"
-verified = false
+verified = true
 
 [genome.rtyp_asm164234v2]
 species = "Whale shark"
 accession = "GCF_001642345.1_ASM164234v2"
 annotation = true
-min_seq = 200000
+min_seq = 10000
 held = ""
 orthologs = false
 role = "benchmark"
-verified = false
+verified = true
 
 [genome.smic_asm5609953v2]
 species = "Greenland shark (PNAS 2026 assembly)"
 accession = "GCA_056099535.2_ASM5609953v2"
 annotation = false
 min_seq = 200000
-held = "auto"
+held = "CM178236.1+CM178238.1"
 orthologs = false
 role = "train"
 verified = true
@@ -195,7 +199,7 @@ species = "Greenland shark (FLI assembly, the annotation answer key)"
 accession = "GCF_052327205.1_FLI_Smic_1.0"
 annotation = true
 min_seq = 200000
-held = "auto"
+held = "NC_140991.1+NC_140995.1"
 orthologs = true
 role = "benchmark"
 verified = true
@@ -205,17 +209,17 @@ species = "Zebra finch"
 accession = "GCF_048771995.1_bTaeGut7.mat"
 annotation = true
 min_seq = 200000
-held = "auto"
+held = "NC_133037.1+NC_133063.1"
 orthologs = true
 role = "train"
-verified = false
+verified = true
 
 [genome.trub_ftakrub13]
 species = "Fugu"
 accession = "GCF_901000725.3_fTakRub1.3"
 annotation = true
 min_seq = 200000
-held = "auto"
+held = "NC_042288.1+NC_042291.1"
 orthologs = true
 role = "train"
 verified = true
@@ -225,7 +229,7 @@ species = "Western clawed frog"
 accession = "GCF_000004195.4_UCB_Xtro_10.0"
 annotation = true
 min_seq = 200000
-held = "auto"
+held = "NC_030683.2"
 orthologs = true
 role = "train"
-verified = false
+verified = true
