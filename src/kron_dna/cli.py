@@ -975,6 +975,16 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                                                        "include: the decoder reads the predictor's states at the "
                                                        "hidden bins, so the heads' losses there train the predictor "
                                                        "(the predictor's output must decode)"),
+                 cf_pairs: list[Path] = typer.Option([], help="measured counterfactual pair tables (cf-pairs-v1 "
+                                                     "parquet; repeatable): their train rows add a sign loss on the "
+                                                     "head's predicted alt-minus-ref change (kron_dna.cfpairs). Rows "
+                                                     "on the held-out chromosomes are refused"),
+                 cf_weight: float = typer.Option(0.0, help="with --cf-pairs: weight of the pair loss (0: off)"),
+                 cf_batch: int = typer.Option(4, help="with --cf-pairs: pairs per step (each two windows)"),
+                 cf_every: int = typer.Option(1, help="with --cf-pairs: the pair loss on every Nth step"),
+                 cf_window: int = typer.Option(131072, help="with --cf-pairs: bases read around each pair"),
+                 cf_temp: float = typer.Option(0.1, help="with --cf-pairs: the change (log1p units) per unit of the "
+                                                "logistic sign loss"),
                  freeze_trunk_until: int = typer.Option(0, help="until this step only the JEPA predictor trains (the "
                                                         "other parameters' gradients are dropped before the "
                                                         "update): a warm-up of a new predictor on a frozen model"),
@@ -1191,6 +1201,11 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
     if jepa_weight <= 0 and (jepa_pred != "mlp" or jepa_loss != "cos" or jepa_decode_pred or freeze_trunk_until):
         raise typer.BadParameter("--jepa-pred, --jepa-loss, --jepa-decode-pred and --freeze-trunk-until need "
                                  "--jepa-weight > 0")
+    if cf_weight < 0 or cf_batch < 1 or cf_every < 1 or cf_temp <= 0 or (cf_weight > 0 and not cf_pairs):
+        raise typer.BadParameter("--cf-weight >= 0 (and > 0 needs --cf-pairs), --cf-batch and --cf-every >= 1, "
+                                 "--cf-temp > 0")
+    if cf_weight > 0 and (not xhead or cf_window % unit or cf_window <= 0):
+        raise typer.BadParameter(f"--cf-pairs needs --xhead heads and --cf-window a positive multiple of {unit}")
     if jepa_decode_pred and (jepa_block_share <= 0 or jepa_block_heads != "include"):
         raise typer.BadParameter("--jepa-decode-pred needs --jepa-block-share > 0 and --jepa-block-heads include "
                                  "(the heads must be scored inside the blocks for the decoded states to train)")
@@ -2220,6 +2235,21 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                        for n_, k_ in xhead_sizes.items()}
     x_consts: dict = {}
 
+    cf = None                           # --cf-pairs: the training rows, their stream, their log
+    if cf_weight > 0:
+        from kron_dna import cfpairs as CF
+        cf = CF.CfPairs(list(cf_pairs), {n_: list(st_.ids) for n_, st_ in xstores.items()},
+                        set(val_chroms.split(",")), cf_window)
+        if not cf.pairs:
+            raise typer.BadParameter(f"--cf-pairs: no usable train row for the heads {sorted(xstores)}")
+        cf_rng = np.random.default_rng([seed, rank, 2041, step])
+        cf_consts = {n_: (None if st_.kind == "binary" else tuple(st_.consts(dev))[1:]) for n_, st_ in xstores.items()}
+        cf_contigs = index.select("chrom", "start", "end", "offset")
+        record["cf_pairs"] = dict(paths=[str(p_) for p_ in cf_pairs], weight=cf_weight, batch=cf_batch,
+                                  every=cf_every, window=cf_window, temp=cf_temp, **cf.counts)
+        say(f"--cf-pairs: {cf.counts['pairs']:,} train pairs ({cf.counts['by_table']}), weight {cf_weight:g}, "
+            f"{cf_batch} per {'step' if cf_every == 1 else f'{cf_every} steps'}, window {cf_window:,}")
+
     def x_consts_on(name_):
         """Head ``name_``'s constants (scales, non-zero means, RNA flags) per card, moved once."""
         def on(d_):
@@ -2924,6 +2954,18 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
             ((loss + track_weight * track if track is not None else loss) / grad_accum).backward()
             if bench_grads is not None and step == 0:
                 bench_losses.append(float(loss.detach()))
+        if cf is not None and step % cf_every == 0:   # --cf-pairs: the sign loss, its own backward
+            cf_loss, cf_st = CF.pair_loss(model, cf.sample(cf_rng, cf_batch), cf_contigs,
+                                          lambda a_, b_: XH.read_rows(bases, a_, b_), cf_consts, XH.signal_of,
+                                          cf_window, cf_temp, dev, autocast)
+            if cf_loss is not None:
+                (cf_weight * cf_loss).backward()
+                if main:
+                    with open(out / "cf.csv", "a") as fh_:
+                        if fh_.tell() == 0:
+                            fh_.write("step,pairs,signed,agree,loss\n")
+                        fh_.write(f"{step + 1},{cf_st['pairs']},{cf_st['signed']},{cf_st['agree']:.4f},"
+                                  f"{cf_st['loss']:.5f}\n")
         x_read["heads"] = None          # every other draw (the --mito-slice part, evaluation) reads every store
         if mito_slice:          # after the main draw's backward: its activations are freed; one optimizer step
             if dev.type == "cuda":                          # time the slice alone (the main backward has finished)
