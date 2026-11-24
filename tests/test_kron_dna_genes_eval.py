@@ -102,6 +102,17 @@ def test_genes_eval_scores_two_annotations(tmp_path, monkeypatch):
     for p in (110, 111, 112):                            # TAA in each frame
         bad[0, p * 1 + (p - 110) * 3: p + (p - 110) * 3 + 3] = [3, 0, 0]
     assert GE.chain_exons_framed(lg2, two, "plus", bad, floor=100.0) == {(0, 180, 240)}
+    # a first coding exon: no acceptor below it, but ATG at 100 with 5' UTR called before it; the donor at 150
+    one = np.full((1, 400, 4), -9.0, np.float32)
+    one[0, 150, 0] = 9
+    lg1 = np.full((1, 400), -5.0, np.float32)
+    lg1[0, 90:150] = 5                                   # the coding call starts 10 bases early
+    atg = seq.copy()
+    atg[0, 100:103] = [0, 3, 2]
+    u5, u3 = np.full((1, 400), -5.0, np.float32), np.full((1, 400), -5.0, np.float32)
+    u5[0, :100] = 5
+    assert GE.chain_exons_framed(lg1, one, "plus", atg, GE.smooth(lg1 > 0), floor=100.0) == {(0, 90, 150)}
+    assert GE.chain_exons_framed(lg1, one, "plus", atg, GE.smooth(lg1 > 0), floor=100.0, utr=(u5, u3)) == {(0, 100, 150)}
     ls = GE.last_stops(np.array([0, 3, 0, 0, 1, 3, 2, 0, 0], np.uint8), "plus")     # TAA at 1, TGA at 5
     assert ls[1, 4] == 1 and ls[1, 3] == -1 and ls[2, 8] == 5 and ls[0].max() == -1
     assert GE.last_stops(np.array([3, 3, 0, 1], np.uint8), "minus")[0, 3] == 0      # TTA: a stop read on -

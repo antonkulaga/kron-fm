@@ -26,7 +26,8 @@ For each window the model reads 1,048,576 bases centred on it; its ``genes`` hea
   exons only. Both scored with exact ends; paired is the number to set beside Tiberius's.
   **chained**: the best non-overlapping set of such stretches per window (``chain_exons``); **framed**: the same
   with a reading frame from the sequence (no stop codon inside an exon, the frame kept across introns;
-  ``chain_exons_framed``), the decoder to quote.
+  ``chain_exons_framed``); **terminal**: framed, plus first and last coding exons ending at a start or stop
+  codon where the head's UTR channel says so. The last is the decoder to quote.
 
 Writes ``OUT/<label>.splice.npy`` (the splice head's logits, float16 ``[windows, 131072, 4]``),
 ``OUT/<label>.genes.json`` with all of it and ``OUT/<label>.genes.npy`` (the logits, float16
@@ -209,6 +210,16 @@ def chain_exons(logit: np.ndarray, splice: np.ndarray, strand: str, calls: np.nd
 
 STOPS = {"plus": [(3, 0, 0), (3, 0, 2), (3, 2, 0)],          # TAA TAG TGA; on -, read on the forward strand: TTA CTA TCA
          "minus": [(3, 3, 0), (1, 3, 0), (3, 1, 0)]}
+START = {"plus": [(0, 3, 2)], "minus": [(1, 0, 3)]}          # ATG; on -, CAT
+
+
+def codon_hits(seq: np.ndarray, codons: list) -> np.ndarray:
+    """Where one of ``codons`` (base codes) starts in ``seq``."""
+    n = len(seq)
+    hit = np.zeros(n, bool)
+    for x, y, z in codons:
+        hit[:n - 2] |= (seq[:-2] == x) & (seq[1:-1] == y) & (seq[2:] == z)
+    return hit
 
 
 def last_stops(seq: np.ndarray, strand: str) -> np.ndarray:
@@ -216,9 +227,7 @@ def last_stops(seq: np.ndarray, strand: str) -> np.ndarray:
     ``strand`` in the base codes ``seq``; -1 where there is none. A stretch [a, b) is open in frame f when that is
     below a."""
     n = len(seq)
-    hit = np.zeros(n, bool)
-    for x, y, z in STOPS[strand]:
-        hit[:n - 2] |= (seq[:-2] == x) & (seq[1:-1] == y) & (seq[2:] == z)
+    hit = codon_hits(seq, STOPS[strand])
     out = np.full((3, n + 1), -1, np.int64)
     for f in range(3):
         p = np.flatnonzero(hit)
@@ -230,13 +239,21 @@ def last_stops(seq: np.ndarray, strand: str) -> np.ndarray:
 
 def chain_exons_framed(logit: np.ndarray, splice: np.ndarray, strand: str, seqs: list, calls: np.ndarray | None = None,
                        thr: float = 3.0, longest: int = 3000, clip: float = 1.0, site: float = 40.0, floor: float = 160.0,
-                       brk: float = 200.0) -> set:
+                       brk: float = 200.0, utr: tuple | None = None, reach: int = 100, gmin: float = 1.0, span: int = 96
+                       ) -> set:
     """``chain_exons`` with a reading frame, from the windows' base codes ``seqs``: an exon is read in one of three
     frames (the coordinate of its codons' low base, mod 3) and must have no stop codon in it (a codon across a
     junction is not looked at); the next exon of a chain continues the frame across the intron (frame minus start
     equals the previous frame minus end, mod 3), or the chain pays ``brk`` for a new gene or a wrong exon between.
     Dynamic programming over exon ends, the best chain kept per frame class. Scores and candidates as in
-    ``chain_exons``; ``brk`` set on beluga (F), the other species untouched."""
+    ``chain_exons``; ``brk`` set on beluga (F), the other species untouched.
+
+    With ``utr`` (two ``[windows, L]`` logit arrays of the genes head: the UTR channel expected below an exon's low
+    end and the one above its high end, i.e. utr5 and utr3 on +, utr3 and utr5 on -) also first and last coding
+    exons: within ``reach`` bases of a smoothed call's end, a start codon the exon begins with, or a stop codon it
+    ends with, is a candidate end when the mean UTR logit over the ``span`` bases outside it (clipped to +-4)
+    exceeds ``gmin``; it scores ``site`` times that mean and fixes the exon's frame. ``reach`` and ``gmin`` set on
+    beluga (F)."""
     lo_ch, hi_ch = SITES[strand]
     opens: dict = {}
     if calls is not None:
@@ -248,17 +265,32 @@ def chain_exons_framed(logit: np.ndarray, splice: np.ndarray, strand: str, seqs:
     for w in range(logit.shape[0]):
         cs = np.concatenate([[0.0], np.cumsum(np.clip(logit[w].astype(np.float32), -clip, clip), dtype=np.float64)])
         s_lo, s_hi = splice[w, :, lo_ch].astype(np.float32), splice[w, :, hi_ch].astype(np.float32)
-        A = {int(p) + 1: site * min(float(s_lo[p]), 8.0) for p in np.flatnonzero(s_lo > thr)}
-        B = {int(p): site * min(float(s_hi[p]), 8.0) for p in np.flatnonzero(s_hi > thr)}
+        seq = np.asarray(seqs[w])
+        A = {int(p) + 1: (site * min(float(s_lo[p]), 8.0), False) for p in np.flatnonzero(s_lo > thr)}     # (score, the
+        B = {int(p): (site * min(float(s_hi[p]), 8.0), False) for p in np.flatnonzero(s_hi > thr)}         # end is a codon)
+        if utr is not None:                               # + : a start codon below, a stop above; - : the reverse
+            first, last = codon_hits(seq, START[strand]), codon_hits(seq, STOPS[strand])
+            lo_hit, hi_hit = (first, last) if strand == "plus" else (last, first)
+            for a in opens.get(w, ([], []))[0]:
+                for p in np.flatnonzero(lo_hit[max(a - reach, 0):a + reach + 1]) + max(a - reach, 0):
+                    g = float(np.clip(utr[0][w, max(p - span, 0):p].astype(np.float32).mean(), -4, 4)) if p > 0 else 0.0
+                    if g > gmin:
+                        A.setdefault(int(p), (g * site, True))
+            for b in opens.get(w, ([], []))[1]:
+                for p in np.flatnonzero(hi_hit[max(b - reach - 3, 0):b + reach - 2]) + max(b - reach - 3, 0):
+                    g = float(np.clip(utr[1][w, p + 3:p + 3 + span].astype(np.float32).mean(), -4, 4)) if p + 3 < len(seq) else 0.0
+                    if g > gmin:
+                        B.setdefault(int(p) + 3, (g * site, True))
         for a in opens.get(w, ([], []))[0]:
-            A.setdefault(int(a), -2 * site)
+            A.setdefault(int(a), (-2 * site, False))
         for b in opens.get(w, ([], []))[1]:
-            B.setdefault(int(b), -2 * site)
+            B.setdefault(int(b), (-2 * site, False))
         if not A or not B:
             continue
-        stops = last_stops(np.asarray(seqs[w]), strand)
+        stops = last_stops(seq, strand)
         a_pos = np.array(sorted(A))
-        a_sc = np.array([A[a] for a in a_pos])
+        a_sc = np.array([A[a][0] for a in a_pos])
+        a_fix = np.array([A[a][1] for a in a_pos], bool)
         nodes: list = [None]                              # (start, end, previous node); node 0 is the empty chain
         # chains by their last exon's end, best increasing: one list per frame class (frame - end) % 3, and [3] any
         ends, best, node = [[0] for _ in range(4)], [[0.0] for _ in range(4)], [[0] for _ in range(4)]
@@ -266,14 +298,21 @@ def chain_exons_framed(logit: np.ndarray, splice: np.ndarray, strand: str, seqs:
             j0, j1 = np.searchsorted(a_pos, b - longest), np.searchsorted(a_pos, b)
             if j1 <= j0:
                 continue
-            aa = a_pos[j0:j1]
-            sc = cs[b] - cs[aa] + a_sc[j0:j1] + B[b]
+            aa, afix = a_pos[j0:j1], a_fix[j0:j1]
+            b_sc, b_fix = B[b]
+            sc = cs[b] - cs[aa] + a_sc[j0:j1] + b_sc
             i_any = np.searchsorted(ends[3], aa, side="right") - 1
             any_node = np.asarray(node[3])[i_any]
             any_best = np.where(any_node == 0, 0.0, np.asarray(best[3])[i_any] - brk)   # a window's first exon is free
             found = []
             for f in range(3):
-                ok = (sc > floor) & (aa > stops[f, b])
+                if b_fix and b % 3 != f:                  # a codon at the high end sets the frame
+                    continue
+                ok = (sc > floor) & (~afix | (aa % 3 == f))      # and so does one at the low end
+                if strand == "plus":                      # the stop codon that closes the gene is allowed: + at the high end
+                    ok &= aa > stops[f, b - 1 if b_fix else b]
+                else:                                     # - at the low end
+                    ok &= np.where(afix, aa >= stops[f, b], aa > stops[f, b])
                 if not ok.any():
                     continue
                 key = (f - aa) % 3
@@ -462,6 +501,11 @@ def finish(out: Path, info: dict, pred: np.ndarray, lab: dict, ids: list[str], s
         if seqs is not None:
             snapped["framed"] = {st: chain_exons_framed(pred[..., ids.index(f"cds_{st}")], splice, st, seqs, sm_cds[st])
                                  for st in ("plus", "minus")}
+            outer = {"plus": ("utr5_plus", "utr3_plus"), "minus": ("utr3_minus", "utr5_minus")}     # below, above an exon
+            if all(c in ids for cs_ in outer.values() for c in cs_):
+                snapped["terminal"] = {st: chain_exons_framed(
+                    pred[..., ids.index(f"cds_{st}")], splice, st, seqs, sm_cds[st],
+                    utr=tuple(pred[..., ids.index(c)] for c in outer[st])) for st in ("plus", "minus")}
     res = dict(info, annotations={})
     for t, y in lab.items():
         per = {}
