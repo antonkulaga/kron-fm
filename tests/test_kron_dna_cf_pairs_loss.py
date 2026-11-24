@@ -118,3 +118,31 @@ def test_tables_drawn_evenly_and_crispri_absences_unsigned(tmp_path):
     assert 0.45 < share < 0.55
     signs = [p.sign for p in cf.pairs if p.table == "small"]
     assert signs.count(0.0) == 8 and signs.count(1.0) == 2
+
+
+def test_pair_loss_ignores_the_training_batch_hidden_mask(monkeypatch):
+    """Regression (arm 2's crash, 24 Nov): genome-train leaves the main batch's hidden-block mask on the model; the
+    pair windows have another number of bins, so pair_loss must run without it (and without decoding through the
+    predictor), and put both back afterwards."""
+    import kron_core.blocks
+    from kron_core.testing import CausalMixer
+    import test_kron_dna_jepa_block as JB
+    from kron_dna import genome as G
+    from kron_dna import xheads as XH
+    monkeypatch.setattr(kron_core.blocks, "kronlstm_mixer", CausalMixer)
+    cfg = G.KronGenomeConfig(d_model=32, n_heads=2, n_layers=1, ff_units=64, stem_channels=8, n_down=7, arch="v2",
+                             jepa=True, jepa_pred_kind="context", jepa_pred_layers=1, xheads=[["h", 3]])
+    m = JB.CpuCoreGenome(cfg).train()
+    stale = torch.zeros(1, 64, dtype=torch.bool)
+    m.jepa_hidden, m.jepa_decode_pred = stale, True
+    rng = np.random.default_rng(0)
+    genome = rng.integers(0, 4, 20000).astype(np.uint8)
+    contigs = pl.DataFrame({"chrom": ["c1"], "start": [0], "end": [20000], "offset": [0]})
+    ref = LETTERS[int(genome[5000])]
+    p = pair(chrom="c1", pos=5000, ref=ref, alt="A" if ref != "A" else "C", read_pos=5100, head="h",
+             channels=np.array([0, 2]), sign=1.0)
+    loss, st = CF.pair_loss(m, [p], contigs, lambda a, b: genome[a:b], {"h": None}, XH.signal_of, 2048, 0.1,
+                            torch.device("cpu"), torch.autocast("cpu", enabled=False))
+    assert loss is not None and torch.isfinite(loss) and st["pairs"] == 1
+    loss.backward()
+    assert m.jepa_hidden is stale and m.jepa_decode_pred is True

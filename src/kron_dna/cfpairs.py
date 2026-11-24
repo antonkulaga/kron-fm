@@ -157,6 +157,10 @@ def pair_loss(model, pairs: list[Pair], contigs: pl.DataFrame, read, consts: dic
         by_head.setdefault(p.head, []).append((p, ref, alt, rel))
     terms, agree, n = [], 0, 0
     old_active, old_span = model.x_active, model.x_span
+    # the pair windows are not the training batch: no hidden blocks (the batch's mask has another shape) and the
+    # decoder reads the core as it is
+    old_hidden, old_dec = getattr(model, "jepa_hidden", None), getattr(model, "jepa_decode_pred", False)
+    model.jepa_hidden, model.jepa_decode_pred = None, False
     try:
         for head, items in by_head.items():
             span_lo = min(((it[3] - BIN) // BIN) * BIN for it in items)
@@ -187,6 +191,7 @@ def pair_loss(model, pairs: list[Pair], contigs: pl.DataFrame, read, consts: dic
                     n += 1
     finally:
         model.x_active, model.x_span = old_active, old_span
+        model.jepa_hidden, model.jepa_decode_pred = old_hidden, old_dec
     if not terms:
         return None, dict(pairs=0, signed=0, agree=float("nan"))
     loss = torch.stack(terms).mean()
