@@ -24,6 +24,9 @@ For each window the model reads 1,048,576 bases centred on it; its ``genes`` hea
   within 48 bases; and **paired**: an exon between two of the splice head's sites (the low-end and high-end kind
   of its strand, up to 3 kb apart) when the mean CDS probability between them is at least 0.5, internal coding
   exons only. Both scored with exact ends; paired is the number to set beside Tiberius's.
+  **chained**: the best non-overlapping set of such stretches per window (``chain_exons``); **framed**: the same
+  with a reading frame from the sequence (no stop codon inside an exon, the frame kept across introns;
+  ``chain_exons_framed``), the decoder to quote.
 
 Writes ``OUT/<label>.splice.npy`` (the splice head's logits, float16 ``[windows, 131072, 4]``),
 ``OUT/<label>.genes.json`` with all of it and ``OUT/<label>.genes.npy`` (the logits, float16
@@ -204,6 +207,110 @@ def chain_exons(logit: np.ndarray, splice: np.ndarray, strand: str, calls: np.nd
     return out
 
 
+STOPS = {"plus": [(3, 0, 0), (3, 0, 2), (3, 2, 0)],          # TAA TAG TGA; on -, read on the forward strand: TTA CTA TCA
+         "minus": [(3, 3, 0), (1, 3, 0), (3, 1, 0)]}
+
+
+def last_stops(seq: np.ndarray, strand: str) -> np.ndarray:
+    """``[3, L + 1]``: for a frame f and an end b, the largest start p (p % 3 == f, p + 3 <= b) of a stop codon of
+    ``strand`` in the base codes ``seq``; -1 where there is none. A stretch [a, b) is open in frame f when that is
+    below a."""
+    n = len(seq)
+    hit = np.zeros(n, bool)
+    for x, y, z in STOPS[strand]:
+        hit[:n - 2] |= (seq[:-2] == x) & (seq[1:-1] == y) & (seq[2:] == z)
+    out = np.full((3, n + 1), -1, np.int64)
+    for f in range(3):
+        p = np.flatnonzero(hit)
+        p = p[p % 3 == f]
+        out[f, p + 3] = p
+        out[f] = np.maximum.accumulate(out[f])
+    return out
+
+
+def chain_exons_framed(logit: np.ndarray, splice: np.ndarray, strand: str, seqs: list, calls: np.ndarray | None = None,
+                       thr: float = 3.0, longest: int = 3000, clip: float = 1.0, site: float = 40.0, floor: float = 160.0,
+                       brk: float = 200.0) -> set:
+    """``chain_exons`` with a reading frame, from the windows' base codes ``seqs``: an exon is read in one of three
+    frames (the coordinate of its codons' low base, mod 3) and must have no stop codon in it (a codon across a
+    junction is not looked at); the next exon of a chain continues the frame across the intron (frame minus start
+    equals the previous frame minus end, mod 3), or the chain pays ``brk`` for a new gene or a wrong exon between.
+    Dynamic programming over exon ends, the best chain kept per frame class. Scores and candidates as in
+    ``chain_exons``; ``brk`` set on beluga (F), the other species untouched."""
+    lo_ch, hi_ch = SITES[strand]
+    opens: dict = {}
+    if calls is not None:
+        for w, a, b in runs(calls):
+            o = opens.setdefault(w, ([], []))
+            o[0].append(a)
+            o[1].append(b)
+    out = set()
+    for w in range(logit.shape[0]):
+        cs = np.concatenate([[0.0], np.cumsum(np.clip(logit[w].astype(np.float32), -clip, clip), dtype=np.float64)])
+        s_lo, s_hi = splice[w, :, lo_ch].astype(np.float32), splice[w, :, hi_ch].astype(np.float32)
+        A = {int(p) + 1: site * min(float(s_lo[p]), 8.0) for p in np.flatnonzero(s_lo > thr)}
+        B = {int(p): site * min(float(s_hi[p]), 8.0) for p in np.flatnonzero(s_hi > thr)}
+        for a in opens.get(w, ([], []))[0]:
+            A.setdefault(int(a), -2 * site)
+        for b in opens.get(w, ([], []))[1]:
+            B.setdefault(int(b), -2 * site)
+        if not A or not B:
+            continue
+        stops = last_stops(np.asarray(seqs[w]), strand)
+        a_pos = np.array(sorted(A))
+        a_sc = np.array([A[a] for a in a_pos])
+        nodes: list = [None]                              # (start, end, previous node); node 0 is the empty chain
+        # chains by their last exon's end, best increasing: one list per frame class (frame - end) % 3, and [3] any
+        ends, best, node = [[0] for _ in range(4)], [[0.0] for _ in range(4)], [[0] for _ in range(4)]
+        for b in sorted(B):
+            j0, j1 = np.searchsorted(a_pos, b - longest), np.searchsorted(a_pos, b)
+            if j1 <= j0:
+                continue
+            aa = a_pos[j0:j1]
+            sc = cs[b] - cs[aa] + a_sc[j0:j1] + B[b]
+            i_any = np.searchsorted(ends[3], aa, side="right") - 1
+            any_node = np.asarray(node[3])[i_any]
+            any_best = np.where(any_node == 0, 0.0, np.asarray(best[3])[i_any] - brk)   # a window's first exon is free
+            found = []
+            for f in range(3):
+                ok = (sc > floor) & (aa > stops[f, b])
+                if not ok.any():
+                    continue
+                key = (f - aa) % 3
+                pb, pn = any_best.copy(), any_node.copy()
+                for k in range(3):
+                    m = np.flatnonzero(key == k)
+                    if not len(m):
+                        continue
+                    ik = np.searchsorted(ends[k], aa[m], side="right") - 1
+                    vb, vn = np.asarray(best[k])[ik], np.asarray(node[k])[ik]
+                    better = (vb > pb[m]) & (vn != 0)
+                    pb[m[better]], pn[m[better]] = vb[better], vn[better]
+                tot = np.where(ok, sc + pb, -np.inf)
+                i = int(tot.argmax())
+                found.append((float(tot[i]), f, int(aa[i]), int(pn[i])))
+            for tot, f, a, prev in found:
+                k = (f - b) % 3
+                if tot > best[k][-1] or tot > best[3][-1]:
+                    nodes.append((a, b, prev))
+                    for q in (k, 3):
+                        if tot > best[q][-1]:
+                            ends[q].append(b)
+                            best[q].append(tot)
+                            node[q].append(len(nodes) - 1)
+        n = node[3][-1]
+        while n:
+            a, b, n = nodes[n]
+            out.add((w, a, b))
+    return out
+
+
+def seqs_of(genome: str, win: pl.DataFrame) -> list:
+    """The windows' base codes (for the framed decoder)."""
+    bases = np.memmap(interim_dir("genome", genome) / "bases.u8", dtype=np.uint8, mode="r")
+    return [np.asarray(bases[o:o + WIN]) for o in win["bases_offset"].to_list()]
+
+
 def smooth(call: np.ndarray, gap: int = 20, short: int = 30) -> np.ndarray:
     """``[n, L]`` calls with gaps of up to ``gap`` bases closed and runs under ``short`` bases dropped: the least
     decoding that turns per-base calls into exons (no gene model; Tiberius and Helixer decode with an HMM)."""
@@ -273,7 +380,7 @@ def score(out: Path, checkpoints: list[str] = typer.Argument(..., help="LABEL=CH
             (d / f"{EK.tag(sh)}.json").write_text(json.dumps(dict(info, rows=rows, shard=list(sh)), indent=1))
             typer.echo(f"{label}: shard {EK.tag(sh)}, {len(rows)} windows in {info['seconds']:.0f} s")
             continue
-        finish(out, info, pred, lab, ids, sp)
+        finish(out, info, pred, lab, ids, sp, seqs_of(name, win))
 
 
 def ids_of(labels: list[str]) -> list[str]:
@@ -317,7 +424,8 @@ def merge(out: Path, label: str, shards: int = typer.Option(..., help="n, as in 
         seen[inf["rows"]] += 1
     if not (seen == 1).all():
         raise typer.BadParameter(f"{label}: windows not covered exactly once")
-    finish(out, dict(infos[0], seconds=sum(i["seconds"] for i in infos), shards=shards), pred, lab, ids, sp)
+    finish(out, dict(infos[0], seconds=sum(i["seconds"] for i in infos), shards=shards), pred, lab, ids, sp,
+           seqs_of(infos[0]["genome"], win))
 
 
 @app.command()
@@ -329,11 +437,12 @@ def rescore(out: Path, label: str, labels: list[str] = typer.Option(..., help="T
     info = {k: v for k, v in info.items() if k not in ("annotations", "disagreement")}
     lab, ids = labels_of(labels, win)
     sp = out / f"{label}.splice.npy"
-    finish(out, info, np.load(out / f"{label}.genes.npy"), lab, ids, np.load(sp) if sp.exists() else None)
+    finish(out, info, np.load(out / f"{label}.genes.npy"), lab, ids, np.load(sp) if sp.exists() else None,
+           seqs_of(info["genome"], win))
 
 
-def finish(out: Path, info: dict, pred: np.ndarray, lab: dict, ids: list[str], splice: np.ndarray | None = None
-           ) -> None:
+def finish(out: Path, info: dict, pred: np.ndarray, lab: dict, ids: list[str], splice: np.ndarray | None = None,
+           seqs: list | None = None) -> None:
     """Every metric from the logits ``pred`` [windows, WIN, channels] against each annotation's labels; with the
     splice head's logits ``splice`` [windows, WIN, 4] also the snapped exons."""
     label = info["label"]
@@ -350,6 +459,9 @@ def finish(out: Path, info: dict, pred: np.ndarray, lab: dict, ids: list[str], s
                    "paired": {st: pair_exons(pred[..., ids.index(f"cds_{st}")], splice, st) for st in ("plus", "minus")},
                    "chained": {st: chain_exons(pred[..., ids.index(f"cds_{st}")], splice, st, sm_cds[st])
                                for st in ("plus", "minus")}}
+        if seqs is not None:
+            snapped["framed"] = {st: chain_exons_framed(pred[..., ids.index(f"cds_{st}")], splice, st, seqs, sm_cds[st])
+                                 for st in ("plus", "minus")}
     res = dict(info, annotations={})
     for t, y in lab.items():
         per = {}
