@@ -13,6 +13,9 @@ mkdir -p "$LOG_DIR"
 flags=(--job-name="kron-$name" --nodes=1 --ntasks=1 --output="$LOG_DIR/%x-%j.out")
 [ -n "$KRON_ACCOUNT" ] && flags+=(--account="$KRON_ACCOUNT")
 [ -n "$KRON_TIME" ] && flags+=(--time="$KRON_TIME")
+# a job comment and a niceness, where a site asks for them (KRON_COMMENT='who; what; eta', KRON_NICE=100)
+[ -n "${KRON_COMMENT:-}" ] && flags+=(--comment="$KRON_COMMENT")
+[ -n "${KRON_NICE:-}" ] && flags+=(--nice="$KRON_NICE")
 if [ "$kind" = gpu ]; then
   [ -n "$KRON_GPU_PARTITION" ] || { echo "set KRON_GPU_PARTITION in slurm/env.local.sh" >&2; exit 2; }
   flags+=(--partition="$KRON_GPU_PARTITION" --cpus-per-task="$KRON_GPU_CPUS" --mem="$KRON_GPU_MEM")
