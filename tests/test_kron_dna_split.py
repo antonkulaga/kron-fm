@@ -579,3 +579,25 @@ def test_forward_split_with_local_track_equals_forward(device, monkeypatch, b, l
             scale = float(g0[n].abs().max()) + 1e-12
             rel = 5e-3 if device.type == "cuda" else 1e-4
             assert float((g0[n] - g1[n]).abs().max()) <= rel * scale + 1e-9, n
+
+
+def test_split_replica_copies_every_module_a_piece_runs(monkeypatch):
+    """Regression (24 Nov, two real cards): the replica did not copy the local track's modules, so piece 2 read
+    weights left on the first card. Every parameter of a module a piece runs must be a copy in the replica (the
+    replica holds its copies as plain attributes, resolved here by name)."""
+    import kron_core.blocks
+    from kron_core.testing import CausalMixer
+    monkeypatch.setattr(kron_core.blocks, "kronlstm_mixer", CausalMixer)
+    m = small("v2", **LOCAL)
+    r = m.split_replica("cpu", force=True)
+
+    def resolve(root, dotted):
+        for part in dotted.split("."):
+            root = root._modules[part] if part in root._modules else getattr(root, part)
+        return root
+
+    piece = ("stem", "down", "up", "head", "ntv3", "local_in", "local_core", "local_out", "local_gate")
+    names = [n for n, _ in m.named_parameters() if n.split(".")[0] in piece]
+    assert any(n.startswith("local_core.") for n in names)
+    for n in names:
+        assert resolve(r, n) is not resolve(m, n), n

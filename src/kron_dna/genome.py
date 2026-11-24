@@ -853,7 +853,8 @@ class KronGenome(nn.Module):
         return outs
 
     #: what a piece of a split window runs on its own device (see :meth:`forward_split`)
-    SPLIT_LOCAL = ("stem", "stem_res", "down", "up", "up2", "skip_proj", "head", "tracks", "ntv3", "xheads")
+    SPLIT_LOCAL = ("stem", "stem_res", "down", "up", "up2", "skip_proj", "head", "tracks", "ntv3", "xheads",
+                   "local_in", "local_core", "local_out")     # the local track runs on each piece's card too
 
     def split_replica(self, device, force: bool = False) -> "KronGenome":
         """A shallow copy of this model for :meth:`forward_split` whose conv path and per-base heads read
