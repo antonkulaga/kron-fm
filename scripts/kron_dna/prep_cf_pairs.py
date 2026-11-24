@@ -2,7 +2,8 @@
 table per source, from the benchmark tables under ``interim/eval`` and kept apart from what the benchmarks quote
 by chromosome.
 
-    uv run python scripts/kron_dna/prep_cf_pairs.py OUT_DIR [--eval-dir interim/eval] [--credible DIR] [--name hg38]
+    uv run [--with pyliftover] python scripts/kron_dna/prep_cf_pairs.py OUT_DIR [--eval-dir interim/eval]
+        [--credible DIR] [--mpra2 GSE140983_MPRAcounts.tsv.gz --mpra1 GSE140983_COUNTS_ANNOTATED.txt.gz --chain CHAIN]
 
 The split (``split`` column; agreed with the trainer, 24 Nov): hg38 chr8/chr9, the models' held-out chromosomes,
 are **not written**; chr3, chr10 and chr16 are ``pair_test`` (their sequence is trained on, no pair from them may
@@ -28,6 +29,15 @@ Columns of every table: ``chrom``, ``pos`` (0-based), ``ref``, ``alt``, ``read_p
   at the gene's TSS; ``effect`` is the fractional change of the gene's expression (``fraction``), ``regulated``
   the paper's call; ``weight`` 1 for regulated pairs, 0.25 for the others (a measured absence of effect);
   ``channel_ids`` the RNA head's channels of the row's cell type, where the store has it.
+- ``hsub2.parquet`` (the second MPRA of Uebbing et al. 2021, human neural stem cells; not a scored set, but its
+  fragments are those of ``hsub-mpra-v1``): each fragment's substitutions in combinations; one row per allele
+  with >= 10 barcodes against the fragment's all-human allele, ``ref`` the human span and ``alt`` the chosen
+  substitutions as chimp bases, read at the fragment's middle (``half`` its half-length) on the DNase head;
+  ``effect`` the log2 difference of activity (``log2``), ``se``/``t``/``p_value`` Welch's test between the
+  barcodes, ``weight`` = 1 / (1 + (se / 0.1)^2). The allele string is taken in the order the first MPRA's file
+  lists the substitutions; the files carry no sequences to check that, so a partial allele of a fragment with
+  several substitutions has ``order_assumed`` true (single-substitution fragments and all-chimp alleles do not
+  depend on it).
 """
 from __future__ import annotations
 
@@ -101,7 +111,72 @@ def crispri(table: Path, rna_store: Path) -> pl.DataFrame:
                               bench_set="set")
 
 
-def main(out: Path, eval_dir: Path = None, credible: Path = None, name: str = "hg38") -> None:
+def hsub2(counts2: Path, counts1: Path, chain: Path, name: str, min_plasmid: int = 20, min_tags: int = 10) -> pl.DataFrame:
+    """The second MPRA of Uebbing et al. 2021 (``GSE140983_MPRAcounts.tsv.gz``): fragments of the first MPRA again,
+    with their substitutions in combinations (an allele string, H or C per substitution). One row per allele
+    against the fragment's all-human allele; the substitutions' places come from the first MPRA's file."""
+    import numpy as np
+    from pyliftover import LiftOver
+    from scipy import stats
+    frag = pl.read_csv(counts1, separator="\t", infer_schema_length=100000, null_values=["NA"],
+                       columns=["Alignment", "Chr", "Start", "Stop", "Species", "eVar_BPChange", "eVar_Pos"]).filter(
+        (pl.col("Species") == "hg19") & pl.col("eVar_Pos").is_not_null()).unique("Alignment").with_columns(
+        Pos=pl.col("Alignment").str.replace("_hsSUB$", ""))
+    t = pl.read_csv(counts2, separator="\t", infer_schema_length=100000, null_values=["NA"]).filter(pl.col("Type") == "hsSUB")
+    t = t.with_columns(c=pl.col("cDNA1") + pl.col("cDNA2"), p=pl.col("pDNA1") + pl.col("pDNA2")).filter(pl.col("p") >= min_plasmid)
+    scale = float(np.log2(t["c"].sum() / t["p"].sum()))
+    a = t.with_columns(a=((pl.col("c") + 1) / (pl.col("p") + 1)).log(2) - scale).group_by("Alignment", "Pos", "Allele").agg(
+        tags=pl.len(), act=pl.col("a").mean(), var=pl.col("a").var()).filter(pl.col("tags") >= min_tags)
+    ref = a.filter(pl.col("Allele").str.contains("^H+$")).select("Pos", tags_h="tags", act_h="act", var_h="var")
+    j = a.filter(pl.col("Allele").str.contains("C")).join(ref, on="Pos").join(frag.drop("Alignment", "Species"), on="Pos")
+    eh, ec = pl.col("var_h") / pl.col("tags_h"), pl.col("var") / pl.col("tags")
+    j = j.with_columns(effect=pl.col("act") - pl.col("act_h"), se=(eh + ec).sqrt(),
+                       dof=(eh + ec) ** 2 / (eh ** 2 / (pl.col("tags_h") - 1) + ec ** 2 / (pl.col("tags") - 1)))
+    j = j.with_columns(t=pl.col("effect") / pl.col("se")).filter(pl.col("t").is_finite())
+    j = j.with_columns(p_value=pl.Series(2 * stats.t.sf(np.abs(j["t"].to_numpy()), j["dof"].to_numpy())))
+    lift = LiftOver(str(chain))
+    src = interim_dir("genome", name)
+    bases = np.memmap(src / "bases.u8", dtype=np.uint8, mode="r")
+    segs = pl.read_parquet(src / "contigs.parquet").to_dicts()
+
+    def at(chrom: str, x: int) -> int | None:
+        return next((s["offset"] + x - s["start"] for s in segs if s["chrom"] == chrom and s["start"] <= x < s["end"]), None)
+
+    rows = []
+    for r in j.to_dicts():
+        offs = [int(x) - 1 for x in str(r["eVar_Pos"]).split(";")]                 # in the file's order: the allele string's
+        subs = [x.split("->") for x in r["eVar_BPChange"].split(";")]              # chimp -> human
+        if len(r["Allele"]) != len(offs) or len(set(offs)) < len(offs):
+            continue
+        x, y = lift.convert_coordinate(r["Chr"], r["Start"]), lift.convert_coordinate(r["Chr"], r["Stop"] - 1)
+        if not x or not y or x[0][0] != y[0][0] or x[0][2] != "+" or y[0][1] - x[0][1] != r["Stop"] - 1 - r["Start"]:
+            continue
+        chrom, start = x[0][0], x[0][1]
+        on = [(o, chimp, hum) for o, (chimp, hum), state in zip(offs, subs, r["Allele"]) if state == "C"]
+        lo, hi = min(o for o, _, _ in on), max(o for o, _, _ in on)
+        g = at(chrom, start + lo)
+        if g is None or at(chrom, start + hi) != g + hi - lo:
+            continue
+        ref_s = "".join("ACGTN"[v] for v in bases[g:g + hi - lo + 1])
+        alt_s = list(ref_s)
+        for o, chimp, _ in on:
+            alt_s[o - lo] = chimp
+        if not all(ref_s[o - lo] == hum for o, _, hum in on):
+            continue
+        rows.append(dict(chrom=chrom, pos=start + lo, ref=ref_s, alt="".join(alt_s),
+                         read_pos=start + (r["Stop"] - r["Start"]) // 2, half=(r["Stop"] - r["Start"] + 1) // 2,
+                         effect=r["effect"], se=r["se"], t=r["t"], p_value=r["p_value"], tags=min(r["tags"], r["tags_h"]),
+                         fragment=r["Pos"], allele=r["Allele"], n_subs=len(on), fragment_subs=len(offs),
+                         order_assumed=0 < len(on) < len(offs), order_ascending=offs == sorted(offs)))
+    v = pl.DataFrame(rows).with_columns(
+        head=pl.lit("dnase196b"), channel_ids=pl.lit([], dtype=pl.List(pl.String)), effect_kind=pl.lit("log2"),
+        weight=1 / (1 + (pl.col("se") / 0.1) ** 2), source=pl.lit("uebbing2021-mpra2"))
+    return split_of(v).select(*COLS, "half", "se", "t", "p_value", "tags", "fragment", "allele", "n_subs", "fragment_subs",
+                              "order_assumed", "order_ascending")
+
+
+def main(out: Path, eval_dir: Path = None, credible: Path = None, name: str = "hg38", mpra2: Path = None,
+         mpra1: Path = None, chain: Path = None) -> None:
     root = interim_dir("genome", name).parent.parent
     eval_dir = eval_dir or root / "eval"
     out.mkdir(parents=True, exist_ok=True)
@@ -109,6 +184,8 @@ def main(out: Path, eval_dir: Path = None, credible: Path = None, name: str = "h
               "crispri": crispri(eval_dir / "crispri-eg-v1" / "pairs.parquet", root / "tracks" / name / "rnaseq-stranded-v1-bin128")}
     if credible:
         tables["eqtl"] = eqtl(eval_dir / "gtex-finemap-v1" / "pairs.parquet", credible)
+    if mpra2:
+        tables["hsub2"] = hsub2(mpra2, mpra1, chain, name)
     counts = dict(held_out_chroms=HELD, pair_test_chroms=PAIR_TEST, tables={})
     for k, t in tables.items():
         check(t)
