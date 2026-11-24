@@ -517,3 +517,65 @@ def test_cli_split_refusals(genomes, tmp_path, monkeypatch, extra, words):
     assert res.exit_code != 0
     text = MGT.flat(res.output)
     assert (words or "--bench-grads needs --bench") in text, text
+
+
+# ------------------------------------------------------------------- the local track (a 1-bp KronLSTM) split too
+
+LOCAL = dict(local_width=16, local_layers=1, local_span=512, dropout=0.0)   # the track's dropout masks follow the piece sizes
+
+
+def test_split_plan_aligns_to_the_local_span():
+    plan = G.split_plan(1, 4096, 2, 16, 48, "length", align=512)
+    assert [(s, e, lo, hi) for _, _, s, e, lo, hi in plan] == [(0, 2048, 0, 2560), (2048, 4096, 1536, 4096)]
+    plan = G.split_plan(1, 3072, 2, 16, 0, "length", align=512)          # 6 segments: cut at 1536
+    assert [(s, e) for _, _, s, e, _, _ in plan] == [(0, 1536), (1536, 3072)]
+    assert G.split_plan(4, 1000 // 16 * 16, 2, 16, 0, None, align=512)[0][0] == "rows"   # rows need no alignment
+    with pytest.raises(ValueError, match="local track"):
+        G.split_plan(1, 2000 // 16 * 16, 2, 16, 0, "length", align=512)
+
+
+@pytest.mark.parametrize("b,length,by", [(1, 4096, None), (2, 2048, "length"), (3, 2048, None)])
+def test_forward_split_with_local_track_equals_forward(device, monkeypatch, b, length, by):
+    """Eval and train mode: with a local track the split cuts at its restart points, so logits, tracks, core and
+    every gradient (the track's included) agree with the unsplit forward."""
+    forced_replicas(monkeypatch)
+    smooth_routing(monkeypatch)
+    seq, seg, ctx, extra = batch_for(b, length, device)
+    m = small("v2", **LOCAL).to(device).eval()
+    with torch.no_grad():
+        logits, core, _ = m(seq, seg, ctx, extra)
+        ntv3 = m.last_ntv3
+        pieces, core_s = m.forward_split(seq, seg, ctx, extra, devices=[device, device], by=by)
+    tol = dict(rtol=1e-4, atol=1e-5)
+    assert torch.allclose(G.gather_split(pieces, "logits", device), logits, **tol)
+    assert torch.allclose(G.gather_split(pieces, "ntv3", device), ntv3, **tol)
+    assert torch.allclose(core_s, core, **tol)
+    g = torch.Generator().manual_seed(9)
+    targets = torch.where(torch.rand(b, length, generator=g) < 0.15, torch.randint(0, 4, (b, length), generator=g),
+                          torch.full((b, length), -100)).to(device)
+    want = (torch.rand(b, length, 5, generator=g) * 3).to(device)
+    mask = (torch.rand(b, length, 1, generator=g) > 0.3).float().to(device)
+    epi_t = (torch.rand(b, length // 16, 3, generator=g) > 0.5).float().to(device)
+    want_core = torch.randn(b, length // 16, 32, generator=g).to(device)
+    res = []
+    for split in (False, True):
+        m = small("v2", **LOCAL).to(device).train()
+        with torch.no_grad():
+            m.local_gate.fill_(0.5)                    # the gate starts at zero, which would hide the track
+        torch.manual_seed(5)
+        if split:
+            pieces, core = m.forward_split(seq, seg, ctx, extra, devices=[device, device], by=by)
+            out = (G.gather_split(pieces, "logits", device), G.gather_split(pieces, "ntv3", device), core)
+        else:
+            logits, core, _ = m(seq, seg, ctx, extra)
+            out = (logits, m.last_ntv3, core)
+        split_loss(m, out, targets, want, mask, epi_t, want_core).backward()
+        res.append({n: p.grad for n, p in m.named_parameters()})
+    g0, g1 = res
+    assert any(n.startswith("local_core.") and g0[n] is not None and float(g0[n].abs().max()) > 0 for n in g0)
+    for n in g0:
+        assert (g0[n] is None) == (g1[n] is None), n
+        if g0[n] is not None:
+            scale = float(g0[n].abs().max()) + 1e-12
+            rel = 5e-3 if device.type == "cuda" else 1e-4
+            assert float((g0[n] - g1[n]).abs().max()) <= rel * scale + 1e-9, n

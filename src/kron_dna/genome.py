@@ -899,9 +899,9 @@ class KronGenome(nn.Module):
         the first device. ``last_jepa``/``last_epi`` are set as by forward; ``last_ntv3`` is None (it is in the
         pieces; :func:`gather_split` joins them). ``core_only``: stop after the core (no decoder, no heads)."""
         c = self.config
-        if c.arch not in ("v2", "v2l") or c.chunk_ratio or c.local_width:
-            raise ValueError("forward_split needs arch v2 or v2l without learned chunking or a local track (v1's "
-                             "GroupNorm takes statistics over the whole window, so a piece would see other ones)")
+        if c.arch not in ("v2", "v2l") or c.chunk_ratio:
+            raise ValueError("forward_split needs arch v2 or v2l without learned chunking (v1's GroupNorm takes "
+                             "statistics over the whole window, so a piece would see other ones)")
         devices = [_device(d) for d in devices]
         dev0 = next(self.parameters()).device
         if devices[0] != dev0:
@@ -909,7 +909,8 @@ class KronGenome(nn.Module):
         b, length = seq.shape[0], seq.shape[-1]
         unit = 2 ** c.n_down
         halo = split_halo(c) if halo is None else int(halo)
-        plan = split_plan(b, length, len(devices), unit, halo, by)
+        # a local track restarts every local_span bases: pieces cut there hold whole segments of it (exact)
+        plan = split_plan(b, length, len(devices), unit, halo, by, align=c.local_span if c.local_width else 0)
         by = plan[0][0]
         reps = {}
         enc = []                                                      # per piece: (skips, its core-input bins)
@@ -947,7 +948,7 @@ class KronGenome(nn.Module):
         for k, (_, rows, start, end, lo, hi) in enumerate(plan):
             d, r = devices[k], reps[devices[k]]
             skips = enc[k][0]
-            y = r.decode(core_dec[rows, lo // unit:hi // unit].transpose(1, 2).to(d), skips)
+            y = r.add_local(r.decode(core_dec[rows, lo // unit:hi // unit].transpose(1, 2).to(d), skips), skips)
             y = y[:, :, start - lo:end - lo]                          # heads are per position: crop first
             pieces.append(SplitPiece(rows=rows, start=start, end=end, device=d, logits=r.head(y).transpose(1, 2),
                                      tracks=r.tracks(y).transpose(1, 2) if r.tracks is not None else None,
@@ -1310,18 +1311,34 @@ def split_halo(config: KronGenomeConfig) -> int:
     return -(-split_reach(config) // unit) * unit
 
 
-def split_plan(batch: int, length: int, n: int, unit: int, halo: int, by: str | None = None) -> list[tuple]:
+def split_plan(batch: int, length: int, n: int, unit: int, halo: int, by: str | None = None,
+               align: int = 0) -> list[tuple]:
     """``n`` pieces of a ``[batch, length]`` window: ``(by, rows, start, end, lo, hi)`` each, where the piece owns
     bases ``start:end`` of ``rows`` and is encoded over ``lo:hi`` (its stretch plus ``halo`` each side, clipped
     to the window). ``by``: "rows" (whole windows, no halo; needs ``batch % n == 0``), "length" (contiguous
     stretches on ``unit`` boundaries), None: rows when the batch divides evenly, else length; or "balanced"
     (--short-sources pack, whose packs may hold an odd number of short rows): rows when the batch divides
     evenly, else whichever of uneven whole rows (``ceil(batch / n)`` rows on the busiest piece, no halo) and
-    length pieces (with their halo) puts fewer encoded bases on the busiest piece; ties go to length."""
+    length pieces (with their halo) puts fewer encoded bases on the busiest piece; ties go to length.
+    ``align`` > 0 (a local track's restart span): length pieces are cut at multiples of ``align`` and the halo is
+    rounded up to one, so each piece's own stretch holds whole recurrent segments of the track; a window whose
+    length is not a multiple of ``align`` is then split by rows only."""
     if n < 1:
         raise ValueError("split over at least one device")
     if length % unit or halo % unit or halo < 0:
         raise ValueError(f"length and halo must be non-negative multiples of {unit}")
+    if align:
+        if align % unit:
+            raise ValueError(f"align must be a multiple of {unit}")
+        halo = -(-halo // align) * align
+        if length % align or length // align < n:
+            if by == "length" or batch < n:
+                raise ValueError(f"a local track restarting every {align} bases cannot split a {length}-base window "
+                                 f"into {n} pieces by length")
+            if batch % n == 0 or by == "balanced":
+                edges = [round(i * batch / n) for i in range(n + 1)]
+                return [("rows", slice(a, b), 0, length, 0, length) for a, b in zip(edges[:-1], edges[1:])]
+        unit = align
     if by == "balanced":
         if batch % n == 0:
             by = "rows"

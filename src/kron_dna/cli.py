@@ -1283,7 +1283,7 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
         bad_ = [n_ for n_, on_ in (("--arch v1/v3 (v1's GroupNorm takes whole-window statistics)",
                                     arch not in ("v2", "v2l")),
                                    ("--whole-contigs", whole_contigs), ("--chunk-ratio", chunk_ratio > 0),
-                                   ("--local-track", bool(local_track)), ("--labels", labels),
+                                   ("--labels", labels),
                                    ("--compile-convs", compile_convs), ("torchrun (WORLD_SIZE > 1)", world > 1))
                 if on_]
         if bad_:
