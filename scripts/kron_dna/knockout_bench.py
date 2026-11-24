@@ -346,7 +346,9 @@ def report(out: Path, n_boot: int = 1000) -> None:
             continue
         r = pl.read_parquet(d / "pairs.parquet")
         subsets = [("all", r), ("K562", r.filter(pl.col("cell_type") == "K562")),
-                   ("chr8/chr9 (held out)", r.filter("held_out")), ("other chromosomes", r.filter(~pl.col("held_out")))]
+                   ("chr8/chr9 (held out)", r.filter("held_out")),
+                   ("chr3/chr10/chr16 (pair test)", r.filter(pl.col("chrom").is_in(["chr3", "chr10", "chr16"]))),   # no
+                   ("other chromosomes", r.filter(~pl.col("held_out")))]      # counterfactual pair is trained there (prep_cf_pairs.py)
         subsets += [(f"study {s}", r.filter(pl.col("study") == s)) for s in
                     r.group_by("study").len().filter(pl.col("len") >= 200)["study"].sort()]
         e = r.filter(pl.col("e5_skipped") == 0) if "e5_skipped" in r.columns else r.clear()
