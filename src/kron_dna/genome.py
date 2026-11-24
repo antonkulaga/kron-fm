@@ -413,8 +413,8 @@ class KronGenome(nn.Module):
         names = [n for n, _, _ in rows]
         if len(set(names)) != len(names) or any(not n.isidentifier() for n in names):
             raise ValueError(f"xheads need distinct identifier names, got {names}")
-        if c.xheads and (c.arch not in ("v2", "v2l") or c.chunk_ratio or c.local_width):
-            raise ValueError("xheads need arch v2 or v2l without learned chunking or a local track")
+        if c.xheads and (c.arch not in ("v2", "v2l") or c.chunk_ratio):      # a local track is fine: it is added to the
+            raise ValueError("xheads need arch v2 or v2l without learned chunking")   # decoder's output the heads read
         for n, _, b in rows:
             if b < 1 or b & (b - 1) or b > 2 ** c.n_down:
                 raise ValueError(f"xhead {n}: bin {b} must be a power of two up to {2 ** c.n_down}")

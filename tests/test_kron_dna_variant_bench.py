@@ -57,6 +57,11 @@ def test_score_merge_and_asb_report(genomes, tmp_path, monkeypatch, device):
     two = bases[r1["offset"] + 2800:r1["offset"] + 2802]
     if (two < 4).all():
         rows.append(dict(chrom="chr1", pos=2800, ref=letters[two[0]] + letters[two[1]], alt=letters[two[0]]))
+    blk = bases[r1["offset"] + 2000:r1["offset"] + 2070]                            # a 70-base block with three changes:
+    if (blk < 4).all():                                                             # same length, so not too long
+        new = blk.copy()
+        new[[0, 30, 69]] = (new[[0, 30, 69]] + 1) % 4
+        rows.append(dict(chrom="chr1", pos=2000, ref="".join(letters[x] for x in blk), alt="".join(letters[x] for x in new)))
     rng = np.random.default_rng(0)
     n = len(rows)
     t = pl.DataFrame(rows).with_columns(
@@ -80,6 +85,7 @@ def test_score_merge_and_asb_report(genomes, tmp_path, monkeypatch, device):
     ref, alt = np.load(d / "ref.npy"), np.load(d / "alt.npy")
     assert info["ref_mismatch"] == 1 and info["ids"] == ["F0", "F1", "F2"] and sites.height == n - 1
     assert ref.shape == alt.shape == (n - 1, 3) and (ref > 0).all()
+    assert sites.filter(pl.col("ref").str.len_chars() == 70).height == int((blk < 4).all())    # the long block is scored
     a, b = (sites.with_row_index("k").filter((pl.col("chrom") == "chr1") & (pl.col("pos") == 1500))["k"]).to_list()
     assert np.array_equal(ref[a], ref[b]) and not np.allclose(alt[a], alt[b])      # one reference, two alternatives
     assert not np.allclose(ref, alt)
@@ -114,6 +120,13 @@ def test_score_merge_and_asb_report(genomes, tmp_path, monkeypatch, device):
     assert res.exit_code == 0, res.output + repr(res.exception)
     rm = next(r for r in json.loads((out / "report_mpra.json").read_text()) if r["label"] == "m")
     assert rm["variants"] == n - 1 and -1 <= rm["spearman_all"] <= 1 and rm["own_channels"] == 0
+    # the human-vs-chimp report reads the same table shape, with a test statistic and a count of substitutions
+    mp.with_columns(differential=pl.lit(True), n_subs=pl.lit(1), t=pl.col("effect")).write_parquet(tmp_path / "hsub.parquet")
+    res = run("report-hsub", out, "--variants", tmp_path / "hsub.parquet", "--min-rows", 3, "--n-boot", 5)
+    assert res.exit_code == 0, res.output + repr(res.exception)
+    rh = [r for r in json.loads((out / "report_hsub.json").read_text()) if r["label"] == "m"]
+    assert {r["subset"] for r in rh} >= {"confident", "differential"} and rh[0]["fragments"] == n - 1
+    assert 0 <= next(r for r in rh if r["subset"] == "differential")["auroc_all"] <= 1
     # the eQTL report: the same sites as a positive/negative table read at "the TSS" (here each variant's position)
     eq = t.select("chrom", "ref", "alt", "held_out", position="pos", tss="pos").with_row_index("k").with_columns(
         label=(pl.col("k") % 2).cast(pl.Int32), pair=(pl.col("k") // 2).cast(pl.Int64), strand=pl.lit("+"),
@@ -138,6 +151,10 @@ def test_score_merge_and_asb_report(genomes, tmp_path, monkeypatch, device):
     res = run("report-lentimpra", out2)
     assert res.exit_code == 0, res.output + repr(res.exception)
     assert json.loads((out2 / "report_lentimpra.json").read_text())[0]["elements"] == 6
+    res = run("report-lentimpra", out2, "--also", out2)                              # "another head": the same one again
+    assert res.exit_code == 0, res.output + repr(res.exception)
+    both = json.loads((out2 / "report_lentimpra.json").read_text())
+    assert len(both) == 2 and both[1]["channels"] == 2 * both[0]["channels"] and both[1]["elements"] == 6
 
 
 def test_label_head_and_mfass_report(genomes, tmp_path, monkeypatch, device):
@@ -189,3 +206,32 @@ def test_label_head_and_mfass_report(genomes, tmp_path, monkeypatch, device):
     assert res.exit_code == 0, res.output + repr(res.exception)
     rep = json.loads((out / "report_mfass.json").read_text())
     assert rep[0]["variants"] == t.height and 0 <= rep[0]["ap"] <= 1
+
+
+def test_vexseq_exon_ends():
+    """Vex-seq's distances to the splice sites have no zero and follow the transcript: an exon [100, 150) is
+    recovered from a variant inside it, before it and after it, on either strand."""
+    s = importlib.util.spec_from_file_location("prep_vexseq", Path(__file__).parents[1] / "scripts/kron_dna/prep_vexseq.py")
+    m = importlib.util.module_from_spec(s)
+    s.loader.exec_module(m)
+    # plus strand: first exon base is 3SS +1, last is 5SS -1; last intron base 3SS -1, first intron base 5SS +1
+    assert m.ends(100, 1, -50, "+") == (100, 150) and m.ends(149, 50, -1, "+") == (100, 150)
+    assert m.ends(99, -1, -51, "+") == (100, 150) and m.ends(150, 51, 1, "+") == (100, 150)
+    # minus strand: the 3' splice site is at the high end
+    assert m.ends(149, 1, -50, "-") == (100, 150) and m.ends(100, 50, -1, "-") == (100, 150)
+    assert m.ends(150, -1, -51, "-") == (100, 150) and m.ends(99, 51, 1, "-") == (100, 150)
+
+
+def test_exp_starr_additive_fit():
+    """The enhancer x promoter fit recovers each element's strength from an incomplete grid of pairs."""
+    sp = importlib.util.spec_from_file_location("prep_exp_starr", Path(__file__).parents[1] / "scripts/kron_dna/prep_exp_starr.py")
+    m = importlib.util.module_from_spec(sp)
+    sp.loader.exec_module(m)
+    rng = np.random.default_rng(0)
+    a, b = rng.normal(size=30), rng.normal(size=40)
+    a, b = a - a.mean(), b - b.mean()
+    p, e = np.repeat(np.arange(30), 40), np.tile(np.arange(40), 30)
+    keep = rng.random(len(p)) < 0.7
+    p, e = p[keep], e[keep]
+    mu, fa, fb, r2 = m.additive(p, e, 2.0 + a[p] + b[e], 30, 40)
+    assert abs(mu - 2.0) < 1e-3 and np.allclose(fa, a, atol=1e-3) and np.allclose(fb, b, atol=1e-3) and r2 > 0.999

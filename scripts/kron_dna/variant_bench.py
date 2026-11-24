@@ -28,6 +28,7 @@ intervals.
 from __future__ import annotations
 
 import json
+import re
 import time
 from pathlib import Path
 
@@ -44,6 +45,8 @@ from kron_dna import xheads as X
 app = typer.Typer(add_completion=False)
 BIN = 128
 EPS = 1.0
+PAIR_TEST = ["chr3", "chr10", "chr16"]      # prep_cf_pairs.py trains no counterfactual pair on these: an arm trained
+PT = pl.col("chrom").is_in(PAIR_TEST)       # on its pairs is quoted on chr8/chr9 and on these ("pair test") only
 CODE = {"A": 0, "C": 1, "G": 2, "T": 3, "N": 4}
 KEY = ["chrom", "pos", "ref", "alt", "read"]
 STORES = {"chiptf": "chip-tf-v1-bin128", "chiphr": "chip-histone-rest-v1-bin128", "chip492b": "chip-histone-core-v1-bin128",
@@ -116,8 +119,10 @@ def score(out: Path, checkpoints: list[str] = typer.Argument(..., help="LABEL=CH
     sites = sites.with_columns(w_lo=((pl.col("pos") + pl.col("read")) // 2 // BIN) * BIN - context // 2)
     inside = lambda c: (pl.col(c) >= pl.col("w_lo") + edge) & (pl.col(c) < pl.col("w_lo") + context - edge)
     n_all = sites.height
-    sites = sites.filter(inside("pos") & inside("read") & (pl.col("ref").str.len_chars() <= 64)
-                         & (pl.col("alt").str.len_chars() <= 64))
+    lr, la = pl.col("ref").str.len_chars(), pl.col("alt").str.len_chars()
+    sites = sites.filter(inside("pos") & inside("read") & (((lr <= 64) & (la <= 64)) | ((lr == la) & (lr <= 1024))))
+    if sites.height < n_all:        # an indel over 64 bases shifts too much; a same-length block (several
+        typer.echo(f"{n_all - sites.height} of {n_all} sites left out: outside the window's core or too long")   # substitutions) may be long
     mine = sites.filter(pl.col("site") % sh[1] == sh[0])
     bases = np.memmap(src / "bases.u8", dtype=np.uint8, mode="r")
     contigs = pl.read_parquet(src / "contigs.parquet")
@@ -300,6 +305,7 @@ def report_asb(out: Path, variants: Path = typer.Option(None, help="the ASB tabl
         for tier in r["match"].unique().sort():
             s = r.filter(pl.col("match") == tier)
             subsets += [(f"{tier}", s), (f"{tier}, chr8/chr9 (held out)", s.filter("held_out")),
+                        (f"{tier}, chr3/chr10/chr16 (pair test)", s.filter(PT)),
                         (f"{tier}, other chromosomes", s.filter(~pl.col("held_out"))),
                         (f"{tier}, with a motif hit", s.filter(pl.col("motif_conc") != "No Hit")),
                         (f"{tier}, no motif hit", s.filter(pl.col("motif_conc") == "No Hit"))]
@@ -363,7 +369,8 @@ def report_mpra(out: Path, variants: Path = typer.Option(None, help="prep_mpra_s
             y, rows = s["effect"].to_numpy(), s["at"].to_numpy()
             own = cells.get(norm(s["cell"][0]), [])
             row = dict(label=d.name, head=info["head"], experiment=exp, element=s["element"][0], kind=s["kind"][0],
-                       cell=s["cell"][0], primary=bool(s["primary"][0]), held_out=bool(s["held_out"][0]), variants=s.height,
+                       cell=s["cell"][0], primary=bool(s["primary"][0]), held_out=bool(s["held_out"][0]),
+                       pair_test=s["chrom"][0] in PAIR_TEST, variants=s.height,
                        own_channels=len(own))
             for k, v in (("all", delta[rows].mean(1)), ("own", delta[rows][:, own].mean(1) if own else None)):
                 if v is not None:
@@ -375,6 +382,7 @@ def report_mpra(out: Path, variants: Path = typer.Option(None, help="prep_mpra_s
         for nm, rs in (("primary experiments", prim), ("promoters", [r for r in prim if r["kind"] == "promoter"]),
                        ("enhancers", [r for r in prim if r["kind"] == "enhancer"]),
                        ("chr8/chr9 (held out)", [r for r in prim if r["held_out"]]),
+                       ("chr3/10/16 (pair test)", [r for r in prim if r["pair_test"]]),
                        ("with own cell line", [r for r in prim if r["own_channels"]])):
             if rs:
                 mean = lambda k: float(np.mean(v)) if (v := [r[k] for r in rs if np.isfinite(r.get(k, np.nan))]) else float("nan")
@@ -385,6 +393,57 @@ def report_mpra(out: Path, variants: Path = typer.Option(None, help="prep_mpra_s
                   f"spearman={r['spearman_all']:.3f}" + (f" own({r['own_channels']})={r['pearson_own']:.3f}" if r["own_channels"] else "")
                   for r in per]
     (out / "report_mpra.json").write_text(json.dumps(table, indent=1))
+    typer.echo("\n".join(lines))
+
+
+@app.command("report-hsub")
+def report_hsub(out: Path, variants: Path = typer.Option(None, help="prep_hsub_mpra.py's table (default: the one scored)"),
+                cells: str = typer.Option("^H9$|neural progenitor|neuronal stem|neurosphere", help="regex on a track's "
+                                          "biosample: the assay's cell type"), n_boot: int = 200, min_rows: int = 20) -> None:
+    """Human-versus-chimpanzee fragments (``prep_hsub_mpra.py``; scored with ``--read-col centre --flank-col half``):
+    the head's predicted change, the mean over channels of ``log2((alt + 1) / (ref + 1))`` at the fragment, against
+    the measured chimp-over-human effect. Over the confident fragments Pearson and Spearman; over the differential
+    ones (fdr < 0.05) the AUROC of the direction as well. All channels, and those of the assay's cell type
+    (``--cells``); chr8/chr9 and single-substitution fragments apart."""
+    lines, table = [], []
+    for d in sorted((out / "pred").iterdir()):
+        if not (d / "index.json").exists():
+            continue
+        info = json.loads((d / "index.json").read_text())
+        t = pl.read_parquet(variants or Path(info["variants"])).filter("confident")
+        sites = pl.read_parquet(d / "sites.parquet").with_row_index("at")
+        delta = np.log2((np.load(d / "alt.npy") + EPS) / (np.load(d / "ref.npy") + EPS))
+        t = t.join(sites.select("chrom", "pos", "ref", "alt", "at", centre="read"), on=["chrom", "pos", "ref", "alt", "centre"])
+        meta = Path(info["store"]) / "binned.json"
+        tracks = json.loads(meta.read_text())["tracks"] if meta.exists() else []
+        own = [k for k, tr in enumerate(tracks) if re.search(cells, str(tr.get("biosample", "")))]
+        rows = t["at"].to_numpy()
+        t = t.with_columns(pred_all=pl.Series(delta[rows].mean(1).astype(np.float64)),
+                           pred_own=pl.Series(delta[rows][:, own].mean(1).astype(np.float64)) if own else pl.lit(None, dtype=pl.Float64))
+        subsets = [("confident", t), ("differential", t.filter("differential")),
+                   ("differential, chr8/chr9", t.filter(pl.col("differential") & pl.col("held_out"))),
+                   ("differential, chr3/10/16 (pair test)", t.filter(pl.col("differential") & PT)),
+                   ("differential, other chrom.", t.filter(pl.col("differential") & ~pl.col("held_out"))),
+                   ("differential, 1 substitution", t.filter(pl.col("differential") & (pl.col("n_subs") == 1))),
+                   ("differential, top 200 by |t|", t.filter("differential").sort(pl.col("t").abs(), descending=True).head(200))]
+        for nm, s in subsets:
+            if s.height < min_rows:
+                continue
+            y = s["effect"].to_numpy()
+            row = dict(label=d.name, head=info["head"], subset=nm, fragments=s.height, own_channels=len(own))
+            for k in ("all", "own") if own else ("all",):
+                v = s[f"pred_{k}"].to_numpy()
+                row[f"pearson_{k}"] = float(np.corrcoef(v, y)[0, 1]) if v.std() > 0 else float("nan")
+                row[f"spearman_{k}"] = spearman(v, y)
+                if nm != "confident":
+                    row[f"auroc_{k}"] = auroc(v, y > 0)
+                    row[f"auroc_{k}_ci"] = ci(lambda i: auroc(v[i], y[i] > 0), len(y), n_boot)
+            table.append(row)
+            lines.append(f"{d.name:20s} {nm:30s} n={s.height:6d} " + " ".join(
+                f"{k}: r={row[f'pearson_{k}']:.3f} rho={row[f'spearman_{k}']:.3f}"
+                + (f" auroc={row[f'auroc_{k}']:.3f}[{row[f'auroc_{k}_ci'][0]:.3f},{row[f'auroc_{k}_ci'][1]:.3f}]" if f"auroc_{k}" in row else "")
+                for k in (("all", "own") if own else ("all",))) + f" (own channels {len(own)})")
+    (out / "report_hsub.json").write_text(json.dumps(table, indent=1))
     typer.echo("\n".join(lines))
 
 
@@ -411,7 +470,8 @@ def report_eqtl(out: Path, variants: Path = typer.Option(None, help="prep_eqtl_f
         t = t.join(sites.select("chrom", "pos", "ref", "alt", "at", tss="read"), on=["chrom", "pos", "ref", "alt", "tss"])
         score = np.array([mag[a, by[s] or slice(None)].mean() for a, s in zip(t["at"].to_numpy(), t["strand"].to_list())])
         t = t.with_columns(score=pl.Series(score))
-        for nm, s in (("all", t), ("chr8/chr9 (held out)", t.filter("held_out")), ("other chromosomes", t.filter(~pl.col("held_out"))),
+        for nm, s in (("all", t), ("chr8/chr9 (held out)", t.filter("held_out")), ("chr3/chr10/chr16 (pair test)", t.filter(PT)),
+                      ("other chromosomes", t.filter(~pl.col("held_out"))),
                       ("within 10 kb of the TSS", t.filter(pl.col("distance").abs() <= 10_000)),
                       ("beyond 10 kb", t.filter(pl.col("distance").abs() > 10_000))):
             y = (s["label"] == 1).to_numpy()
@@ -448,12 +508,18 @@ def ridge_cv(x: np.ndarray, y: np.ndarray, fold: np.ndarray, lam: float = 100.0)
 
 @app.command("report-lentimpra")
 def report_lentimpra(out: Path, variants: Path = typer.Option(None, help="prep_lentimpra.py's table (default: the one "
-                                                                         "scored)"), lam: float = 100.0) -> None:
+                                                                         "scored)"), lam: float = 100.0,
+                     also: list[Path] = typer.Option([], help="other OUT folders with the same label's predictions "
+                                                              "from other heads: one more probe on all heads' channels")) -> None:
     """lentiMPRA activity of native 200-bp elements (Agarwal et al. 2025) against the head's prediction at their
     place in the genome (scored with ``--ref-only``), per cell line: Pearson of the measured ``log2(RNA/DNA)`` with
     (a) the mean ``log1p`` signal over the cell line's own channels, where the store has them, and (b) a ridge probe
     on every channel's ``log1p`` signal, fitted out-of-fold on the paper's ten folds (their Table S6 gives Enformer,
-    Sei and MPRALegNet on the same folds). chr8/chr9 elements apart (probe fitted on the others)."""
+    Sei and MPRALegNet on the same folds). chr8/chr9 elements apart (probe fitted on the others). A table with a
+    ``group`` column (``prep_exp_starr.py``: enhancer and promoter strengths) is reported per cell line and group.
+    With ``--also OUT2 [--also OUT3 ...]`` (the same elements scored with other heads under the same label) a
+    second line per cell line gives the probe on all those heads' channels together, on the elements every head
+    has."""
     lines, table = [], []
     for d in sorted((out / "pred").iterdir()):
         if not (d / "index.json").exists():
@@ -465,23 +531,40 @@ def report_lentimpra(out: Path, variants: Path = typer.Option(None, help="prep_l
         t = t.join(sites.select("chrom", "pos", "at"), on=["chrom", "pos"])
         meta = Path(info["store"]) / "binned.json"
         tracks = json.loads(meta.read_text())["tracks"] if meta.exists() else []
-        for (cell,), s in t.group_by("cell", maintain_order=True):
-            y, x = s["activity"].to_numpy(), x_all[s["at"].to_numpy()]
-            own = [k for k, tr in enumerate(tracks) if norm(str(tr.get("biosample", ""))) == norm(cell)]
+        if "group" not in t.columns:                      # prep_exp_starr.py's table: enhancers and promoters apart
+            t = t.with_columns(group=pl.lit(""))
+        runs = [(info["head"], t, [(x_all, "at")], tracks)]
+        if also:                                          # every head's channels side by side
+            tj, parts, heads = t, [(x_all, "at")], [info["head"]]
+            for k, o in enumerate(also):
+                dd = o / "pred" / d.name
+                heads.append(json.loads((dd / "index.json").read_text())["head"])
+                tj = tj.join(pl.read_parquet(dd / "sites.parquet").with_row_index(f"at{k}").select("chrom", "pos", f"at{k}"),
+                             on=["chrom", "pos"])
+                parts.append((np.log1p(np.load(dd / "ref.npy")).astype(np.float64), f"at{k}"))
+            runs.append(("+".join(heads), tj, parts, []))
+        for head, tt, parts, trk in runs:
+          for (cell, group), s in tt.group_by("cell", "group", maintain_order=True):
+            y, x = s["activity"].to_numpy(), np.concatenate([xa[s[c].to_numpy()] for xa, c in parts], 1)
+            own = [k for k, tr in enumerate(trk) if norm(str(tr.get("biosample", ""))) == norm(cell)]
             held = s["held_out"].to_numpy()
             oof = ridge_cv(x, y, s["fold"].to_numpy(), lam)
             pear = lambda a, b: float(np.corrcoef(a, b)[0, 1]) if len(a) > 2 else float("nan")
-            row = dict(label=d.name, head=info["head"], cell=cell, elements=s.height, own_channels=len(own),
+            row = dict(label=d.name, head=head, channels=x.shape[1], cell=cell, group=group, elements=s.height, own_channels=len(own),
                        probe_pearson=pear(oof, y), probe_by_fold=[pear(oof[s["fold"].to_numpy() == f], y[s["fold"].to_numpy() == f])
                                                                   for f in sorted(set(s["fold"].to_list()))],
                        own_pearson=pear(x[:, own].mean(1), y) if own else None, held_out=int(held.sum()))
             if held.sum() > 50:                          # the probe fitted on the other chromosomes
                 ho = ridge_cv(x, y, held.astype(int), lam)
                 row["probe_pearson_held_out"] = pear(ho[held], y[held])
+            pt = s["chrom"].is_in(PAIR_TEST).to_numpy()
+            if pt.sum() > 50:                            # likewise for the pair-test chromosomes
+                row["probe_pearson_pair_test"] = pear(ridge_cv(x, y, pt.astype(int), lam)[pt], y[pt])
             table.append(row)
-            lines.append(f"{d.name:20s} {cell:6s} n={s.height:6d} probe={row['probe_pearson']:.3f} "
+            lines.append(f"{d.name:20s} {cell:6s} {group:9s} n={s.height:6d} probe={row['probe_pearson']:.3f} "
                          f"held-out chr8/chr9={row.get('probe_pearson_held_out', float('nan')):.3f} "
-                         + (f"own({len(own)})={row['own_pearson']:.3f}" if own else "own: none"))
+                         f"pair-test chr3/10/16={row.get('probe_pearson_pair_test', float('nan')):.3f} "
+                         + (f"own({len(own)})={row['own_pearson']:.3f}" if own else "own: none") + f"  [{head}, {x.shape[1]} channels]")
     (out / "report_lentimpra.json").write_text(json.dumps(table, indent=1))
     typer.echo("\n".join(lines))
 
@@ -491,7 +574,7 @@ def report_lentimpra(out: Path, variants: Path = typer.Option(None, help="prep_l
 @app.command("report-mfass")
 def report_mfass(out: Path, variants: Path = typer.Option(None, help="prep_mfass.py's table (default: the one scored)"),
                  n_boot: int = 200) -> None:
-    """Splice-disrupting variants (MFASS; ``sdv``: dPSI <= -0.5) from the splice head, scored with ``--head splice
+    """Splice-disrupting variants (MFASS, or Vex-seq's table from ``prep_vexseq.py``; ``sdv``: dPSI <= -0.5) from the splice head, scored with ``--head splice
     --read-col exon_mid --flank-col half``: a variant's prediction is the change (alt - ref) of the exon's acceptor
     and donor logits (each the highest of its strand's channel over the exon and 3 bases beyond), averaged. Average
     precision and AUROC of the predicted loss for ``sdv``, Spearman with the measured dPSI; per region, chr8/chr9
@@ -509,7 +592,8 @@ def report_mfass(out: Path, variants: Path = typer.Option(None, help="prep_mfass
         own = {"+": [ch["acceptor_plus"], ch["donor_plus"]], "-": [ch["acceptor_minus"], ch["donor_minus"]]}
         pred = np.array([delta[a, own[s]].mean() for a, s in zip(t["at"].to_numpy(), t["strand"].to_list())])
         t = t.with_columns(pred=pl.Series(pred))
-        subsets = [("all", t), ("chr8/chr9 (held out)", t.filter("held_out")), ("other chromosomes", t.filter(~pl.col("held_out")))]
+        subsets = [("all", t), ("chr8/chr9 (held out)", t.filter("held_out")), ("chr3/chr10/chr16 (pair test)", t.filter(PT)),
+                   ("other chromosomes", t.filter(~pl.col("held_out")))]
         subsets += [(str(r), t.filter(pl.col("region") == r)) for r in t["region"].drop_nulls().unique().sort()]
         for nm, s in subsets:
             y = s["sdv"].to_numpy().astype(bool)
@@ -518,11 +602,12 @@ def report_mfass(out: Path, variants: Path = typer.Option(None, help="prep_mfass
             v = -s["pred"].to_numpy()
             row = dict(label=d.name, subset=nm, variants=s.height, sdv=int(y.sum()), chance=float(y.mean()), ap=ap(v, y),
                        ap_ci=ci(lambda i: ap(v[i], y[i]), len(y), n_boot), auroc=auroc(v, y),
-                       spearman_dpsi=spearman(s["pred"].to_numpy(), s["dpsi"].to_numpy()))
+                       spearman_dpsi=spearman(s["pred"].to_numpy(), s["dpsi"].to_numpy()),
+                       pearson_dpsi=float(np.corrcoef(s["pred"].to_numpy(), s["dpsi"].to_numpy())[0, 1]))
             table.append(row)
             lines.append(f"{d.name:20s} {nm:22s} n={s.height:6d} sdv={row['sdv']:4d} ap={row['ap']:.3f}"
                          f"[{row['ap_ci'][0]:.3f},{row['ap_ci'][1]:.3f}] (chance {row['chance']:.3f}) auroc={row['auroc']:.3f} "
-                         f"rho(dPSI)={row['spearman_dpsi']:.3f}")
+                         f"rho(dPSI)={row['spearman_dpsi']:.3f} r={row['pearson_dpsi']:.3f}")
     (out / "report_mfass.json").write_text(json.dumps(table, indent=1))
     typer.echo("\n".join(lines))
 
