@@ -145,6 +145,10 @@ def test_score_merge_and_asb_report(genomes, tmp_path, monkeypatch, device):
     res = run("report-lentimpra", out2)
     assert res.exit_code == 0, res.output + repr(res.exception)
     assert json.loads((out2 / "report_lentimpra.json").read_text())[0]["elements"] == 6
+    res = run("report-lentimpra", out2, "--also", out2)                              # "another head": the same one again
+    assert res.exit_code == 0, res.output + repr(res.exception)
+    both = json.loads((out2 / "report_lentimpra.json").read_text())
+    assert len(both) == 2 and both[1]["channels"] == 2 * both[0]["channels"] and both[1]["elements"] == 6
 
 
 def test_label_head_and_mfass_report(genomes, tmp_path, monkeypatch, device):
