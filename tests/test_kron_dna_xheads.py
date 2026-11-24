@@ -62,6 +62,33 @@ def test_an_inactive_head_runs_no_forward_and_gets_no_gradient(device):
     assert m.last_x == {}
 
 
+@pytest.mark.parametrize("kind", ["mlp", "kron"])
+def test_heads_run_beside_a_local_track_and_both_get_gradient(device, kind):
+    """A single-base KronLSTM track (``local_width``) with further heads, per base and binned: the heads read the
+    decoder's output with the track added, so a head's loss reaches the track, the trunk and the head; and the
+    track changes what the heads see."""
+    m = with_heads(small("v2", local_width=16, local_span=256, xhead_kind=kind, xhead_bin=8, xhead_width=64),
+                   [["dnase", 3, 16], ["splice", 2]]).to(device).train()
+    with torch.no_grad():
+        m.local_gate.fill_(0.5)                                      # the gate starts at zero: open it
+    seq, seg, ctx, extra = batch_for(2, 1024, device)
+    m(seq, seg, ctx, extra)
+    assert set(m.last_x) == {"dnase", "splice"}
+    assert m.last_x["splice"].shape[:2] == (2, 1024) and m.last_x["dnase"].shape[:2] == (2, 1024 // 16)
+    with_track = {k: v.detach().clone() for k, v in m.last_x.items()}
+    (m.last_x["dnase"].float().sum() + m.last_x["splice"].float().sum()).backward()
+    grad = lambda ps: sum(float(p.grad.abs().sum()) for p in ps if p.grad is not None)
+    assert grad(m.local_core.parameters()) > 0 and grad(m.local_out.parameters()) > 0 and m.local_gate.grad is not None
+    assert grad(m.xheads["dnase"].parameters()) > 0 and grad(m.xheads["splice"].parameters()) > 0
+    assert grad(m.down.parameters()) > 0                             # and the trunk
+    with torch.no_grad():
+        m.local_gate.zero_()
+        m(seq, seg, ctx, extra)
+    assert not torch.allclose(m.last_x["splice"], with_track["splice"])
+    with pytest.raises(ValueError):                                  # learned chunking is still refused with heads
+        with_heads(small("v2", chunk_ratio=8.0), [["dnase", 3]])
+
+
 @pytest.mark.parametrize("bad", [[["a", 1], ["a", 2]], [["not a name", 1]]])
 def test_head_names_are_checked(bad):
     with pytest.raises(ValueError):
