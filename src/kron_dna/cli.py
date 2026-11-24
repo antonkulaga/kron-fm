@@ -947,11 +947,18 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                                               "states: none, vicreg (variance hinge + covariance) or sigreg (LeJEPA: "
                                               "random projections towards an isotropic Gaussian, Epps-Pulley)"),
                  jepa_reg_weight: float = typer.Option(1.0, help="weight of --jepa-reg"),
+                 jepa_reg_own_stream: bool = typer.Option(False, help="--jepa-reg sigreg draws its random directions "
+                                                          "from a stream of its own, so every other draw (the soft "
+                                                          "bases) is that of the --jepa-weight 0 run with the same "
+                                                          "blocks: the JEPA-on arm of a twin pair. Off: the global "
+                                                          "stream, as before"),
                  jepa_block_share: float = typer.Option(0.0, help="with --jepa-weight, block JEPA: hide this fraction "
                                                         "of each training row's bins in contiguous blocks (MASK in "
                                                         "the online input, the repeat channel zeroed, no soft bases "
                                                         "there; the target reads the clean row) and train the "
-                                                        "predictor on the hidden bins. 0: off, as before"),
+                                                        "predictor on the hidden bins. At --jepa-weight 0 the blocks "
+                                                        "are hidden and nothing predicts them (the JEPA-off twin). "
+                                                        "0: off, as before"),
                  jepa_block_len: str = typer.Option("1024:8192", help="with --jepa-block-share: LO:HI block lengths "
                                                     "in bases (multiples of 2**n_down), drawn log-uniformly"),
                  jepa_on: str = typer.Option("hidden", help="with --jepa-block-share: the bins the JEPA loss is a mean "
@@ -1199,9 +1206,10 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                                  "--jepa-weight or --labels")
     if not 0.0 <= jepa_block_share <= 0.9:
         raise typer.BadParameter("--jepa-block-share must lie in [0, 0.9]")
-    if jepa_block_share > 0 and (jepa_weight <= 0 or whole_contigs or arch == "v3"):
-        raise typer.BadParameter("--jepa-block-share needs --jepa-weight > 0 and does not take --whole-contigs or "
-                                 "--arch v3")
+    # at --jepa-weight 0 the blocks are hidden as with JEPA on and nothing predicts them: the JEPA-off twin of a
+    # block-JEPA run (same inputs, same draws), so a comparison of the two changes the latent loss alone
+    if jepa_block_share > 0 and (whole_contigs or arch == "v3"):
+        raise typer.BadParameter("--jepa-block-share does not take --whole-contigs or --arch v3")
     if jepa_on not in ("hidden", "all") or jepa_block_heads not in ("exclude", "include"):
         raise typer.BadParameter("--jepa-on must be hidden or all, --jepa-block-heads exclude or include")
     if jepa_pred not in ("mlp", "context") or jepa_loss not in ("cos", "zcos", "zcos-mse") or jepa_pred_layers < 1:
@@ -2771,7 +2779,9 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                 reg_t = torch.relu(1 - std).mean() + off.pow(2).sum() / z.shape[1]
                 mlm = mlm + reg_w * reg_t
             elif jepa_reg == "sigreg":
-                dirs = torch.randn(z.shape[1], 64, device=z.device)
+                if jepa_reg_own_stream and z.device not in sig_gen:
+                    sig_gen[z.device] = torch.Generator(device=z.device).manual_seed(sig_seed)
+                dirs = torch.randn(z.shape[1], 64, device=z.device, generator=sig_gen.get(z.device))
                 proj = (z / std.mean()) @ (dirs / dirs.norm(dim=0))     # [N, 64] 1-D projections
                 tg = torch.linspace(-3, 3, 17, device=z.device)
                 arg = proj.unsqueeze(-1) * tg                           # [N, 64, 17]
@@ -2865,6 +2875,10 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
     # block JEPA (--jepa-block-share) and jepa.csv. The blocks have a random stream of their own (per card, and per
     # start step so a resumed run does not replay its first blocks); metrics.csv is not touched.
     block_rng = np.random.default_rng([seed, rank, 2029, step]) if jepa_block_share > 0 else None
+    # --jepa-reg-own-stream: SIGReg's random directions too. Drawn from the global stream they shift every later draw
+    # of it (the soft bases), so a run with JEPA on and its --jepa-weight 0 twin see different inputs after step one
+    sig_seed = int(np.random.SeedSequence([seed, rank, 2031, step]).generate_state(1)[0])
+    sig_gen: dict = {}              # device -> generator, with --jepa-reg-own-stream only
     jepa_rows: list[dict] = []                        # each training micro-batch's terms since the last jepa.csv row
     jepa_secs, jepa_peak, jepa_steps = 0.0, 0.0, 0
     jepa_csv = out / "jepa.csv"
