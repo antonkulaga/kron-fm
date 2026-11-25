@@ -166,30 +166,101 @@ def track_projection(name: str, channels: int, dims: int) -> torch.Tensor:
     return torch.randn(channels, dims, generator=g) / math.sqrt(dims)
 
 
-def jepa_track_features(outputs: dict[str, torch.Tensor], dims: int, eps: float = 1e-6) -> torch.Tensor:
-    """The richer JEPA target: the target model's track-head predictions on the clean window, ``{head: [B, n,
-    channels]}`` at one bin size, as ``[B, n, dims]`` dense features. Each head (in name order) gets an equal share
-    of ``dims`` (the first takes the remainder): its outputs are centred per channel over the batch's bins, projected
-    by ``track_projection`` and scaled to unit spread, so a head with 1,643 channels weighs as much as one with
-    196. Predictions are dense at every bin, unlike the measured tracks, which are mostly zeros. No gradient."""
-    names = sorted(outputs)
+def track_shares(names: list[str], dims: int) -> list[int]:
+    """``dims`` shared out over the heads ``names`` (sorted): equal parts, the first taking the remainder."""
     if not names or dims < len(names):
         raise ValueError(f"{dims} dims for {len(names)} heads")
     share = [dims // len(names)] * len(names)
     share[0] += dims - sum(share)
+    return share
+
+
+class TrackFeatureStats(nn.Module):
+    """Running statistics of the richer JEPA target, so a window's target does not depend on what else is in its
+    batch: per head the mean of every channel and the spread of its projected features, exponential averages over
+    the valid bins of the training batches (``momentum`` per update, bias-corrected, so the first batch already
+    gives its own statistics). Buffers: they belong in the checkpoint. ``channels``: ``{head: channels}``."""
+
+    def __init__(self, channels: dict[str, int], dims: int, momentum: float = 0.01, floor: float = 1e-3) -> None:
+        super().__init__()
+        self.names, self.dims, self.momentum, self.floor = sorted(channels), dims, momentum, floor
+        self.shares = dict(zip(self.names, track_shares(self.names, dims)))
+        for n in self.names:
+            self.register_buffer(f"mean_{n}", torch.zeros(channels[n]))
+            self.register_buffer(f"var_{n}", torch.zeros(()))
+        self.register_buffer("weight", torch.zeros(()))               # 1 - (1 - momentum) ** updates
+
+    @torch.no_grad()
+    def update(self, name: str, y: torch.Tensor, z_var: torch.Tensor | None = None) -> None:
+        m = self.momentum
+        if z_var is None:
+            getattr(self, f"mean_{name}").mul_(1 - m).add_(y.mean(0).to(self.weight.device), alpha=m)
+        else:
+            getattr(self, f"var_{name}").mul_(1 - m).add_(z_var.to(self.weight.device), alpha=m)
+
+    def mean(self, name: str) -> torch.Tensor:
+        return getattr(self, f"mean_{name}") / self.weight.clamp_min(1e-12)
+
+    def std(self, name: str) -> torch.Tensor:
+        return (getattr(self, f"var_{name}") / self.weight.clamp_min(1e-12)).clamp_min(self.floor ** 2).sqrt()
+
+
+def jepa_track_features(outputs: dict[str, torch.Tensor], dims: int, eps: float = 1e-6,
+                        valid: torch.Tensor | None = None, stats: TrackFeatureStats | None = None,
+                        update: bool = True) -> torch.Tensor:
+    """The richer JEPA target: the target model's track-head predictions on the clean window, ``{head: [B, n,
+    channels]}`` at one bin size, as ``[B, n, dims]`` dense features. Each head (in name order) gets an equal share
+    of ``dims`` (the first takes the remainder): its outputs are centred per channel, projected by
+    ``track_projection`` and scaled to unit spread, so a head with 1,643 channels weighs as much as one with 196.
+    Predictions are dense at every bin, unlike the measured tracks, which are mostly zeros. No gradient.
+
+    The centre and the spread come from ``stats`` when given (:class:`TrackFeatureStats`: running values, first
+    updated with this batch's valid bins when ``update``), so the same window gets the same target in any batch;
+    without ``stats`` they are this batch's own, taken over the bins ``valid`` (``[B, n]`` bool: real sequence, not
+    padding; None: every bin). With no valid bin the features are zeros."""
+    names = sorted(outputs)
+    share = track_shares(names, dims)
+    if stats is not None and (stats.names != names or stats.dims != dims):
+        raise ValueError(f"stats are for {stats.names} at {stats.dims} dims, got {names} at {dims}")
     blocks = []
     with torch.no_grad():
+        some = valid is None or bool(valid.any())
+        if stats is not None and update and some:
+            stats.weight.mul_(1 - stats.momentum).add_(stats.momentum)
         for name, k in zip(names, share):
             y = outputs[name].float()
-            y = y - y.mean((0, 1), keepdim=True)
-            z = y @ track_projection(name, y.shape[-1], k).to(y.device)
-            blocks.append(z / (z.std() + eps))
+            if not some and stats is None:
+                blocks.append(y.new_zeros(*y.shape[:2], k))
+                continue
+            rows = y.reshape(-1, y.shape[-1]) if valid is None else y[valid.to(y.device)]     # [N, channels]
+            proj = track_projection(name, y.shape[-1], k).to(y.device)
+            if stats is None:
+                mean = rows.mean(0)
+                std = ((rows - mean) @ proj).std() + eps
+            else:
+                if update and some:
+                    stats.update(name, rows)
+                mean = stats.mean(name).to(y.device)
+                if update and some:
+                    stats.update(name, rows, ((rows - mean) @ proj).pow(2).mean())
+                std = stats.std(name).to(y.device)
+            blocks.append(((y - mean) @ proj) / std)
     return torch.cat(blocks, -1)
+
+
+def jepa_track_coverage(hidden: torch.Tensor, ratio: int) -> float:
+    """The share of hidden core steps (``[B, bins]`` bool) that lie in a track bin counted by the track loss: a
+    track bin of ``ratio`` core steps counts only when all of them are hidden (:func:`pool_bins`), so short hidden
+    blocks under wide track bins can leave the track loss with little to learn from. 1.0 at ratio 1."""
+    n = int(hidden.sum())
+    return float(pool_bins(hidden, ratio).sum()) * ratio / n if n else 0.0
 
 
 def pool_bins(x: torch.Tensor, ratio: int) -> torch.Tensor:
     """``[B, bins, ...]`` core-step states (float: the mean) or a hidden mask (bool: all of them) per ``ratio``
     steps: a core at 32 bp against heads at 128 bp has ratio 4."""
+    if ratio < 1:
+        raise ValueError(f"ratio {ratio}: the track heads' bin must be a whole multiple of the core's step, not finer")
     if ratio == 1:
         return x
     b, n = x.shape[:2]
@@ -401,6 +472,8 @@ class MLPHead(nn.Module):
             got = self(cols.t().unsqueeze(0))[0].t()                   # [N, out]
             out = out.to(got.dtype)
             out[where] = got
+        else:                                                          # nothing selected: zero gradients, not None,
+            out = out + sum(p.sum() for p in self.parameters()).to(out.dtype) * 0   # as the dense head would give
         return out.transpose(1, 2)
 
 
@@ -764,6 +837,7 @@ class KronGenome(nn.Module):
         ``context``: ``[B]`` or ``[B, K]`` ids (see ``CONTEXT_RANGES``); ``extra``: ``[B, n_in_extra, L]`` reserved
         input channels (none = zeros)."""
         c = self.config
+        head_at, ntv3_at = self.take_base_masks(seq)
         if c.arch == "v3":
             return self._forward_v3(seq, segments, context, extra)
         b, length = seq.shape[0], seq.shape[-1]
@@ -790,9 +864,22 @@ class KronGenome(nn.Module):
         self.last_epi = self.epigenome_logits(core) if self.config.n_epigenomes else None
         x = self.add_local(self.decode(self.core_to_decode(core).transpose(1, 2), skips), skips)
         tracks = self.tracks(x).transpose(1, 2) if self.tracks is not None else None   # [B, L, n_tracks]
-        self.last_ntv3 = self._base_head(self.ntv3, x, self.ntv3_at) if self.ntv3 is not None else None
+        self.last_ntv3 = self._base_head(self.ntv3, x, ntv3_at) if self.ntv3 is not None else None
         self.last_x, self.last_x_at = self.run_xheads(x)
-        return self._base_head(self.head, x, self.head_at), core, tracks
+        return self._base_head(self.head, x, head_at), core, tracks
+
+    def take_base_masks(self, seq: torch.Tensor) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        """``head_at`` and ``ntv3_at`` for the forward that starts now, and both attributes cleared: a mask holds
+        for the one forward after it was set, so a later forward of another batch (the JEPA's edited window, a
+        counterfactual pair) never reads positions chosen for this one. A mask of another shape than the window
+        is an error."""
+        masks = self.head_at, self.ntv3_at
+        self.head_at = self.ntv3_at = None
+        want = (seq.shape[0], seq.shape[-1])
+        for name, m in zip(("head_at", "ntv3_at"), masks):
+            if m is not None and tuple(m.shape) != want:
+                raise ValueError(f"{name} is {tuple(m.shape)} for a window of {want}")
+        return masks
 
     @staticmethod
     def _base_head(head: nn.Module, x: torch.Tensor, where: torch.Tensor | None, rows=slice(None), start: int = 0
@@ -1056,6 +1143,7 @@ class KronGenome(nn.Module):
         dev0 = next(self.parameters()).device
         if devices[0] != dev0:
             raise ValueError(f"the first split device must be the model's own ({dev0}), got {devices[0]}")
+        head_at, ntv3_at = self.take_base_masks(seq)
         b, length = seq.shape[0], seq.shape[-1]
         unit, step = grid_of(c), 2 ** c.n_down       # pieces are cut on the grid; the core counts its own steps
         halo = split_halo(c) if halo is None else int(halo)
@@ -1102,9 +1190,9 @@ class KronGenome(nn.Module):
             y = r.add_local(r.decode(core_dec[rows, lo // step:hi // step].transpose(1, 2).to(d), skips), skips)
             y = y[:, :, start - lo:end - lo]                          # heads are per position: crop first
             pieces.append(SplitPiece(rows=rows, start=start, end=end, device=d,
-                                     logits=self._base_head(r.head, y, self.head_at, rows, start),
+                                     logits=self._base_head(r.head, y, head_at, rows, start),
                                      tracks=r.tracks(y).transpose(1, 2) if r.tracks is not None else None,
-                                     ntv3=(self._base_head(r.ntv3, y, self.ntv3_at, rows, start)
+                                     ntv3=(self._base_head(r.ntv3, y, ntv3_at, rows, start)
                                            if r.ntv3 is not None else None),
                                      **dict(zip(("x", "x_at"), self.run_xheads(y, r.xheads, at=start)))))
             enc[k] = None                                             # drop this function's hold on the skips
@@ -1488,9 +1576,8 @@ def split_plan(batch: int, length: int, n: int, unit: int, halo: int, by: str | 
             if by == "length" or batch < n:
                 raise ValueError(f"a local track restarting every {align} bases cannot split a {length}-base window "
                                  f"into {n} pieces by length")
-            if batch % n == 0 or by == "balanced":
-                edges = [round(i * batch / n) for i in range(n + 1)]
-                return [("rows", slice(a, b), 0, length, 0, length) for a, b in zip(edges[:-1], edges[1:])]
+            edges = [round(i * batch / n) for i in range(n + 1)]       # uneven when the batch does not divide
+            return [("rows", slice(a, b), 0, length, 0, length) for a, b in zip(edges[:-1], edges[1:])]
         unit = align
     if by == "balanced":
         if batch % n == 0:

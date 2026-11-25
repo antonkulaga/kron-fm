@@ -414,6 +414,8 @@ def test_base_heads_run_only_where_asked(device, monkeypatch):
     for n, p in m.named_parameters():
         if n in want:
             assert torch.allclose(p.grad, want[n], atol=1e-4, rtol=1e-3), n
+    assert m.head_at is None and m.ntv3_at is None                   # a mask holds for one forward
+    m.head_at, m.ntv3_at = lm_at, nt_at
     with torch.no_grad():                                            # and through the split
         pieces, _ = m.forward_split(seq, seg, ctx, extra, devices=[device, device], by="length")
         for p in pieces:
@@ -422,7 +424,7 @@ def test_base_heads_run_only_where_asked(device, monkeypatch):
             assert float(p.logits.to(device)[~sel].abs().max()) == 0.0
             sel = nt_at[p.rows, p.start:p.end]
             assert float(p.ntv3.to(device)[~sel].abs().max()) == 0.0
-    m.head_at = m.ntv3_at = None
+    assert m.head_at is None and m.ntv3_at is None
     with torch.no_grad():
         again, _, _ = m(seq, seg, ctx, extra)
     assert float(again[~lm_at].abs().max()) > 0                       # back to every base
