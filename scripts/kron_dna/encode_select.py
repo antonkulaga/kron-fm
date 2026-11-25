@@ -6,8 +6,9 @@ Per assay, one output type (the human selections' choice): ChIP-seq and ATAC-seq
 DNase-seq ``read-depth normalized signal``, RNA-seq (total and polyA plus) the two strands of ``signal of unique
 reads``. Per experiment, the file (for RNA-seq, the plus and minus pair) over the most biological replicates (the
 pooled one when there is one), ties to the lowest accession. Released files only; single-cell, single-nucleus and
-microRNA assays are not taken. Columns as the human selections: i, experiment, file, assay, biosample, target,
-output_type, size, bio_reps, url.
+microRNA assays are not taken. PRO-cap, eCLIP, CAGE and RAMPAGE are stranded pairs like RNA-seq. ``--assays``
+keeps only the named ones. Columns as the human selections: i, experiment, file, assay, biosample, target,
+output_type, size, bio_reps, url, channel (the store's id: ``<experiment>_P`` / ``_M`` for a stranded pair).
 """
 from __future__ import annotations
 
@@ -27,7 +28,13 @@ WANT = {
     "RNA-seq": ["plus strand signal of unique reads", "minus strand signal of unique reads"],
     "polyA plus RNA-seq": ["plus strand signal of unique reads", "minus strand signal of unique reads"],
     "total RNA-seq": ["plus strand signal of unique reads", "minus strand signal of unique reads"],
+    # 5' end and RNA-binding assays: stranded pairs like RNA-seq (the trainer's request, 25 Nov 2026)
+    "PRO-cap": ["plus strand signal of unique reads", "minus strand signal of unique reads"],
+    "eCLIP": ["plus strand signal of unique reads", "minus strand signal of unique reads"],
+    "CAGE": ["plus strand signal of unique reads", "minus strand signal of unique reads"],
+    "RAMPAGE": ["plus strand signal of unique reads", "minus strand signal of unique reads"],
 }
+STRAND = {"plus strand signal of unique reads": "P", "minus strand signal of unique reads": "M"}
 FIELDS = ["accession", "dataset", "assay_term_name", "output_type", "file_size", "biological_replicates",
           "target.label", "biosample_ontology.term_name", "href", "status"]
 
@@ -40,13 +47,17 @@ def search(assembly: str) -> list[dict]:
     return json.loads(out)["@graph"]
 
 
-def main(out: Path, assembly: str = typer.Option(...)) -> None:
+def main(out: Path, assembly: str = typer.Option(...),
+         assays: str = typer.Option("", help="'+'-joined assays to keep (default: all of WANT), e.g. PRO-cap+CAGE")) -> None:
     files = search(assembly)
+    keep = set(assays.split("+")) if assays else set(WANT)
+    if keep - set(WANT):
+        raise typer.BadParameter(f"no output type chosen for {sorted(keep - set(WANT))}; known: {sorted(WANT)}")
     by_exp: dict = defaultdict(list)
     for f in files:
         a = f.get("assay_term_name")
         a = "/".join(a) if isinstance(a, list) else a
-        if a in WANT and f.get("output_type") in WANT[a]:
+        if a in keep and f.get("output_type") in WANT[a]:
             by_exp[(a, f["dataset"])].append(f)
     rows = []
     for (assay, exp), fs in sorted(by_exp.items()):
@@ -63,7 +74,9 @@ def main(out: Path, assembly: str = typer.Option(...)) -> None:
                              biosample=(f.get("biosample_ontology") or {}).get("term_name", ""),
                              target=(f.get("target") or {}).get("label", ""), output_type=ot,
                              size=int(f.get("file_size") or 0), bio_reps=",".join(map(str, r)),
-                             url=f"{API}{f['href']}"))
+                             url=f"{API}{f['href']}",
+                             # the store's channel id: a stranded pair is <experiment>_P and _M, else the file
+                             channel=(exp.strip("/").split("/")[-1] + "_" + STRAND[ot]) if ot in STRAND else f["accession"]))
     df = pl.DataFrame(rows).with_row_index("i")
     out.parent.mkdir(parents=True, exist_ok=True)
     df.write_csv(out, separator="\t")
