@@ -89,6 +89,20 @@ class KronGenomeConfig:
     jepa_track_dims: int = 0    # > 0: the predictor also predicts this many track features at hidden bins (a linear
                                 # readout, ``last_jepa_tracks``): the target model's own track-head predictions on the
                                 # clean window, compressed by jepa_track_features. New parameters only
+    inter_levels: list = field(default_factory=list)   # v2: pooling levels (1 = 2 bp ... n_down - 1) that get a
+                                # recurrent block inside the conv tower, one in the encoder and one in the decoder at
+                                # that resolution (InterKron: a light bidirectional KronLSTM, restarting every
+                                # local_span bases, added through a map that starts at zero). [3] = at 8 bp
+    inter_width: int = 128      # the width of those blocks
+    bin_convs: int = 0          # v2/v2l: this many extra k=5 residual convolutions at bin resolution on each side of
+                                # the core (after the last pooling, before the first unpooling), dilation 1, 2, 4, 8,
+                                # 8, ...: local capacity and reach where it is cheap, for a core at fine bins whose
+                                # conv tower has fewer levels, plus a skip from the core's input to the decoder's
+                                # first step (bin_skip), the path the coarsest encoder skip gives a deeper tower.
+                                # All start as the identity (BinConv; the skip's 1x1 map starts at zero)
+    codon_dims: int = 0         # > 0: a head that predicts this many protein features per codon from the decoder
+                                # states of the codon's three bases (CodonHead; targets: protein_targets, a protein
+                                # model's per-residue features laid on codons). New parameters only
     n_contexts: int = 0         # v2: learned context embeddings added to the core's input bins: 0 nuclear, else
                                 # the organelle's NCBI genetic code table (2 vertebrate mito, 5 invertebrate, ...)
     n_ntv3: int = 0             # quantitative per-base assay tracks (NTv3 bigwigs): one output per track, predicted
@@ -164,6 +178,39 @@ def track_projection(name: str, channels: int, dims: int) -> torch.Tensor:
     import zlib
     g = torch.Generator().manual_seed(zlib.crc32(f"{name}:{channels}:{dims}".encode()))
     return torch.randn(channels, dims, generator=g) / math.sqrt(dims)
+
+
+PROTEIN_SPACE, PROTEIN_ACTIVE = 16384, 64       # the ESM Atlas's sparse features: 64 active of 16,384 per residue
+_PROTEIN_PROJ: dict = {}
+
+
+def protein_projection(dims: int, space: int = PROTEIN_SPACE) -> torch.Tensor:
+    """A fixed ``[space, dims]`` Gaussian projection of the protein feature space, seeded by both sizes (the same
+    after every restart and on every machine); kept after its first use."""
+    if (dims, space) not in _PROTEIN_PROJ:
+        g = torch.Generator().manual_seed(1_000_003 * space + dims)
+        _PROTEIN_PROJ[(dims, space)] = torch.randn(space, dims, generator=g) / math.sqrt(dims)
+    return _PROTEIN_PROJ[(dims, space)]
+
+
+def protein_targets(feat: torch.Tensor, val: torch.Tensor, scale: torch.Tensor, dims: int) -> torch.Tensor:
+    """Codon targets from a protein model's sparse per-residue features: ``feat`` ``[N, k]`` feature ids, ``val``
+    ``[N, k]`` their stored values (uint8) and ``scale`` ``[N]`` the protein's scale, as ``[N, dims]`` unit vectors:
+    the active features' projection rows summed with weights ``val / 255 * scale``, then normalised. Two residues
+    with the same active features get the same direction; the length carries nothing and is dropped. No gradient."""
+    with torch.no_grad():
+        proj = protein_projection(dims).to(feat.device)
+        w = val.float() / 255.0 * scale.float().unsqueeze(-1)
+        t = (proj[feat.long()] * w.unsqueeze(-1)).sum(1)
+        return F.normalize(t, dim=-1)
+
+
+def codon_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    """One minus the cosine between predicted and target codon features (``[N, dims]``), averaged; zero when they
+    point the same way, and zero with no codon."""
+    if pred.shape[0] == 0:
+        return pred.sum() * 0.0
+    return (1.0 - F.cosine_similarity(pred.float(), target.float().detach(), dim=-1)).mean()
 
 
 def track_shares(names: list[str], dims: int) -> list[int]:
@@ -449,6 +496,50 @@ class ResConv(nn.Module):
         return self.skip(x) + self.conv(norm_act(self.norm, x))
 
 
+class InterKron(nn.Module):
+    """A recurrent block inside the conv tower: a light bidirectional KronLSTM over the positions of one pooling
+    level, each row its own document and its state restarting every ``span`` positions (bounded memory, and whole
+    segments in every piece of a split window), added to the level's features through a 1x1 map that starts at
+    zero, so the tower starts as it was without it."""
+
+    def __init__(self, c: int, width: int, index: int) -> None:
+        super().__init__()
+        self.inp, self.out = nn.Conv1d(c, width, 1), nn.Conv1d(width, c, 1)
+        self.block = BiKronLSTMBlock(width, max(1, width // 32), 2 * width, 0.0, index)
+        nn.init.zeros_(self.out.weight)
+        nn.init.zeros_(self.out.bias)
+
+    def forward(self, x: torch.Tensor, span: int, checkpoint: bool = False) -> torch.Tensor:
+        b, _, n = x.shape
+        h = self.inp(x).transpose(1, 2).reshape(1, b * n, -1)
+        per_row = torch.arange(0, n, min(span, n), device=x.device)
+        starts = (torch.arange(b, device=x.device).unsqueeze(1) * n + per_row).reshape(-1)
+        cu = torch.cat([starts, torch.tensor([b * n], device=x.device)]).to(torch.int32)
+        h = (torch.utils.checkpoint.checkpoint(self.block, h, cu, use_reentrant=False)
+             if checkpoint and torch.is_grad_enabled() else self.block(h, cu))
+        return x + self.out(h.reshape(b, n, -1).transpose(1, 2))
+
+
+def bin_dilations(n: int) -> list[int]:
+    """Dilations of ``n`` bin-level convolutions: 1, 2, 4, 8, then 8."""
+    return [min(2 ** i, 8) for i in range(n)]
+
+
+class BinConv(nn.Module):
+    """A pre-norm k=5 residual convolution with dilation at bin resolution; its convolution starts at zero, so a
+    stack of them starts as the identity and can be added to a trained model without changing it."""
+
+    def __init__(self, c: int, dilation: int) -> None:
+        super().__init__()
+        self.norm = ChannelRMSNorm(c)
+        self.conv = nn.Conv1d(c, c, 5, padding=2 * dilation, dilation=dilation)
+        nn.init.zeros_(self.conv.weight)
+        nn.init.zeros_(self.conv.bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x + self.conv(norm_act(self.norm, x))
+
+
 class MLPHead(nn.Module):
     """v2: per-position two-layer head (norm, 1x1, GELU, 1x1), one per task, so tasks do not share one linear map."""
 
@@ -475,6 +566,25 @@ class MLPHead(nn.Module):
         else:                                                          # nothing selected: zero gradients, not None,
             out = out + sum(p.sum() for p in self.parameters()).to(out.dtype) * 0   # as the dense head would give
         return out.transpose(1, 2)
+
+
+class CodonHead(nn.Module):
+    """Protein features of a codon from the decoder states of its three bases, in reading order (so the strand is
+    in the order the bases are given, and a codon split by an intron is read across it): the three states side by
+    side through one hidden layer. ``forward(x, rows, pos)``: ``x`` ``[B, C, L]``, ``rows`` ``[N]`` the window of
+    each codon, ``pos`` ``[N, 3]`` its bases' positions in the window; returns ``[N, dims]``."""
+
+    def __init__(self, c_in: int, hidden: int, dims: int) -> None:
+        super().__init__()
+        self.norm = ChannelRMSNorm(c_in)
+        self.fc1, self.fc2 = nn.Linear(3 * c_in, hidden), nn.Linear(hidden, dims)
+
+    def forward(self, x: torch.Tensor, rows: torch.Tensor, pos: torch.Tensor) -> torch.Tensor:
+        if rows.numel() == 0:
+            return x.new_zeros(0, self.fc2.out_features) + sum(p.sum() for p in self.parameters()).to(x.dtype) * 0
+        cols = x[rows.unsqueeze(1), :, pos]                             # [N, 3, C]: only the codons' bases
+        cols = norm_act(self.norm, cols.reshape(-1, cols.shape[-1]).t().unsqueeze(0), act=False)[0].t()
+        return self.fc2(F.gelu(self.fc1(cols.reshape(rows.shape[0], -1))))
 
 
 class KronHead(nn.Module):
@@ -559,6 +669,30 @@ class KronGenome(nn.Module):
         self.ntv3 = (MLPHead(widths[0], c.head_hidden or 2 * widths[0], c.n_ntv3) if v2
                      else nn.Conv1d(widths[0], c.n_ntv3, 1)) if c.n_ntv3 else None
         self.last_ntv3 = None
+        # the codon head runs on the codons given for the next forward only (not saved): codon_at = (rows [N] long,
+        # pos [N, 3] long, positions in the window); last_codon [N, dims], last_codon_ok [N] bool (False: a codon
+        # whose bases fall in two pieces of a split window, not computed)
+        levels = sorted(int(v) for v in c.inter_levels)
+        if levels:
+            if c.arch != "v2" or c.chunk_ratio:
+                raise ValueError("inter_levels needs arch v2 without learned chunking")
+            if levels[0] < 1 or levels[-1] >= c.n_down or len(set(levels)) != len(levels):
+                raise ValueError(f"inter_levels are distinct pooling levels 1..{c.n_down - 1}, got {levels}")
+            if any(c.local_span % 2 ** v for v in levels):
+                raise ValueError("local_span (the restart span) must be a multiple of every inter level's step")
+        self.inter = nn.ModuleDict({f"{side}{v}": InterKron(widths[v], c.inter_width, k * len(levels) + j)
+                                    for k, side in enumerate(("enc", "dec")) for j, v in enumerate(levels)})
+        if c.bin_convs and (c.arch not in ("v2", "v2l") or c.chunk_ratio):
+            raise ValueError("bin_convs needs arch v2 or v2l without learned chunking")
+        self.bin_pre = nn.ModuleList(BinConv(c.d_model, d) for d in bin_dilations(c.bin_convs))
+        self.bin_post = nn.ModuleList(BinConv(c.d_model, d) for d in bin_dilations(c.bin_convs))
+        self.bin_skip = nn.Conv1d(c.d_model, c.d_model, 1) if c.bin_convs else None   # around the core, at bins
+        if self.bin_skip is not None:
+            nn.init.zeros_(self.bin_skip.weight)
+            nn.init.zeros_(self.bin_skip.bias)
+        self.codon_head = CodonHead(widths[0], c.head_hidden or 2 * widths[0], c.codon_dims) if c.codon_dims else None
+        self.codon_at: tuple[torch.Tensor, torch.Tensor] | None = None
+        self.last_codon = self.last_codon_ok = None
         self._init_xheads(c, widths[0])
         self.context = nn.Embedding(c.n_contexts, c.d_model) if c.n_contexts else None
         self.jepa_pred = make_jepa_predictor(c)
@@ -838,6 +972,8 @@ class KronGenome(nn.Module):
         input channels (none = zeros)."""
         c = self.config
         head_at, ntv3_at = self.take_base_masks(seq)
+        codon_at, self.codon_at = getattr(self, "codon_at", None), None
+        self.last_codon = self.last_codon_ok = None
         if c.arch == "v3":
             return self._forward_v3(seq, segments, context, extra)
         b, length = seq.shape[0], seq.shape[-1]
@@ -866,6 +1002,10 @@ class KronGenome(nn.Module):
         tracks = self.tracks(x).transpose(1, 2) if self.tracks is not None else None   # [B, L, n_tracks]
         self.last_ntv3 = self._base_head(self.ntv3, x, ntv3_at) if self.ntv3 is not None else None
         self.last_x, self.last_x_at = self.run_xheads(x)
+        if codon_at is not None and getattr(self, "codon_head", None) is not None:
+            rows_c, pos_c = (t.to(x.device) for t in codon_at)
+            self.last_codon = self.codon_head(x, rows_c, pos_c)
+            self.last_codon_ok = torch.ones(rows_c.shape[0], dtype=torch.bool, device=x.device)
         return self._base_head(self.head, x, head_at), core, tracks
 
     def take_base_masks(self, seq: torch.Tensor) -> tuple[torch.Tensor | None, torch.Tensor | None]:
@@ -970,12 +1110,24 @@ class KronGenome(nn.Module):
             for block in self.down:
                 skips.append(x)
                 x = pool2(block(x))
-            return x, skips
+            for block in getattr(self, "bin_pre", ()):
+                x = block(x)
+            return x, (skips + [x] if getattr(self, "bin_skip", None) is not None else skips)
         skips = []
-        for block in self.down:
+        for i, block in enumerate(self.down):
             skips.append(x)
-            x = pool2(block(x))
-        return x, skips
+            x = self._inter("enc", i + 1, pool2(block(x)))
+        for block in getattr(self, "bin_pre", ()):
+            x = block(x)
+        return x, (skips + [x] if getattr(self, "bin_skip", None) is not None else skips)   # last: the core's input
+
+    def _inter(self, side: str, level: int, x: torch.Tensor) -> torch.Tensor:
+        """The recurrent block of ``side`` (enc, dec) at pooling ``level`` (positions of 2**level bases), if any."""
+        inter = getattr(self, "inter", None)
+        if not inter or f"{side}{level}" not in inter:
+            return x
+        return inter[f"{side}{level}"](x, self.config.local_span // 2 ** level,
+                                       self.checkpoint_core and torch.is_grad_enabled())
 
     jepa_gate = 1.0                     # genome-train --jepa-gate: share of the predictor's gradient into the core
     jepa_skip_cut = False               # genome-train --jepa-skip-cut: the latent loss reads ``last_jepa_loss``
@@ -1018,6 +1170,11 @@ class KronGenome(nn.Module):
 
     def decode(self, x: torch.Tensor, skips: list[torch.Tensor]) -> torch.Tensor:
         """``[B, d_model, bins]`` -> ``[B, stem_channels, L]`` through the decoder and the encoder's skips."""
+        if getattr(self, "bin_skip", None) is not None:              # the bin-level skip around the core
+            skips, bottom = skips[:-1], skips[-1]
+            x = x + self.bin_skip(bottom).to(x.dtype)
+        for block in getattr(self, "bin_post", ()):
+            x = block(x)
         if self.config.arch == "v2l":              # conv at the coarse level, upsample x scale + skip, conv at fine
             for i, (block, skip) in enumerate(zip(self.up, reversed(skips))):
                 x = torch.repeat_interleave(block(x), 2, dim=-1)
@@ -1026,7 +1183,7 @@ class KronGenome(nn.Module):
         if self.config.arch == "v2":
             for i, (block, skip) in enumerate(zip(self.up, reversed(skips))):
                 x = block(F.interpolate(x, scale_factor=2, mode="nearest"))
-                x = self.up2[i](x + self.skip_scale[i] * self.skip_proj[i](skip))
+                x = self._inter("dec", len(self.up) - 1 - i, self.up2[i](x + self.skip_scale[i] * self.skip_proj[i](skip)))
             return x
         for block, skip in zip(self.up, reversed(skips)):
             x = block(F.interpolate(x, scale_factor=2, mode="nearest")) + skip
@@ -1144,12 +1301,14 @@ class KronGenome(nn.Module):
         if devices[0] != dev0:
             raise ValueError(f"the first split device must be the model's own ({dev0}), got {devices[0]}")
         head_at, ntv3_at = self.take_base_masks(seq)
+        codon_at, self.codon_at = getattr(self, "codon_at", None), None
+        self.last_codon = self.last_codon_ok = None
         b, length = seq.shape[0], seq.shape[-1]
         unit, step = grid_of(c), 2 ** c.n_down       # pieces are cut on the grid; the core counts its own steps
         halo = split_halo(c) if halo is None else int(halo)
         # a local track restarts every local_span bases: pieces cut there hold whole segments of it (exact)
         plan = split_plan(b, length, len(devices), unit, halo, by,
-                          **({"align": c.local_span} if c.local_width else {}))
+                          **({"align": c.local_span} if c.local_width or c.inter_levels else {}))
         by = plan[0][0]
         reps = {}
         enc = []                                                      # per piece: (skips, its core-input bins)
@@ -1183,6 +1342,7 @@ class KronGenome(nn.Module):
         if core_only:
             return [], core
         pieces = []
+        codon_parts: list[tuple[torch.Tensor, torch.Tensor]] = []
         core_dec = self.core_to_decode(core)
         for k, (_, rows, start, end, lo, hi) in enumerate(plan):
             d, r = devices[k], reps[devices[k]]
@@ -1195,7 +1355,18 @@ class KronGenome(nn.Module):
                                      ntv3=(self._base_head(r.ntv3, y, ntv3_at, rows, start)
                                            if r.ntv3 is not None else None),
                                      **dict(zip(("x", "x_at"), self.run_xheads(y, r.xheads, at=start)))))
+            if codon_at is not None and getattr(r, "codon_head", None) is not None:
+                rows_c, pos_c = codon_at
+                lo_r, hi_r = rows.indices(b)[:2]
+                mine = ((rows_c >= lo_r) & (rows_c < hi_r) & (pos_c >= start).all(1) & (pos_c < end).all(1)).cpu()
+                codon_parts.append((mine, r.codon_head(y, (rows_c[mine] - lo_r).to(d), (pos_c[mine] - start).to(d))))
             enc[k] = None                                             # drop this function's hold on the skips
+        if codon_parts:                                               # each codon lies in at most one piece
+            ok = torch.stack([m for m, _ in codon_parts]).any(0)
+            out = codon_parts[0][1].new_zeros(ok.shape[0], self.config.codon_dims, device=dev0)
+            for m, p in codon_parts:
+                out[m.to(dev0)] = p.to(dev0)
+            self.last_codon, self.last_codon_ok = out, ok.to(dev0)
         return pieces, core
 
     def n_parameters(self) -> int:
@@ -1537,13 +1708,26 @@ def split_reach(config: KronGenomeConfig) -> int:
         for j in range(1, nd):
             skip.append(c)
             c += 2 * (2 * 2 ** j) + 2 ** j
-    bins_reach, d = c, 0
+    extra = 2 * sum(bin_dilations(config.bin_convs)) * 2 ** nd   # the bin-level convolutions, each side of the core
+    bins_reach = c + extra
+    if config.inter_levels:                                  # a recurrent block spreads an error at a piece's edge
+        return max(bins_reach, 0) + 2 * len(config.inter_levels) * config.local_span + _plain_reach(config)
+    d = bins_reach + extra if config.bin_convs else 0        # the bin-level skip is an encoder output: exact only
+                                                             # beyond the encoder's reach, then the post convolutions
     for i in reversed(range(nd)):
         if arch == "v2":                                     # upsample, ConvBlock2, + skip, ConvBlock2
             d = max(d + 2 ** i + 4 * 2 ** i, skip[i]) + 4 * 2 ** i
         else:                                                # ResConv at 2**(i+1), upsample, + skip, ResConv
             d = max(d + 2 * 2 ** (i + 1) + 2 ** i, skip[i]) + 2 * 2 ** i
     return max(bins_reach, d)
+
+
+def _plain_reach(config: KronGenomeConfig) -> int:
+    """``split_reach`` of the same tower without recurrent blocks (their segments are added on top: each block, in
+    the order the signal meets them, can carry an edge error across one whole restart segment, and the
+    convolutions between them carry it on)."""
+    from dataclasses import replace
+    return split_reach(replace(config, inter_levels=[]))
 
 
 def split_halo(config: KronGenomeConfig) -> int:
