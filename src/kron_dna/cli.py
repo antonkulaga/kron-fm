@@ -968,6 +968,16 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                  checkpoint_core: bool = typer.Option(False, help="recompute each core layer in backward: ~8x less "
                                                       "core activation memory for ~30 % more compute"),
                  eval_window: int = typer.Option(0, help="held-out windows of this length (0: the curriculum's last)"),
+                 focus_map: Path = typer.Option(None, help="the builder's per-128-bp focus map of the primary genome "
+                                                "(a folder with focus.u8 and focus.json: annotation bits and the "
+                                                "share of each track store's channels with signal per cell)"),
+                 focus_columns: str = typer.Option("", help="with --focus-map: its columns to use, comma separated "
+                                                   "(default all); a cell's weight is the largest of them, 0..1"),
+                 focus_mask_tilt: float = typer.Option(0.0, help="with --focus-map: tilt where masked bases fall on "
+                                                       "primary-genome rows: a base is masked with probability "
+                                                       "mask_prob x ((1 - T) + T x weight / the row's mean weight), so "
+                                                       "the row's masking rate stays the same and (1 - T) is the floor "
+                                                       "on empty sequence. Evaluation masks uniformly. 0: off"),
                  eval_fixed: int = typer.Option(0, help="also score this many held-out windows, the same ones (and "
                                                 "the same masks) at every evaluation, so a curve shows the model's "
                                                 "change alone: masked-base loss only, to eval_fixed.csv. The 8 "
@@ -1557,6 +1567,24 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
             x_bin[n_b] = st_b.bin
     # primary-genome windows start on the coarsest pre-binned store's grid (cells are global, a window must match)
     x_grid = max([st_b.bin for st_b in xstores.values() if st_b.kind == "tracks_binned"], default=1)
+    focus_w = None                     # --focus-map: [cells, k] uint8 columns of the primary genome's 128-bp cells
+    if not 0.0 <= focus_mask_tilt < 1.0:
+        raise typer.BadParameter("--focus-mask-tilt must lie in [0, 1)")
+    if focus_mask_tilt > 0 and focus_map is None:
+        raise typer.BadParameter("--focus-mask-tilt needs --focus-map")
+    if focus_map is not None:
+        fj_ = json.loads((focus_map / "focus.json").read_text())
+        if fj_.get("genome") != name:
+            raise typer.BadParameter(f"--focus-map is of {fj_.get('genome')}, the primary genome is {name}")
+        cols_ = fj_["columns"]
+        pick_ = [c_.strip() for c_ in focus_columns.split(",") if c_.strip()] or cols_
+        bad_ = [c_ for c_ in pick_ if c_ not in cols_]
+        if bad_:
+            raise typer.BadParameter(f"--focus-columns: not in the map: {bad_}")
+        focus_bin = int(fj_["bin"])
+        fm_ = np.memmap(focus_map / "focus.u8", dtype=np.uint8, mode="r").reshape(int(fj_["cells"]), len(cols_))
+        focus_w = fm_[:, [cols_.index(c_) for c_ in pick_]]
+        say(f"focus map: {len(pick_)} of {len(cols_)} columns, {focus_bin}-bp cells; mask tilt {focus_mask_tilt:g}")
     # the model's grid (genome.grid_of): window and row lengths, packs, split halos and head spans are multiples of the
     # core's step or of the widest head bin, whichever is larger (a 32-bp core with 128-bp heads: 128)
     grid = max([unit] + [b_ for b_ in x_bin.values() if b_ > 1])
@@ -1724,6 +1752,7 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
     rep_main = rep_mito = None
     rep_genome: list = [None] * len(genomes)
     rep_batch: list = []
+    foc_batch: list = []             # --focus-mask-tilt: the batch's per-base weights
     rep_rng = np.random.default_rng([seed, rank, 2027])
     if repeat_channel:
         def open_repeat(d, n_bases: int, label: str):
@@ -1852,6 +1881,7 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
         xh_t = {n_: [] for n_ in xstores}            # --xhead: each head's stored targets per row
         xh_m = {n_: [] for n_ in xstores}            # and the channels each row supervises
         rep_rows = []
+        foc_rows = []                                # --focus-mask-tilt: per base weight of each row (float16)
         row_len, row_wt = [], []                     # per row: its length, and its share of one window
         left, more, cell, wrow = batch, 0, None, window   # windows to draw; rows left in the pack being filled, their
         while left or more:                               # bucket and length (cell None, wrow == window: a full row)
@@ -1954,6 +1984,15 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                     if flip_row:
                         r_[:take] = r_[:take][::-1].copy()
                 rep_rows.append(r_)
+            if focus_mask_tilt > 0:                  # the primary genome's cells; flat elsewhere
+                f_ = np.ones(wrow, dtype=np.float16)
+                if not (from_mito or xs is not None or fg is not None) and take > 0:
+                    c0_, c1_ = at // focus_bin, -(-(at + take) // focus_bin)
+                    wc_ = np.asarray(focus_w[c0_:c1_]).max(1).astype(np.float16) / 255
+                    f_[:take] = np.repeat(wc_, focus_bin)[at - c0_ * focus_bin:at - c0_ * focus_bin + take]
+                    if flip_row:
+                        f_[:take] = f_[:take][::-1].copy()
+                foc_rows.append(f_)
             if epigenome_weight > 0:
                 if from_mito or xs is not None or fg is not None:         # no human Regulatory Build there
                     epi_t.append(np.zeros((wrow // epi_unit, n_epi), dtype=bool))
@@ -2057,10 +2096,11 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                     {n_: torch.from_numpy(rows(v_)) for n_, v_ in xh_t.items()},
                     {n_: torch.from_numpy(rows(v_)) for n_, v_ in xh_m.items()})] if nt_t else []
             rep_ = [torch.from_numpy(rows(rep_rows))] if rep_rows else []
+            foc_ = [torch.from_numpy(rows(foc_rows))] if foc_rows else []
             out = [torch.from_numpy(rows(seqs)), torch.from_numpy(rows(segs)), torch.tensor([ctxs[i] for i in ix])]
             if labels:
                 out += [torch.from_numpy(rows(x)) for x in (labs, acts, valid)]
-            return tuple(out), (epi_, nt_, rep_)
+            return tuple(out), (epi_, nt_, rep_, foc_)
 
         if pack:                                     # one part per row length, the full window first
             parts = []
@@ -2068,7 +2108,7 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                 ix = [i for i, l_ in enumerate(row_len) if l_ == w_]
                 parts.append((sum(row_wt[i] for i in ix) / batch, *stacked(ix)))
             return parts
-        out, (epi_batch[:], ntv3_batch[:], rep_batch[:]) = stacked(range(len(seqs)))
+        out, (epi_batch[:], ntv3_batch[:], rep_batch[:], foc_batch[:]) = stacked(range(len(seqs)))
         return out
 
     dev = torch.device("cuda", torch.cuda.current_device())
@@ -2649,7 +2689,14 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
         if clean:
             inputs, targets = seq.to(dev), None
         else:   # held-out masks are always plain MASK (bert only in training), so runs with and without it compare
-            inputs, targets = G.mask_bases(seq.to(dev), mask_prob, generator=mask_gen,
+            prob_ = mask_prob
+            if focus_mask_tilt > 0 and model.training and foc_batch:   # --focus-mask-tilt: masked bases leaning
+                fw_ = foc_batch[0].to(dev).float()                       # toward annotated, signal-rich cells
+                known_ = (seq.to(dev) < 4).float() if seq.dim() == 2 else torch.ones_like(fw_)
+                mean_ = (fw_ * known_).sum(1, keepdim=True) / known_.sum(1, keepdim=True).clamp_min(1.0)
+                prob_ = (mask_prob * ((1 - focus_mask_tilt) + focus_mask_tilt * fw_ / mean_.clamp_min(1e-3))
+                         ).clamp(0.0, 0.9)
+            inputs, targets = G.mask_bases(seq.to(dev), prob_, generator=mask_gen,
                                            bert=bert_mask and model.training)
         fwd_kw = {}                     # training-only inputs; evaluation always reads hard bases, no repeat channel
         # --jepa-block-share: hidden bins [B, bins] and bases [B, L] of this training batch (None: no blocks). The
@@ -2982,7 +3029,7 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
             return loss_on(*parts, **kw)
         loss = track = None
         for w_, rows_, sides_ in parts:
-            epi_batch[:], ntv3_batch[:], rep_batch[:] = sides_
+            epi_batch[:], ntv3_batch[:], rep_batch[:], foc_batch[:] = sides_
             l_, t_ = loss_on(*rows_, **kw)
             loss = w_ * l_ if loss is None else loss + w_ * l_
             if t_ is not None:
