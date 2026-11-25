@@ -935,6 +935,9 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                                                      "cards and micro-batches (0: --batch-size windows)"),
                  grad_accum: int = typer.Option(1, help="micro-batches summed per optimizer step"),
                  compile_convs: bool = typer.Option(False, help="torch.compile each conv block"),
+                 lean_convs: bool = typer.Option(False, help="the same function with less memory: norm+GELU in the "
+                                                 "conv blocks and heads recomputed in backward instead of keeping its "
+                                                 "copies, pooling without an index tensor (genome.LEAN_CONV)"),
                  local_track: str = typer.Option("", help="two-pathway: width,layers[,span] of a light 1-bp KronLSTM "
                                                  "beside the long-range core, e.g. 128,2,8192"),
                  checkpoint_core: bool = typer.Option(False, help="recompute each core layer in backward: ~8x less "
@@ -1264,6 +1267,7 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
             raise typer.BadParameter("--jepa-gate must be ZERO:RAMP (two integers)")
     if (jepa_skip_cut or jepa_gate) and jepa_weight <= 0:
         raise typer.BadParameter("--jepa-skip-cut and --jepa-gate need --jepa-weight > 0")
+    G.LEAN_CONV = lean_convs
     if eval_fixed < 0:
         raise typer.BadParameter("--eval-fixed must be >= 0")
     if jepa_var_floor < 0 or not 0.0 < jepa_var_floor_frac <= 1.0 or (jepa_var_floor > 0 and jepa_weight <= 0):

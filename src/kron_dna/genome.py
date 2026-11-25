@@ -257,6 +257,29 @@ class ChannelRMSNorm(nn.Module):
         return (x32 * torch.rsqrt(x32.pow(2).mean(1, keepdim=True) + self.eps)).to(x.dtype) * self.weight[:, None]
 
 
+# genome-train --lean-convs: the same function with less kept for backward. Norm+GELU is recomputed in backward
+# (non-reentrant checkpoint: only its input is saved, not the fp32 copy, the cast-back and the scaled copy, nor GELU's
+# input), and pooling takes the max of even and odd positions (no int64 index tensor; at exact ties the gradient is
+# split instead of going to the first). Set by the CLI; parameters and checkpoints are unchanged.
+LEAN_CONV = False
+
+
+def norm_act(norm: nn.Module, x: torch.Tensor, act: bool = True) -> torch.Tensor:
+    """``gelu(norm(x))`` (or ``norm(x)`` with ``act=False``), recomputed in backward under ``LEAN_CONV``."""
+    f = (lambda t: F.gelu(norm(t))) if act else norm
+    if LEAN_CONV and torch.is_grad_enabled() and x.requires_grad:
+        return torch.utils.checkpoint.checkpoint(f, x, use_reentrant=False)
+    return f(x)
+
+
+def pool2(x: torch.Tensor) -> torch.Tensor:
+    """``max_pool1d(x, 2)``; under ``LEAN_CONV`` without the index tensor."""
+    if not LEAN_CONV:
+        return F.max_pool1d(x, 2)
+    n = x.shape[-1] - x.shape[-1] % 2
+    return torch.maximum(x[..., 0:n:2], x[..., 1:n:2])
+
+
 class ConvBlock2(nn.Module):
     """v2: two pre-norm k=5 convolutions with GELU and one residual (NTv3's encoder block), per-position norm."""
 
@@ -267,8 +290,8 @@ class ConvBlock2(nn.Module):
         self.skip = nn.Conv1d(c_in, c_out, 1) if c_in != c_out else nn.Identity()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        h = self.conv1(F.gelu(self.norm1(x)))
-        return self.skip(x) + self.conv2(F.gelu(self.norm2(h)))
+        h = self.conv1(norm_act(self.norm1, x))
+        return self.skip(x) + self.conv2(norm_act(self.norm2, h))
 
 
 class ResConv(nn.Module):
@@ -281,7 +304,7 @@ class ResConv(nn.Module):
         self.skip = nn.Conv1d(c_in, c_out, 1) if c_in != c_out else nn.Identity()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.skip(x) + self.conv(F.gelu(self.norm(x)))
+        return self.skip(x) + self.conv(norm_act(self.norm, x))
 
 
 class MLPHead(nn.Module):
@@ -292,7 +315,7 @@ class MLPHead(nn.Module):
         self.norm, self.fc1, self.fc2 = ChannelRMSNorm(c_in), nn.Conv1d(c_in, hidden, 1), nn.Conv1d(hidden, c_out, 1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.fc2(F.gelu(self.fc1(self.norm(x))))
+        return self.fc2(F.gelu(self.fc1(norm_act(self.norm, x, act=False))))
 
 
 class KronHead(nn.Module):
@@ -746,15 +769,15 @@ class KronGenome(nn.Module):
         if self.config.arch == "v2l":              # stem branch at 1 bp, pool, then the tower (pool after each block)
             x = self.stem_res(x)
             skips = [x]
-            x = F.max_pool1d(x, 2)
+            x = pool2(x)
             for block in self.down:
                 skips.append(x)
-                x = F.max_pool1d(block(x), 2)
+                x = pool2(block(x))
             return x, skips
         skips = []
         for block in self.down:
             skips.append(x)
-            x = F.max_pool1d(block(x), 2)
+            x = pool2(block(x))
         return x, skips
 
     jepa_gate = 1.0                     # genome-train --jepa-gate: share of the predictor's gradient into the core
