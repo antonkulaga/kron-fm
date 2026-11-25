@@ -3,7 +3,7 @@
 # node features) lives in slurm/env.local.sh, which is git-ignored, because this repository is public.
 # Copy slurm/env.local.example.sh to slurm/env.local.sh on the cluster and fill it in.
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-[ -f "$HERE/env.local.sh" ] && source "$HERE/env.local.sh"
+[ -f "$HERE/env.local.sh" ] && [ -z "${KRON_NO_ENV_LOCAL:-}" ] && source "$HERE/env.local.sh"   # tests set KRON_NO_ENV_LOCAL
 
 export REPO="${REPO:-$(cd "$HERE/.." && pwd)}"
 export KRON_GPU_PARTITION="${KRON_GPU_PARTITION:-}"     # required for GPU jobs
