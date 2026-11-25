@@ -93,8 +93,16 @@ class Runner:
         self.model.x_span = (FL, FL + WIN) if heads else None
         self.unit = 2 ** self.model.config.n_down
 
-    def run(self, seq: torch.Tensor) -> torch.Tensor:
+    def reset_segments(self, reach: int) -> torch.Tensor:
+        """Segment ids restarting the core's recurrence ``reach`` bases each side of the central window."""
         seg = torch.zeros(1, CTX // self.unit, dtype=torch.long, device=self.dev)
+        lo, hi = (FL - reach) // self.unit, (FL + WIN + reach) // self.unit
+        seg[:, lo:hi] = 1
+        seg[:, hi:] = 2
+        return seg
+
+    def run(self, seq: torch.Tensor, seg: torch.Tensor | None = None) -> torch.Tensor:
+        seg = seg if seg is not None else torch.zeros(1, CTX // self.unit, dtype=torch.long, device=self.dev)
         ctx = torch.zeros(1, dtype=torch.long, device=self.dev) if self.model.config.n_contexts > 0 else None
         with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
             return self.model(seq[None], seg, ctx)[0][0, FL:FL + WIN].float()
@@ -348,7 +356,8 @@ def cmd_spans(a):
     orig = list(r.model.core)
     res = dict(ckpt=a.ckpt, windows=win.height, lens={})
     for L in a.lens:
-        out = {m: [] for m in ("intact", "core layers skipped", "core zeroed")}
+        modes = ["intact", "core layers skipped", "core zeroed"] + [f"core reset {d // 1024} kb" for d in a.reach]
+        out = {m: [] for m in modes}
         for w, codes in enumerate(rows):
             rng = np.random.default_rng(10_000 * w + L)
             n_blk = max(1, int(0.1 * WIN / L)); starts = np.sort(rng.choice(WIN // L, n_blk, replace=False)) * L
@@ -363,7 +372,8 @@ def cmd_spans(a):
                 r.model.core = torch.nn.ModuleList([Skip() for _ in orig] if mode == "core layers skipped" else orig)
                 hook = r.model.core_norm.register_forward_hook(lambda m_, i_, o: torch.zeros_like(o)) \
                     if mode == "core zeroed" else None
-                lg = r.run(s2)[torch.from_numpy(at).to(r.dev)]
+                seg = r.reset_segments(int(mode.split()[2]) * 1024) if mode.startswith("core reset") else None
+                lg = r.run(s2, seg)[torch.from_numpy(at).to(r.dev)]
                 if hook is not None:
                     hook.remove()
                 out[mode].append(float((F.cross_entropy(lg, lab) / np.log(2)).item()))
@@ -389,6 +399,7 @@ def main():
     p.add_argument("--windows", type=int, default=32); p.add_argument("--passes", type=int, default=2)
     p = sub.add_parser("spans"); p.add_argument("ckpt"); p.add_argument("bench"); p.add_argument("out")
     p.add_argument("--lens", nargs="+", type=int, default=[1024, 4096, 16384]); p.add_argument("--windows", type=int, default=16)
+    p.add_argument("--reach", nargs="*", type=int, default=[8192, 32768, 131072])
     a = ap.parse_args()
     dict(classes=cmd_classes, core=cmd_core, layers=cmd_layers, skips=cmd_skips, joint=cmd_joint, reset=cmd_reset,
          cpg=cmd_cpg, spans=cmd_spans)[a.cmd](a)
