@@ -841,6 +841,26 @@ def genome_prepare_mito(gbff: Path = typer.Argument(..., help="RefSeq mitochondr
     typer.echo(f"{table.group_by('code').len().sort('len', descending=True).head(10)}")
 
 
+
+def gather_track_outputs(pieces: list, heads: list[str], bin_: int, b: int, length: int, device) -> dict:
+    """--jepa-track-dims: the binned further heads' outputs of a split forward (``genome.SplitPiece.x`` over window
+    bases ``x_at``) joined into ``{head: [b, length / bin_, channels]}`` on ``device``, as the unsplit forward's
+    ``last_x`` gives them."""
+    out = {}
+    for n_ in heads:
+        p0_ = pieces[0].x[n_]
+        full_ = p0_.new_zeros(b, length // bin_, p0_.shape[-1], device=device)
+        for p_ in pieces:
+            full_[p_.rows, p_.x_at[0] // bin_:p_.x_at[1] // bin_] = p_.x[n_].to(device)
+        out[n_] = full_
+    return out
+
+
+def bin_means(x, bin_: int):
+    """``[B, L, T]`` per-base outputs as the means of whole ``bin_``-base bins, ``[B, L / bin_, T]``."""
+    return x.reshape(x.shape[0], x.shape[1] // bin_, bin_, -1).mean(2)
+
+
 @app.command("genome-train")
 def genome_train(out: Path = typer.Argument(..., help="run directory (resumes from its checkpoint.pt)"),
                  name: str = typer.Option("hg38", help="prepared genome under data/interim/genome/"),
@@ -968,6 +988,12 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                  jepa_var_floor_frac: float = typer.Option(0.5, help="with --jepa-var-floor: each dimension's std is "
                                                            "held above this fraction of the mean std (no gradient "
                                                            "through the mean)"),
+                 jepa_track_dims: int = typer.Option(0, help="the richer JEPA target: the predictor also predicts "
+                                                     "this many track features at hidden bins, the target model's "
+                                                     "own binned further heads and NTv3 head on the clean window, "
+                                                     "compressed by a fixed projection (genome.jepa_track_features). "
+                                                     "Needs block JEPA and binned --xhead heads. 0: off"),
+                 jepa_track_weight: float = typer.Option(1.0, help="with --jepa-track-dims: weight of its loss"),
                  jepa_skip_cut: bool = typer.Option(False, help="the latent loss reads the predictor's output without "
                                                     "the derivative of its identity skip, so the loss cannot pull the "
                                                     "core toward the prediction through it (the decoder's reading "
@@ -1273,6 +1299,10 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
     if (jepa_skip_cut or jepa_gate) and jepa_weight <= 0:
         raise typer.BadParameter("--jepa-skip-cut and --jepa-gate need --jepa-weight > 0")
     G.LEAN_CONV = lean_convs
+    if jepa_track_dims < 0 or jepa_track_weight < 0 or (jepa_track_dims > 0 and (jepa_weight <= 0
+                                                                                   or jepa_block_share <= 0)):
+        raise typer.BadParameter("--jepa-track-dims needs --jepa-weight > 0 and --jepa-block-share > 0; it and "
+                                 "--jepa-track-weight must be >= 0")
     if eval_fixed < 0:
         raise typer.BadParameter("--eval-fixed must be >= 0")
     if jepa_var_floor < 0 or not 0.0 < jepa_var_floor_frac <= 1.0 or (jepa_var_floor > 0 and jepa_weight <= 0):
@@ -2053,6 +2083,7 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                                 n_tracks=len(G.TRACKS) if labels else 0, arch=arch, head_hidden=head_hidden,
                                 n_contexts=n_contexts, n_in_extra=n_in_extra, jepa=jepa_weight > 0,
                                 jepa_pred_kind=jepa_pred, jepa_pred_layers=jepa_pred_layers,
+                                jepa_track_dims=jepa_track_dims,
                                 n_epigenomes=n_epi if epigenome_weight > 0 else 0, chunk_ratio=chunk_ratio,
                                 n_ntv3=len(ntv3["ids"]) if ntv3 else 0,
                                 chunk_length_feature=chunk_length_feature,
@@ -2390,6 +2421,17 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
         import copy
         target = copy.deepcopy(model).eval()
         target.x_active = set()                       # the target's further heads are never read
+        trk_heads, trk_bin = [], 0                    # --jepa-track-dims: except the binned ones, on the clean window
+        if jepa_track_dims > 0:
+            trk_heads = sorted(n_ for n_, b_ in x_bin.items() if b_ > 1)
+            bins_ = {x_bin[n_] for n_ in trk_heads}
+            if not trk_heads or len(bins_) != 1:
+                raise typer.BadParameter(f"--jepa-track-dims needs binned --xhead heads of one bin size, got "
+                                         f"{ {n_: x_bin[n_] for n_ in trk_heads} }")
+            trk_bin = bins_.pop()
+            target.x_active = set(trk_heads)
+            say(f"richer JEPA target: {jepa_track_dims} track features from {', '.join(trk_heads)}"
+                + (" and NTv3" if ntv3 is not None else "") + f" at {trk_bin} bp, weight {jepa_track_weight:g}")
         for p_ in target.parameters():
             p_.requires_grad_(False)
         if jepa_ema > 0 and teacher_saved is not None:            # audit 2026-11-18, TR05
@@ -2785,14 +2827,26 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                 acc_x.add(p_x[rows_x], w_x[rows_x], cm_x.to(dev)[rows_x], pm_x[rows_x])
         reg_t = None                    # the anti-collapse term of this micro-batch (JEPA_TRACE)
         if target is not None and model.training and model.last_jepa is not None:
+            trk_out = None              # --jepa-track-dims: {head: [B, bins, channels]} of the clean window
             with torch.no_grad(), autocast:
                 if split_now:           # the target's core states only: encoder pieces + core, no decoder; it reads
                     # the clean row and, with block JEPA, the repeat channel without the blocks zeroed (tgt_kw)
-                    _, want_core = target.forward_split(seq.to(dev), seg.to(dev), ctx.to(dev) if ctx_on else None,
-                                                        devices=split_devs, halo=split_halo or None, by=split_by,
-                                                        core_only=True, **tgt_kw)
+                    t_pieces, want_core = target.forward_split(
+                        seq.to(dev), seg.to(dev), ctx.to(dev) if ctx_on else None, devices=split_devs,
+                        halo=split_halo or None, by=split_by, core_only=not trk_heads, **tgt_kw)
+                    if trk_heads:
+                        trk_out = gather_track_outputs(t_pieces, trk_heads, trk_bin, seq.shape[0], seq.shape[-1], dev)
+                        nt_full_ = G.gather_split(t_pieces, "ntv3", dev)
+                        if nt_full_ is not None:
+                            trk_out["ntv3"] = nt_full_
                 else:
                     _, want_core, _ = target(seq.to(dev), seg.to(dev), ctx.to(dev) if ctx_on else None, **tgt_kw)
+                    if trk_heads:
+                        trk_out = {n_: target.last_x[n_] for n_ in trk_heads}
+                        if getattr(target, "last_ntv3", None) is not None:
+                            trk_out["ntv3"] = target.last_ntv3
+                if trk_out is not None and "ntv3" in trk_out:       # per base -> the heads' bins
+                    trk_out["ntv3"] = bin_means(trk_out["ntv3"], trk_bin)
             keep_bins = seg.to(dev) == 0                                # not padding
             lj_ = getattr(model, "last_jepa_loss", None)
             lj_ = model.last_jepa if lj_ is None else lj_   # --jepa-skip-cut
@@ -2820,6 +2874,13 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                 jepa_term = dist[on_bins].mean() if bool(on_bins.any()) else cos.sum() * 0.0
                 jepa_losses.append(float(jepa_term.detach()))
                 mlm = mlm + jepa_weight * jepa_term
+                if trk_out is not None and getattr(model, "last_jepa_tracks", None) is not None:
+                    feats_ = G.jepa_track_features(trk_out, jepa_track_dims).to(model.last_jepa_tracks.device)
+                    r_ = trk_bin // unit                  # core steps per head bin
+                    trk_loss = G.jepa_track_loss(G.pool_bins(model.last_jepa_tracks, r_), feats_,
+                                                 G.pool_bins(blk_bins & keep_bins, r_))
+                    jepa_track_losses.append(float(trk_loss.detach()))
+                    mlm = mlm + jepa_track_weight * trk_loss
                 z = ctx_core.float()[vis_bins]
             if parts_log is not None:                                   # jepa.csv: no gradient, no random numbers
                 with torch.no_grad():
@@ -2935,6 +2996,7 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
         return x * ntv3_nz
 
     jepa_losses: list[float] = []
+    jepa_track_losses: list[float] = []    # --jepa-track-dims
     bench_losses: list[float] = []
     jepa_std: list[float] = []
     epi_keep: list = []
@@ -3467,6 +3529,7 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                        + (f", mito {mito_bits:.3f}" if mito_bits is not None else "")
                        + "".join(f", {genomes[k].name} {b_:.3f}" for k, b_ in zip(g_eval, genome_bits))
                        + (f", jepa {np.mean(jepa_losses):.4f} (core std {np.mean(jepa_std):.3f})" if jepa_losses else "")
+                       + (f", jepa tracks {np.mean(jepa_track_losses):.4f}" if jepa_track_losses else "")
                        + (f", chunk every {unit / np.mean(chunk_rates):.0f} bp" if chunk_rates else "") + f", {h:.2f} h, "
                        + (f"peak {torch.cuda.max_memory_allocated(dev) / 2**30:.1f} GiB" if split_devs is None else
                           "peak " + ", ".join(f"{d_} {torch.cuda.max_memory_allocated(d_) / 2**30:.1f}"
@@ -3486,6 +3549,7 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                 slice_rows.clear()
                 slice_losses.clear()
             jepa_losses.clear()
+            jepa_track_losses.clear()
             jepa_std.clear()
             chunk_rates.clear()
             _save_atomic({"model": model.state_dict(), "optimizer": opt.state_dict(), "config": config.to_dict(),
