@@ -581,7 +581,9 @@ class CodonHead(nn.Module):
 
     def forward(self, x: torch.Tensor, rows: torch.Tensor, pos: torch.Tensor) -> torch.Tensor:
         if rows.numel() == 0:
-            return x.new_zeros(0, self.fc2.out_features) + sum(p.sum() for p in self.parameters()).to(x.dtype) * 0
+            # the weights by name: on a split replica they are plain attributes and parameters() is empty
+            zero = sum(w.sum() for w in (self.fc1.weight, self.fc1.bias, self.fc2.weight, self.fc2.bias)) * 0
+            return x.new_zeros(0, self.fc2.out_features) + zero.to(x.dtype)
         cols = x[rows.unsqueeze(1), :, pos]                             # [N, 3, C]: only the codons' bases
         cols = norm_act(self.norm, cols.reshape(-1, cols.shape[-1]).t().unsqueeze(0), act=False)[0].t()
         return self.fc2(F.gelu(self.fc1(cols.reshape(rows.shape[0], -1))))
@@ -1247,7 +1249,8 @@ class KronGenome(nn.Module):
 
     #: what a piece of a split window runs on its own device (see :meth:`forward_split`)
     SPLIT_LOCAL = ("stem", "stem_res", "down", "up", "up2", "skip_proj", "head", "tracks", "ntv3", "xheads",
-                   "local_in", "local_core", "local_out")     # the local track runs on each piece's card too
+                   "local_in", "local_core", "local_out",     # the local track runs on each piece's card too
+                   "inter", "bin_pre", "bin_post", "bin_skip", "codon_head")   # and the conv tower's additions
 
     def split_replica(self, device, force: bool = False) -> "KronGenome":
         """A shallow copy of this model for :meth:`forward_split` whose conv path and per-base heads read
