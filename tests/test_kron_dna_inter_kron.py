@@ -77,3 +77,28 @@ def test_they_train_and_refuse_what_they_cannot_do(cpu_mixer):
                 dict(inter_levels=[2], local_span=130)):
         with pytest.raises(ValueError):
             small(**bad)
+
+
+def test_every_piecewise_path_restarts_where_a_whole_forward_does(cpu_mixer):
+    """The capped evaluation and the whole-contig forward cut a window into pieces: with in-tower blocks their
+    pieces must start and end on the restart span, or the blocks restart elsewhere than in training."""
+    from kron_dna import evalkit
+    m = small(inter_levels=[2], bin_convs=2, xheads=[["a", 2, 8]], xhead_kind="mlp")
+    shake(m)
+    g = torch.Generator().manual_seed(2)
+    for b in list(m.bin_pre) + list(m.bin_post):
+        b.conv.weight.data = torch.randn(b.conv.weight.shape, generator=g) * 0.2
+    assert G.piece_step(m.config) == 128 and G.piece_step(small().config) == 8
+    assert G.piece_bounds(m.config, 1000, 1400, 8192, 100) == (896, 1536)
+    seq = torch.randint(0, 4, (4096,))
+    with torch.no_grad():
+        logits, core, _ = m(seq[None])
+        whole_x = {k: v.clone() for k, v in m.last_x.items()}
+        capped = evalkit.core_capped(m, seq, None, 1000)              # chunks that do not sit on the span
+        assert torch.allclose(capped, core, atol=1e-5)
+        got = evalkit.decode_span(m, seq, core, (1024, 2048))
+        lo, hi = m.last_x_at
+        assert torch.allclose(got["a"], whole_x["a"][:, lo // 8:hi // 8], atol=1e-5)
+        outs = m.forward_contig(seq, [1024, 3072], chunk=1024)
+        for (lg, _), s in zip(outs, (1024, 3072)):
+            assert torch.allclose(lg, logits[:, s:s + 1024], atol=1e-5)

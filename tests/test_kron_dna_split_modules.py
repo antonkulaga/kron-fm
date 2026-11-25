@@ -44,3 +44,5 @@ def test_empty_selections_work_on_a_replica(cpu_mixer):
     assert out.shape == (1, 4, 16) and cod.shape == (0, 4)
     (out.sum() + cod.sum()).backward()
     assert float(m.head.fc1.weight.grad.abs().sum()) == 0 and float(m.codon_head.fc1.weight.grad.abs().sum()) == 0
+    for head in (m.head, m.codon_head):                              # every weight, the norm's too: zero, not None
+        assert all(p.grad is not None and float(p.grad.abs().sum()) == 0 for p in head.parameters())
