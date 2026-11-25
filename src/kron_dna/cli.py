@@ -986,6 +986,10 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                                                   "(pos.i64, feat.u16, val.u8, scale.f32, codons.json)"),
                  codon_weight: float = typer.Option(0.0, help="weight of the codon head's loss (1 - cosine) on "
                                                     "primary-genome training rows. 0: the head is not trained"),
+                 codon_on: str = typer.Option("masked", help="with --codon-weight: 'masked' scores only codons with "
+                                              "at least one masked base (with 15 % masking about 61 % of codons are "
+                                              "fully visible, and the amino acid can be read off them); 'all' every "
+                                              "codon in the row"),
                  focus_mask_tilt: float = typer.Option(0.0, help="with --focus-map: tilt where masked bases fall on "
                                                        "primary-genome rows: a base is masked with probability "
                                                        "mask_prob x ((1 - T) + T x weight / the row's mean weight), so "
@@ -1778,10 +1782,12 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                         feat=np.memmap(codon_store / "feat.u16", dtype=np.uint16, mode="r").reshape(n_c_, k_c_),
                         val=np.memmap(codon_store / "val.u8", dtype=np.uint8, mode="r").reshape(n_c_, k_c_),
                         scale=np.memmap(codon_store / "scale.f32", dtype=np.float32, mode="r"))
+        if codon_on not in ("masked", "all"):
+            raise typer.BadParameter("--codon-on is 'masked' or 'all'")
         if not (np.diff(codon_st["first"]) >= 0).all():
             raise typer.BadParameter(f"{codon_store}: rows are not sorted by the codon's first base")
         say(f"codon head: {n_c_:,} codons of {cj_.get('transcripts', '?')} transcripts from {codon_store.name}, "
-            f"{k_c_} features each, projected to {codon_dims}; weight {codon_weight:g}")
+            f"{k_c_} features each, projected to {codon_dims}; weight {codon_weight:g}, scored on {codon_on} codons")
     rep_rng = np.random.default_rng([seed, rank, 2027])
     if repeat_channel:
         def open_repeat(d, n_bases: int, label: str):
@@ -2796,7 +2802,11 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
         codon_idx = None                # --codon-weight: the store rows of this batch's codons, in codon_at's order
         if codon_st is not None and model.training and codon_batch:
             r_l, p_l, i_l = [], [], []
+            tg_ = targets.cpu().numpy() if (codon_on == "masked" and targets is not None) else None
             for r_, (ci_, cp_) in enumerate(codon_batch[0]):
+                if len(ci_) and tg_ is not None:                     # --codon-on masked: a masked base in the codon
+                    keep_ = (tg_[r_][np.clip(cp_, 0, tg_.shape[1] - 1)] != -100).any(1)
+                    ci_, cp_ = ci_[keep_], cp_[keep_]
                 if len(ci_):
                     r_l.append(np.full(len(ci_), r_, np.int64)), p_l.append(cp_), i_l.append(ci_)
             if i_l:
