@@ -935,6 +935,11 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                                                      "cards and micro-batches (0: --batch-size windows)"),
                  grad_accum: int = typer.Option(1, help="micro-batches summed per optimizer step"),
                  compile_convs: bool = typer.Option(False, help="torch.compile each conv block"),
+                 lean_heads: bool = typer.Option(False, help="training only: the masked-base head runs on the masked "
+                                                 "bases and the NTv3 head on the bases its loss scores (its split, "
+                                                 "the window's centre, visible bases); zero elsewhere, which no loss "
+                                                 "reads (genome.KronGenome.head_at / ntv3_at). Evaluation scores "
+                                                 "every base as before"),
                  lean_convs: bool = typer.Option(False, help="the same function with less memory: norm+GELU in the "
                                                  "conv blocks and heads recomputed in backward instead of keeping its "
                                                  "copies, pooling without an index tensor (genome.LEAN_CONV)"),
@@ -1521,6 +1526,18 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
             x_bin[n_b] = st_b.bin
     # primary-genome windows start on the coarsest pre-binned store's grid (cells are global, a window must match)
     x_grid = max([st_b.bin for st_b in xstores.values() if st_b.kind == "tracks_binned"], default=1)
+    # the model's grid (genome.grid_of): window and row lengths, packs, split halos and head spans are multiples of the
+    # core's step or of the widest head bin, whichever is larger (a 32-bp core with 128-bp heads: 128)
+    grid = max([unit] + [b_ for b_ in x_bin.values() if b_ > 1])
+    if grid > unit:
+        off_grid = [f"{n_} {v_:,}" for n_, v_ in
+                    [("curriculum window", w_) for w_, _ in phases] +
+                    [("--mito-slice", mito_slice), ("--split-halo", split_halo), ("--cf-window", cf_window),
+                     ("--jepa-edit-window", jepa_edit_window), ("--jepa-guard-window", jepa_guard_window)]
+                    if v_ and v_ % grid]
+        if off_grid:
+            raise typer.BadParameter(f"with heads binned at {grid} bases these must be multiples of {grid}: "
+                                     + ", ".join(off_grid))
 
     def on_grid(at_: int, take_: int, off_: int, len_: int) -> tuple[int, int]:
         """``at_``/``take_`` moved onto the ``x_grid`` grid inside the contig ``[off_, off_ + len_)``: the start down
@@ -1736,7 +1753,7 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
         if max_contig and r["len"] > max_contig:
             at += 0 if longest else int(rng.integers(0, r["len"] - max_contig + 1))
             r["len"] = max_contig
-        n = -(-r["len"] // unit) * unit
+        n = -(-r["len"] // grid) * grid
         codes = np.full(n, 4, dtype=np.int64)
         codes[:r["len"]] = bases[at:at + r["len"]]
         out = [torch.from_numpy(codes)]
@@ -1751,7 +1768,7 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
     # training sampler drew since the last report (kept for 'pad' too: it draws no random number).
     from kron_dna import packing as PK
     pack_short = short_sources == "pack"
-    pack_unit = math.lcm(unit, epi_unit)
+    pack_unit = math.lcm(grid, epi_unit)
     pack_cells: dict = {}
     tally = PK.Tally()
     if pack_short:
@@ -2619,7 +2636,21 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
             model.x_active = set(x_now)
             # training: the heads run on the supervised stretch only (the window's centre): the same loss and
             # gradients, without their activations at every other base. Evaluation scores whole windows.
-            model.x_span = XH.span_of(x_ok, unit) if model.training and x_now else None
+            model.x_span = XH.span_of(x_ok, grid) if model.training and x_now else None
+        if lean_heads:                  # --lean-heads: the per-base heads only where a training loss reads them
+            on_ = model.training and not clean and targets is not None
+            model.head_at = (targets != -100).to(dev) if on_ else None
+            nt_ok = None
+            if on_ and ntv3 is not None and ntv3_batch:
+                nt_ok = ntv3_batch[0][1].to(dev) == 1
+                if ntv3_center < 1.0:
+                    edge_ = int(round(nt_ok.shape[1] * (1 - ntv3_center) / 2))
+                    if edge_:
+                        nt_ok[:, :edge_] = False
+                        nt_ok[:, -edge_:] = False
+                if skip_at is not None:
+                    nt_ok = nt_ok & ~skip_at
+            model.ntv3_at = nt_ok
         parts_log = {} if jepa_log and model.training else None        # this micro-batch's loss terms, for jepa.csv
         model.jepa_hidden = blk_bins if model.training else None       # the context predictor and --jepa-decode-pred
         # --split-cards: training windows only (``unsplit``: the --mito-slice part, whole on the first card)
