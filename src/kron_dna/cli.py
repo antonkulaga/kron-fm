@@ -940,10 +940,10 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                  checkpoint_core: bool = typer.Option(False, help="recompute each core layer in backward: ~8x less "
                                                       "core activation memory for ~30 % more compute"),
                  eval_window: int = typer.Option(0, help="held-out windows of this length (0: the curriculum's last)"),
-                 eval_fixed: int = typer.Option(0, help="score this many held-out windows, the same ones (and the same "
-                                                "masks) at every evaluation, so a curve shows the model's change "
-                                                "alone. 0: 8 windows drawn anew at each step, as before (arms with "
-                                                "one seed still share them step by step)"),
+                 eval_fixed: int = typer.Option(0, help="also score this many held-out windows, the same ones (and "
+                                                "the same masks) at every evaluation, so a curve shows the model's "
+                                                "change alone: masked-base loss only, to eval_fixed.csv. The 8 "
+                                                "windows drawn anew at each step stay in metrics.csv. 0: off"),
                  jepa_weight: float = typer.Option(0.0, help="JEPA-DNA latent loss: predict an EMA target encoder's "
                                                    "core states of the unmasked window (cosine), at this weight"),
                  jepa_ema: float = typer.Option(0.996, help="with --jepa-weight: EMA decay of the target encoder"),
@@ -3190,17 +3190,15 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
         elif step % eval_every == 0 or step == steps or step == end_step or out_of_time:
             model.eval()
             keep: list = []
-            ev_step = 9001 if eval_fixed else step     # --eval-fixed: one set of windows and masks for every eval
-            n_eval = eval_fixed or 8
-            eval_rng = np.random.default_rng([seed, ev_step])            # the same windows for every run with this seed
-            mask_gen = torch.Generator(device=dev).manual_seed(seed * 1_000_003 + ev_step)
+            eval_rng = np.random.default_rng([seed, step])               # the same windows for every run with this seed
+            mask_gen = torch.Generator(device=dev).manual_seed(seed * 1_000_003 + step)
             with torch.no_grad():
                 pairs = ([contig_loss(*sample_contig(val_idx), keep=keep if labels else None) for _ in range(2)]
                          if whole_contigs else
                          [loss_on(*sample(val_idx, window=eval_window, batch=1 if arch in ("v2", "v2l", "v3") else batch_size,
                                           gen=eval_rng),
                                   keep=keep if labels else None, mask_gen=mask_gen,
-                                  score_ntv3=mlm_weight != 0) for _ in range(n_eval)])
+                                  score_ntv3=mlm_weight != 0) for _ in range(8)])
                 if ntv3 is not None and not whole_contigs:   # NTv3's test split lies on chromosomes the
                     for _ in range(24):                          # masked-LM trains on, so draw from there too;
                         # only ~1.6% of a random training window is split==3, so draw enough to cover regions
@@ -3208,8 +3206,8 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                                 mask_gen=mask_gen, track_only=True,   # scored only via the split==3 accumulator
                                 clean=mlm_weight == 0)
                     if mlm_weight == 0:      # a track stage is scored as it trains, on unmasked input: the same
-                        again = np.random.default_rng([seed, ev_step])   # the held-out windows once more, unmasked
-                        for _ in range(n_eval):
+                        again = np.random.default_rng([seed, step])   # eight held-out windows once more, unmasked
+                        for _ in range(8):
                             loss_on(*sample(val_idx, window=eval_window, batch=1, gen=again), track_only=True,
                                     clean=True)
                     x_rng = np.random.default_rng([seed, step, 7])    # its own stream: the paired draws above and
@@ -3270,6 +3268,28 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                              "would-raise": "would raise the --jepa-reg weight (monitor only)",
                              "stop": f"still triggered at the cap x{jepa_guard_cap:g}: saving and stopping"}[gi_["action"]]
                     guard_note += f"\nWARNING: JEPA collapse guard at step {step}: {why_} ({gi_['hits']} in a row): {what_}"
+            if eval_fixed and not whole_contigs:   # --eval-fixed: the same windows and masks at every eval, the
+                # masked-base loss only (no head or track scorer sees them), to eval_fixed.csv beside metrics.csv
+                t_fx = time.time()
+                fx_rng = np.random.default_rng([seed, 9001])
+                fx_gen = torch.Generator(device=dev).manual_seed(seed * 1_000_003 + 9001)
+                x_keep, xstage = xstage, None       # loss_on reads it: no further head runs on these windows
+                try:
+                    with torch.no_grad():
+                        fx = [loss_on(*sample(val_idx, window=eval_window, batch=1 if arch in ("v2", "v2l", "v3")
+                                              else batch_size, gen=fx_rng)[:3], mask_gen=fx_gen, score_ntv3=False)
+                              for _ in range(eval_fixed)]
+                finally:
+                    xstage = x_keep
+                if main:
+                    bits_fx = float(np.mean([m_.item() for m_, _ in fx])) / math.log(2)
+                    fx_csv = out / "eval_fixed.csv"
+                    if not fx_csv.exists():
+                        fx_csv.write_text("step,windows,val_bits_per_base_fixed,seconds\n")
+                    with fx_csv.open("a") as fh:
+                        fh.write(f"{step},{eval_fixed},{bits_fx:.4f},{time.time() - t_fx:.1f}\n")
+                    say(f"step {step}: held-out {bits_fx:.3f} bits/base on the {eval_fixed} fixed windows "
+                        f"({time.time() - t_fx:.0f} s)")
             model.train()
             h = hours + (time.time() - t0) / 3600
             bits = float(np.mean([m.item() for m, _ in pairs])) / math.log(2)
