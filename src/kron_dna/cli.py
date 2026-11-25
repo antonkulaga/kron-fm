@@ -973,6 +973,19 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                                                 "share of each track store's channels with signal per cell)"),
                  focus_columns: str = typer.Option("", help="with --focus-map: its columns to use, comma separated "
                                                    "(default all); a cell's weight is the largest of them, 0..1"),
+                 bin_convs: int = typer.Option(0, help="extra k=5 residual convolutions at bin resolution on each side "
+                                               "of the core, with a 1x1 skip around it (model config bin_convs; the "
+                                               "builder's K5 arm). 0: off"),
+                 inter_levels: str = typer.Option("", help="pooling levels (1 = 2 bp ... n_down - 1), comma separated, "
+                                                  "that get a bidirectional KronLSTM block in encoder and decoder "
+                                                  "(model config inter_levels; the KI arm). Empty: none"),
+                 inter_width: int = typer.Option(128, help="with --inter-levels: the width of those blocks"),
+                 codon_dims: int = typer.Option(0, help="a codon head predicting this many projected protein features "
+                                                "per codon from the decoder (model config codon_dims). 0: none"),
+                 codon_store: Path = typer.Option(None, help="with --codon-weight: the primary genome's codon store "
+                                                  "(pos.i64, feat.u16, val.u8, scale.f32, codons.json)"),
+                 codon_weight: float = typer.Option(0.0, help="weight of the codon head's loss (1 - cosine) on "
+                                                    "primary-genome training rows. 0: the head is not trained"),
                  focus_mask_tilt: float = typer.Option(0.0, help="with --focus-map: tilt where masked bases fall on "
                                                        "primary-genome rows: a base is masked with probability "
                                                        "mask_prob x ((1 - T) + T x weight / the row's mean weight), so "
@@ -1753,6 +1766,22 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
     rep_genome: list = [None] * len(genomes)
     rep_batch: list = []
     foc_batch: list = []             # --focus-mask-tilt: the batch's per-base weights
+    codon_batch: list = []           # --codon-weight: per row of the batch, (store rows [k], in-row positions [k, 3])
+    codon_st = None
+    if codon_weight > 0:
+        if codon_store is None or codon_dims <= 0:
+            raise typer.BadParameter("--codon-weight needs --codon-store and --codon-dims")
+        cj_ = json.loads((codon_store / "codons.json").read_text())
+        n_c_, k_c_ = int(cj_["codons"]), int(cj_["features_per_codon"])
+        pos_c_ = np.fromfile(codon_store / "pos.i64", dtype=np.int64).reshape(n_c_, 3)
+        codon_st = dict(pos=pos_c_, first=pos_c_.min(1), last=pos_c_.max(1),
+                        feat=np.memmap(codon_store / "feat.u16", dtype=np.uint16, mode="r").reshape(n_c_, k_c_),
+                        val=np.memmap(codon_store / "val.u8", dtype=np.uint8, mode="r").reshape(n_c_, k_c_),
+                        scale=np.memmap(codon_store / "scale.f32", dtype=np.float32, mode="r"))
+        if not (np.diff(codon_st["first"]) >= 0).all():
+            raise typer.BadParameter(f"{codon_store}: rows are not sorted by the codon's first base")
+        say(f"codon head: {n_c_:,} codons of {cj_.get('transcripts', '?')} transcripts from {codon_store.name}, "
+            f"{k_c_} features each, projected to {codon_dims}; weight {codon_weight:g}")
     rep_rng = np.random.default_rng([seed, rank, 2027])
     if repeat_channel:
         def open_repeat(d, n_bases: int, label: str):
@@ -1882,6 +1911,7 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
         xh_m = {n_: [] for n_ in xstores}            # and the channels each row supervises
         rep_rows = []
         foc_rows = []                                # --focus-mask-tilt: per base weight of each row (float16)
+        codon_rows = []                              # --codon-weight: each row's codons (store rows, positions)
         row_len, row_wt = [], []                     # per row: its length, and its share of one window
         left, more, cell, wrow = batch, 0, None, window   # windows to draw; rows left in the pack being filled, their
         while left or more:                               # bucket and length (cell None, wrow == window: a full row)
@@ -1993,6 +2023,15 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                     if flip_row:
                         f_[:take] = f_[:take][::-1].copy()
                 foc_rows.append(f_)
+            if codon_st is not None:                 # the primary genome's codons lying wholly in the row
+                ci_, cp_ = np.zeros(0, np.int64), np.zeros((0, 3), np.int64)
+                if not (from_mito or xs is not None or fg is not None) and take > 0:
+                    a_, b_ = np.searchsorted(codon_st["first"], [at, at + take])
+                    ci_ = a_ + np.flatnonzero(codon_st["last"][a_:b_] < at + take)
+                    cp_ = codon_st["pos"][ci_] - at
+                    if flip_row:                     # reverse-complemented row: same column (reading) order
+                        cp_ = take - 1 - cp_
+                codon_rows.append((ci_, cp_))
             if epigenome_weight > 0:
                 if from_mito or xs is not None or fg is not None:         # no human Regulatory Build there
                     epi_t.append(np.zeros((wrow // epi_unit, n_epi), dtype=bool))
@@ -2097,10 +2136,11 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                     {n_: torch.from_numpy(rows(v_)) for n_, v_ in xh_m.items()})] if nt_t else []
             rep_ = [torch.from_numpy(rows(rep_rows))] if rep_rows else []
             foc_ = [torch.from_numpy(rows(foc_rows))] if foc_rows else []
+            cod_ = [[codon_rows[i] for i in ix]] if codon_rows else []
             out = [torch.from_numpy(rows(seqs)), torch.from_numpy(rows(segs)), torch.tensor([ctxs[i] for i in ix])]
             if labels:
                 out += [torch.from_numpy(rows(x)) for x in (labs, acts, valid)]
-            return tuple(out), (epi_, nt_, rep_, foc_)
+            return tuple(out), (epi_, nt_, rep_, foc_, cod_)
 
         if pack:                                     # one part per row length, the full window first
             parts = []
@@ -2108,7 +2148,7 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                 ix = [i for i, l_ in enumerate(row_len) if l_ == w_]
                 parts.append((sum(row_wt[i] for i in ix) / batch, *stacked(ix)))
             return parts
-        out, (epi_batch[:], ntv3_batch[:], rep_batch[:], foc_batch[:]) = stacked(range(len(seqs)))
+        out, (epi_batch[:], ntv3_batch[:], rep_batch[:], foc_batch[:], codon_batch[:]) = stacked(range(len(seqs)))
         return out
 
     dev = torch.device("cuda", torch.cuda.current_device())
@@ -2129,6 +2169,8 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                                 n_epigenomes=n_epi if epigenome_weight > 0 else 0, chunk_ratio=chunk_ratio,
                                 n_ntv3=len(ntv3["ids"]) if ntv3 else 0,
                                 chunk_length_feature=chunk_length_feature,
+                                bin_convs=bin_convs, inter_width=inter_width, codon_dims=codon_dims,
+                                inter_levels=[int(v_) for v_ in inter_levels.split(",") if v_.strip()],
                                 **(dict(zip(("local_width", "local_layers", "local_span"),
                                             map(int, local_track.split(",")))) if local_track else {}))
     try:                                              # --genome context ids against the table this model has
@@ -2751,6 +2793,15 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
         model.jepa_hidden = blk_bins if model.training else None       # the context predictor and --jepa-decode-pred
         # --split-cards: training windows only (``unsplit``: the --mito-slice part, whole on the first card)
         split_now = split_devs is not None and model.training and not unsplit
+        codon_idx = None                # --codon-weight: the store rows of this batch's codons, in codon_at's order
+        if codon_st is not None and model.training and codon_batch:
+            r_l, p_l, i_l = [], [], []
+            for r_, (ci_, cp_) in enumerate(codon_batch[0]):
+                if len(ci_):
+                    r_l.append(np.full(len(ci_), r_, np.int64)), p_l.append(cp_), i_l.append(ci_)
+            if i_l:
+                codon_idx = np.concatenate(i_l)
+                model.codon_at = (torch.from_numpy(np.concatenate(r_l)), torch.from_numpy(np.concatenate(p_l)))
         with autocast:
             if split_now:
                 pieces, ctx_core = model.forward_split(inputs, seg.to(dev), ctx.to(dev) if ctx_on else None,
@@ -2776,6 +2827,16 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                 parts_log["mlm"] = float(mlm.detach())
             if model.training and mlm_weight != 1.0:
                 mlm = mlm * mlm_weight
+        if codon_idx is not None and model.last_codon is not None:
+            ok_c = model.last_codon_ok
+            want_c = G.protein_targets(torch.from_numpy(codon_st["feat"][codon_idx].astype(np.int64)),
+                                       torch.from_numpy(codon_st["val"][codon_idx]),
+                                       torch.from_numpy(codon_st["scale"][codon_idx]), codon_dims).to(dev)
+            loss_c = G.codon_loss(model.last_codon.float()[ok_c], want_c[ok_c.to(want_c.device)])
+            mlm = mlm + codon_weight * loss_c
+            codon_losses.append(float(loss_c.detach()))
+            if parts_log is not None:
+                parts_log["codon"] = codon_losses[-1]
         if chunk_ratio and model.training and model.last_ratio_loss is not None:
             mlm = mlm + ratio_weight * model.last_ratio_loss
             chunk_rates.append(model.last_chunks)
@@ -3029,7 +3090,7 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
             return loss_on(*parts, **kw)
         loss = track = None
         for w_, rows_, sides_ in parts:
-            epi_batch[:], ntv3_batch[:], rep_batch[:], foc_batch[:] = sides_
+            epi_batch[:], ntv3_batch[:], rep_batch[:], foc_batch[:], codon_batch[:] = sides_
             l_, t_ = loss_on(*rows_, **kw)
             loss = w_ * l_ if loss is None else loss + w_ * l_
             if t_ is not None:
@@ -3037,6 +3098,7 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
         return loss, track
 
     ntv3_losses: list[float] = []
+    codon_losses: list[float] = []   # --codon-weight: the codon head's training loss per micro-batch
     ntv3_scale = ntv3_nz = ntv3_rna = None
     ntv3_stats = None
     if ntv3:
@@ -3603,6 +3665,9 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                           "peak " + ", ".join(f"{d_} {torch.cuda.max_memory_allocated(d_) / 2**30:.1f}"
                                               for d_ in split_devs) + " GiB")
                        + (f", tracks {tracks_note}" if tracks_note else ""))
+            if codon_losses:            # --codon-weight: the codon head's training loss since the last report
+                say(f"codon head: train 1 - cosine {np.mean(codon_losses):.4f} over {len(codon_losses)} micro-batches")
+                codon_losses.clear()
             if tally.by:
                 say(f"training rows since the last report (--short-sources {short_sources}): {tally.line()}")
             if slice_tally.by:
