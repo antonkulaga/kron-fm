@@ -564,7 +564,9 @@ class MLPHead(nn.Module):
             out = out.to(got.dtype)
             out[where] = got
         else:                                                          # nothing selected: zero gradients, not None,
-            out = out + sum(p.sum() for p in self.parameters()).to(out.dtype) * 0   # as the dense head would give
+            # as the dense head would give; the weights by name: on a split replica parameters() is empty
+            ws = list(self.parameters()) or [self.fc1.weight, self.fc1.bias, self.fc2.weight, self.fc2.bias]
+            out = out + (sum(w.sum() for w in ws) * 0).to(out.dtype)
         return out.transpose(1, 2)
 
 
