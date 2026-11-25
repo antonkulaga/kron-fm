@@ -1336,6 +1336,7 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
     guard = G.jepa_guard_new()          # --jepa-guard state; with off its factor stays 1 and the loss is as before
     guard_saved = None                  # the state a resumed checkpoint carries
     jnorm_saved = None                  # --jepa-loss zcos: the running target statistics a resumed checkpoint carries
+    tstats_saved = None                 # --jepa-track-dims: the track features' running statistics, likewise
     teacher_saved, resumed = None, False
     xstage_saved = None
     jepa_log = main and jepa_weight > 0 and (jepa_block_share > 0 or jepa_log_every > 0 or jepa_guard != "off")
@@ -2269,6 +2270,7 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
         say(f"resumed at step {step}")
         guard_saved = state.get("jepa_guard")
         jnorm_saved = state.get("jepa_norm")
+        tstats_saved = state.get("jepa_track_stats")
         teacher_saved, resumed = state.get("jepa_target"), True
         xstage_saved = state.get("xstage")
     elif init is not None and not bench:
@@ -2447,6 +2449,7 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
     # --jepa-loss zcos: running per-dimension mean and variance of the target's core states (momentum 0.99), the
     # frame the loss is taken in; carried in the checkpoint so a resumption keeps its frame
     jnorm = {k_: v_.to(dev) for k_, v_ in jnorm_saved.items()} if jnorm_saved and jepa_loss != "cos" else {}
+    tstats: dict = {"mod": None}        # --jepa-track-dims: G.TrackFeatureStats, made from the first target outputs
     if jepa_weight > 0:
         model.jepa_decode_pred = jepa_decode_pred
         if jepa_pred != "mlp" or jepa_loss != "cos" or jepa_decode_pred or freeze_trunk_until:
@@ -2879,8 +2882,17 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                 jepa_losses.append(float(jepa_term.detach()))
                 mlm = mlm + jepa_weight * jepa_term
                 if trk_out is not None and getattr(model, "last_jepa_tracks", None) is not None:
-                    feats_ = G.jepa_track_features(trk_out, jepa_track_dims).to(model.last_jepa_tracks.device)
                     r_ = trk_bin // unit                  # core steps per head bin
+                    if tstats["mod"] is None:             # running statistics over valid bins (Astra review 25 Nov)
+                        tstats["mod"] = G.TrackFeatureStats({n_: t_.shape[-1] for n_, t_ in trk_out.items()},
+                                                            jepa_track_dims).to(dev)
+                        if tstats_saved is not None:
+                            miss_ = tstats["mod"].load_state_dict(tstats_saved, strict=False).missing_keys
+                            say("richer JEPA target: running statistics resumed"
+                                + (f" ({len(miss_)} new entries start fresh)" if miss_ else ""))
+                    valid_ = G.pool_bins(keep_bins, r_).to(dev)
+                    feats_ = G.jepa_track_features(trk_out, jepa_track_dims, valid=valid_, stats=tstats["mod"],
+                                                   update=True).to(model.last_jepa_tracks.device)
                     hid_core_ = blk_bins & keep_bins
                     hid_head_ = G.pool_bins(hid_core_, r_)
                     trk_loss = G.jepa_track_loss(G.pool_bins(model.last_jepa_tracks, r_), feats_, hid_head_)
@@ -3573,6 +3585,8 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                           **({"jepa_target": target.state_dict()} if target is not None and jepa_ema > 0 else {}),
                           **({"jepa_guard": dict(guard, std_mins=list(guard["std_mins"]))} if jepa_guard != "off" else {}),
                           **({"jepa_norm": {k_: v_.cpu() for k_, v_ in jnorm.items()}} if jnorm else {}),
+                          **({"jepa_track_stats": {k_: v_.cpu() for k_, v_ in tstats["mod"].state_dict().items()}}
+                             if tstats["mod"] is not None else {}),
                           **({"genomes": [dict(name=g_.name, share=g_.share, context=g_.context,
                                                held_out=g_.val["chrom"].unique(maintain_order=True).to_list())
                                           for g_ in genomes]} if genomes else {})}, ckpt)
