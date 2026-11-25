@@ -20,6 +20,8 @@ def test_sixteen_shards_per_hash_prefix():
     s = EF.shards_of("c133dfce69f606f20865e9008199f852")              # found in the Atlas in shard c_0304
     assert len(s) == 16 and s[0] == "deduplicated_c_0304.parquet" and s[-1] == "deduplicated_c_0319.parquet"
     assert EF.shards_of("9f97af79d53dc90b58cbd279fd5946d3")[14] == "deduplicated_9_3998.parquet"
+    assert EF.chunk_shards(0xc13) == s                                # the same 16, from the chunk's number
+    assert EF.chunk_shards(0xc5e)[0] == "deduplicated_c_1504.parquet"  # the chunk before c5f, where CDK1 was looked for
 
 
 def test_fasta_reading_and_row_group_choice(tmp_path, monkeypatch):

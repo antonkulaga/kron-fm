@@ -6,7 +6,10 @@ The Atlas (Chan Zuckerberg Biohub, CC BY 4.0; bucket ``esm-protein-atlas``, rele
 billion deduplicated public protein sequences, the sparse-autoencoder features of ESM C 6B: per residue 64 active
 features out of 16,384. A protein is keyed by the MD5 of its sequence. Its features sit in one of the 16 shards
 ``sae/data_shards/deduplicated_<h0>_<NNNN>.parquet`` with ``NNNN = int(h[1:3], 16) * 16 + j``, ``j`` in 0..15 (found
-by reading; the Atlas does not document it), each shard sorted by hash in row groups of 100 proteins.
+by reading; the Atlas does not document it), each shard sorted by hash in row groups of 100 proteins. The groups
+of 16 are equal-count pieces of the sorted hashes, so their edges drift a little from the three-character prefix:
+a hash near the start of its prefix can sit in the group before. A second pass looks there for
+what the first did not find (``parts-neighbours/``).
 
 So for the proteins of one species: hash every sequence; per shard that could hold any of them read the footer,
 then of each row group whose hash range covers a wanted hash only the hash column, and the feature column only
@@ -103,6 +106,11 @@ def shards_of(md5: str) -> list[str]:
     return [f"deduplicated_{md5[0]}_{first + j:04d}.parquet" for j in range(16)]
 
 
+def chunk_shards(n: int) -> list[str]:
+    """The 16 shards of chunk ``n`` (0..4095, the hashes' first three characters as a number)."""
+    return [f"deduplicated_{n >> 8:x}_{(n & 255) * 16 + j:04d}.parquet" for j in range(16)]
+
+
 def pick(meta, wanted: list[str]) -> dict[int, list[str]]:
     """Row groups of a shard whose hash range covers a wanted hash: ``{row group: hashes}``."""
     col = next(i for i in range(meta.num_columns) if meta.schema.column(i).path == "protein_hash")
@@ -169,8 +177,34 @@ def main(fasta: Path, out: Path, workers: int = 32, limit: int = 0) -> None:
         for line in failed[:10]:
             typer.echo("  " + line)
         raise typer.Exit(1)
-    got: dict[str, bytes] = {}
+    have: set[str] = set()                                              # hashes only: the records are read at the end
     for p in sorted(parts.glob("*.parquet")):
+        have.update(pq.read_table(p, columns=["md5"]).column(0).to_pylist())
+    # second pass: a hash the first pass did not find may sit in the chunk before its own (seen: the pieces' edges
+    # run up to a quarter of a prefix late, never early; the human proteome's misses pile up at the prefix's start)
+    rest = sorted(set(md5.values()) - have)
+    near: dict[int, list[str]] = {}
+    for h in rest:
+        if int(h[:3], 16) > 0:
+            near.setdefault(int(h[:3], 16) - 1, []).append(h)
+    parts2 = out / "parts-neighbours"
+    parts2.mkdir(exist_ok=True)
+
+    def neighbour(item) -> int:
+        try:
+            return fetch_shard(item[0], item[1], parts2)                # the footer's ranges decide what is read
+        except Exception as e:
+            failed.append(f"{item[0]}: {e!r}"[:200])
+            return 0
+
+    with ThreadPoolExecutor(workers) as pool:
+        extra = sum(pool.map(neighbour, [(sh, hs) for m, hs in near.items() for sh in chunk_shards(m)]))
+    typer.echo(f"second pass: {len(rest):,} not found at first, {len(near):,} neighbouring chunks looked at, {extra:,} found there")
+    if failed:
+        typer.echo(f"{len(failed)} neighbouring chunks could not be read; run again: {failed[:5]}")
+        raise typer.Exit(1)
+    got: dict[str, bytes] = {}
+    for p in sorted(parts.glob("*.parquet")) + sorted(parts2.glob("*.parquet")):
         for r in pq.read_table(p).to_pylist():
             got[r["md5"]] = r["per_position"]
     rows = [{"name": n, "md5": md5[n], "length": len(seqs[n]), "per_position": got[md5[n]]} for n in seqs if md5[n] in got]
