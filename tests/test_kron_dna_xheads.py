@@ -9,6 +9,7 @@ from __future__ import annotations
 import pytest
 import numpy as np
 import torch
+import torch.nn.functional as F
 
 from kron_dna import genome as G
 
@@ -425,3 +426,21 @@ def test_base_heads_run_only_where_asked(device, monkeypatch):
     with torch.no_grad():
         again, _, _ = m(seq, seg, ctx, extra)
     assert float(again[~lm_at].abs().max()) > 0                       # back to every base
+
+
+def test_kron_head_pools_before_its_map(device):
+    """KronHead maps bin means to the KronLSTM's width (not every base, then the mean): the same function as the
+    earlier order, written out here."""
+    torch.manual_seed(0)
+    h = G.KronHead(24, 5, bin=8, d=64, layers=1).to(device)
+    x = torch.randn(2, 24, 256, device=device)
+    z = h.norm(x)
+    p = F.avg_pool1d(h.down(z), h.bin)
+    b, d, n = p.shape
+    cu = torch.arange(0, b * n + 1, n, device=device, dtype=torch.int32)
+    q = p.transpose(1, 2).reshape(1, b * n, d)
+    for block in h.blocks:
+        q = block(q, cu)
+    old = h.local(z) + torch.repeat_interleave(h.out(q.reshape(b, n, d).transpose(1, 2)), h.bin, dim=-1)
+    assert torch.allclose(h(x), old, atol=1e-5, rtol=1e-4)
+    assert h(torch.randn(1, 24, 4, device=device)).shape == (1, 5, 4)     # shorter than one step

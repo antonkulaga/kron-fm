@@ -356,18 +356,23 @@ class KronHead(nn.Module):
         self.out = nn.Conv1d(d, t, 1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # The 1x1 map to the KronLSTM's width runs on the bin means, not on every base before pooling (a 1x1
+        # convolution and a mean commute): one tensor of d channels per base less. What a per-base head still makes
+        # at single bases, the normalised states, is recomputed in backward by checkpoint_xheads (--xhead-recompute).
         z = self.norm(x)
-        p = F.avg_pool1d(self.down(z), self.bin)                       # [B, d, n]
+        local = self.local(z)
+        if x.shape[-1] < self.bin:                                     # shorter than one step: the readout alone
+            return local
+        means = F.avg_pool1d(z, self.bin)
+        p = self.down(means)                                           # [B, d, n]
         b, d, n = p.shape
-        if n == 0:                                                     # shorter than one step: the readout alone
-            return self.local(z)
         cu = torch.arange(0, b * n + 1, n, device=x.device, dtype=torch.int32)
         h = p.transpose(1, 2).reshape(1, b * n, d)
         for block in self.blocks:
             h = block(h, cu)
         h = h.reshape(b, n, d).transpose(1, 2)
         wide = torch.repeat_interleave(self.out(h), self.bin, dim=-1)
-        return self.local(z) + F.pad(wide, (0, x.shape[-1] - wide.shape[-1]))
+        return local + F.pad(wide, (0, x.shape[-1] - wide.shape[-1]))
 
 
 class KronGenome(nn.Module):
