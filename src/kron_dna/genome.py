@@ -180,6 +180,15 @@ def track_projection(name: str, channels: int, dims: int) -> torch.Tensor:
     return torch.randn(channels, dims, generator=g) / math.sqrt(dims)
 
 
+def layout_fingerprint(chroms, starts, ends, offsets) -> str:
+    """A SHA-256 of a prepared genome's contig layout (``contigs.parquet``: name, start, end and offset of each
+    contig, in offset order). A store that addresses bases by layout offset (the codon store) records it, and its
+    reader refuses a genome prepared differently, where the same offsets are other bases."""
+    import hashlib
+    rows = sorted(zip((int(o) for o in offsets), (str(c) for c in chroms), (int(a) for a in starts), (int(b) for b in ends)))
+    return hashlib.sha256("\n".join(f"{c}\t{a}\t{b}\t{o}" for o, c, a, b in rows).encode()).hexdigest()
+
+
 PROTEIN_SPACE, PROTEIN_ACTIVE = 16384, 64       # the ESM Atlas's sparse features: 64 active of 16,384 per residue
 _PROTEIN_PROJ: dict = {}
 
