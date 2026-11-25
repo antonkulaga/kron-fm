@@ -15,7 +15,8 @@ OUT_DIR, rows sorted by the codon's first base in the genome's global layout (``
   their stored values, strongest first as the Atlas has them;
 - ``scale.f32`` ``[codons]``: the protein's scale for ``val``;
 - ``codons.parquet``: per kept transcript its gene, transcript, protein name, strand, residues;
-- ``codons.json``: counts and what was left out.
+- ``codons.json``: counts, what was left out, and ``layout_sha256`` (``genome.layout_fingerprint`` of the prepared
+  genome's contigs): a reader checks it, since the offsets mean other bases in a genome prepared differently.
 """
 from __future__ import annotations
 
@@ -32,6 +33,7 @@ import pyarrow.parquet as pq
 import typer
 
 from kron_core.paths import interim_dir
+from kron_dna.genome import layout_fingerprint
 
 K = 64
 BASES = "ACGT"
@@ -127,7 +129,8 @@ def main(gtf: Path, features: Path, out: Path, name: str = "hg38") -> None:
     V[order].tofile(out / "val.u8")
     S[order].tofile(out / "scale.f32")
     pl.DataFrame(rows).write_parquet(out / "codons.parquet")
-    info = dict(genome=name, gtf=gtf.name, codons=int(len(P)), transcripts=len(rows), features_per_codon=K,
+    info = dict(genome=name, gtf=gtf.name, codons=int(len(P)),
+                layout_sha256=layout_fingerprint(contigs["chrom"], contigs["start"], contigs["end"], contigs["offset"]), transcripts=len(rows), features_per_codon=K,
                 feature_space=16384, left_out=left, proteins_offered=len(feats),
                 source="ESM Atlas v1 (Chan Zuckerberg Biohub, CC BY 4.0): sparse-autoencoder features of ESM C 6B",
                 layout="rows sorted by the codon's first base in the genome's global layout")

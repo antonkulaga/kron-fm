@@ -63,6 +63,9 @@ def test_features_follow_the_codons(tmp_path, monkeypatch):
     PC.main(gtf, feats, out, name="x")
     info = json.loads((out / "codons.json").read_text())
     assert info["codons"] == 7 and info["transcripts"] == 2 and info["left_out"]["not_codons"] == 1
+    from kron_dna.genome import layout_fingerprint
+    assert info["layout_sha256"] == layout_fingerprint(["chr1"], [0], [len(chrom)], [0])
+    assert info["layout_sha256"] != layout_fingerprint(["chr1"], [0], [len(chrom)], [8])     # another layout
     pos = np.fromfile(out / "pos.i64", dtype=np.int64).reshape(-1, 3)
     feat = np.fromfile(out / "feat.u16", dtype=np.uint16).reshape(-1, 64)
     assert pos[:3].tolist() == [[2, 3, 4], [5, 11, 12], [13, 14, 15]]                 # the K codon spans the intron

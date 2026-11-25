@@ -19,7 +19,7 @@ OUT_DIR gets ``features.parquet`` (name, md5, length, ``per_position``: the Atla
 ``row``, ``col`` (feature id), ``data`` (uint8), ``shape`` [residues, 16384] and ``scale``; value = data / 255 *
 scale is an assumption to check against the Atlas's documentation), ``missing.tsv`` (proteins whose exact
 sequence the Atlas does not hold) and ``fetch.json`` (counts, release, time). A rerun keeps the shards already
-done (``parts/``). Sequences with characters outside the 20 amino acids are looked up as they are.
+done (``parts/``), for the same protein list only: another list in the same OUT_DIR is refused (``WANTED.sha256``). Sequences with characters outside the 20 amino acids are looked up as they are.
 """
 from __future__ import annotations
 
@@ -160,6 +160,15 @@ def main(fasta: Path, out: Path, workers: int = 32, limit: int = 0) -> None:
             by_shard.setdefault(s, []).append(h)
     parts = out / "parts"
     parts.mkdir(parents=True, exist_ok=True)
+    # a finished shard holds only the proteins asked of it then: the cache is good for one protein list
+    wanted = hashlib.sha256("\n".join(sorted(set(md5.values()))).encode()).hexdigest()
+    mark = out / "WANTED.sha256"
+    if mark.exists() and mark.read_text().strip() != wanted:
+        raise typer.BadParameter(f"{out} holds shards fetched for another protein list (another FASTA or --limit); "
+                                 "use a new OUT_DIR")
+    if not mark.exists() and any(parts.iterdir()):
+        typer.echo(f"note: {out} has shards from before this check; taken as fetched for this protein list")
+    mark.write_text(wanted + "\n")
     typer.echo(f"{len(seqs):,} proteins, {len(set(md5.values())):,} distinct sequences, {len(by_shard):,} shards to look in")
     done = found = 0
     failed: list[str] = []

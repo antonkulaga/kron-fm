@@ -48,3 +48,16 @@ def test_fasta_reading_and_row_group_choice(tmp_path, monkeypatch):
     got = pq.read_table(parts / "deduplicated_x_0000.parquet").to_pylist()
     assert got == [{"md5": h["sp|A|A_X"], "per_position": h["sp|A|A_X"].encode()}]
     assert EF.fetch_shard("deduplicated_x_0000.parquet", [], parts) == 1          # a finished shard is kept
+
+
+def test_a_cache_is_good_for_one_protein_list(tmp_path, monkeypatch):
+    import pytest
+    fa, fb = tmp_path / "a.fasta", tmp_path / "b.fasta"
+    fa.write_text(">p1\nMKT\n")
+    fb.write_text(">p1\nMKT\n>p2\nMSS\n")
+    monkeypatch.setattr(EF, "fetch_shard", lambda shard, wanted, parts: 0)       # no network: nothing is found
+    out = tmp_path / "out"
+    EF.main(fa, out, workers=2, limit=0)
+    EF.main(fa, out, workers=2, limit=0)                                         # the same list again: fine
+    with pytest.raises(EF.typer.BadParameter):
+        EF.main(fb, out, workers=2, limit=0)                                     # another list: refused

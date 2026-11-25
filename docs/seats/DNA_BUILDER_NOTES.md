@@ -180,6 +180,47 @@ graph 8.6e-6, Triton vs graph 0.004; on F's Hugging Face repo (the trainer). kro
 positive dims (the TorchScript exporter resolved negative dims against stale ranks).
 Open: ClinVar scoring of A, D, F (needs a card); stage 2 ChIP-seq download; the rest of stage 1's RNA-seq.
 
+**25 Nov, 20:30 (evening).** An outside review (Astra 6.2 through the kit's review engine, three runs; a fourth
+on the ablation script is running) and the trainer's error analysis drove the day.
+
+- Review fixes on main (cd9860c) and after: lean masks hold for one forward; `TrackFeatureStats` (running statistics
+  of the richer JEPA target; still folds the current batch in before normalising: open, moot while JEPA is dropped);
+  `split_plan`'s unowned tail; `pool_bins` ratio; empty selections on a split replica (`_norm_weights`).
+- Anton dropped every JEPA arm (no benefit measured). Cards go to architecture arms at 32 bp against arm A:
+  K5P (5 core layers), K5 (`n_layers 5, bin_convs 10`), KI (`inter_levels [3], n_layers 5`), a DNase 32-bp head arm,
+  and the codon head on F-lean 250k (`codon_dims 64`, `--codon-on masked`). The trainer runs and reads them.
+- New in `genome.py` (5ac1ba4, fixes 4be4f36, 9c32f11): `bin_convs` (`BinConv`, `bin_pre`/`bin_post`/`bin_skip`:
+  dilated convolutions each side of the core and a skip around it), `inter_levels` (`InterKron`: KronLSTM blocks in
+  encoder and decoder at a pooling level, restarting every `local_span`), `codon_dims` (`CodonHead`,
+  `protein_targets`, `codon_loss`, `codon_at`), `piece_step`/`piece_bounds` (every piecewise path cuts where a
+  restarting recurrence restarts: split forward, `evalkit.core_capped`, `decode_span`, `forward_contig`),
+  `layout_fingerprint`. A new module must be listed in `SPLIT_LOCAL` or as whole-batch:
+  `tests/test_kron_dna_split_modules.py` fails otherwise (five were missed tonight; a one-device split test cannot
+  see it).
+- Protein target without inference: `scripts/kron_dna/esm_atlas_fetch.py` reads per-residue ESM C 6B sparse features
+  (64 active of 16,384) from the public ESM Atlas by the MD5 of the sequence, range requests only. Shards: 16 per
+  three-character hash prefix, in equal-count pieces whose edges run late (a second pass looks one chunk back).
+  Human reference proteome: 20,103 of 20,652 proteins. `prep_esm_atlas_codons.py` lays them on codons of the
+  transcript whose translated CDS is the protein: `$KRON_FM_DATA/interim/proteins/esm-atlas-v1/hg38-codons-v2`,
+  9,545,923 codons, 18,541 genes, 75 % in the training split. Open from the review: how the stored byte maps to a
+  value is an assumption; codons cut by a split are dropped; overlapping genes can give a base two targets; other
+  species not fetched yet.
+- Stores handed over today: `procap-stranded-v1-bin128` (448), `eclip-stranded-v1-bin128` (1,026), both after the
+  minus-strand sign fix (429482a); `tss-stranded-v1-bin128` (442) and `tss3-stranded-v1-bin128` (890: CAGE, RAMPAGE,
+  PRO-cap in one, the trainer's shared head `tss890`); `dnase-biosamples-v1-bin32` (the head-size arm);
+  `tss3-stranded-v1-bin32` building (603 of 890 tracks, no consumer waiting).
+- `scripts/kron_dna/focus_map.py`: `interim/genome/hg38/focus-bin128` (annotation bits and, per store, the share of
+  tracks at 1x and 4x their typical signal per 128-bp cell); the trainer's `--focus-map` reads it.
+- Measured and withdrawn: the soft clip of the binned targets loses nothing (a perfect prediction of the stored
+  target scores the measured log1p); peaks "at half height" was a selection effect (AlphaGenome shows the same), so
+  no loss change follows.
+- From the trainer's checks (read their notes for the tables): masked bases are predicted through the conv tower,
+  most through the coarsest skip; core layers 1-5 jointly matter more than 7-9; for DNase the core's value comes
+  from within about 32 kb.
+- `xhead_bench.py report` writes results.csv and summary.csv before the paired comparisons (7291ce2); the report
+  on 61 sources was still in its paired bootstraps after 2.5 h.
+- Waiting on Anton: the trust-register row for the aligners; whether track stores go to Hugging Face.
+
 ## Items
 
 | item | state |
