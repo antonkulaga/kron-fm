@@ -1563,7 +1563,8 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
         off_grid = [f"{n_} {v_:,}" for n_, v_ in
                     [("curriculum window", w_) for w_, _ in phases] +
                     [("--mito-slice", mito_slice), ("--split-halo", split_halo), ("--cf-window", cf_window),
-                     ("--jepa-edit-window", jepa_edit_window), ("--jepa-guard-window", jepa_guard_window)]
+                     ("--jepa-edit-window", jepa_edit_window), ("--jepa-guard-window", jepa_guard_window),
+                     ("--eval-window", eval_window)]
                     if v_ and v_ % grid]
         if off_grid:
             raise typer.BadParameter(f"with heads binned at {grid} bases these must be multiples of {grid}: "
@@ -2435,8 +2436,11 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
         for p_ in target.parameters():
             p_.requires_grad_(False)
         if jepa_ema > 0 and teacher_saved is not None:            # audit 2026-11-18, TR05
-            target.load_state_dict(teacher_saved)
-            say("jepa: the EMA teacher continues from the checkpoint")
+            miss_, extra_ = target.load_state_dict(teacher_saved, strict=False)   # Astra review 25 Nov
+            if extra_:
+                raise typer.BadParameter(f"the checkpoint's EMA teacher has weights this model lacks: {extra_[:6]}")
+            say("jepa: the EMA teacher continues from the checkpoint"
+                + (f"; {len(miss_)} new tensors (added heads or readouts) start as the student's" if miss_ else ""))
         elif jepa_ema > 0 and resumed:
             say("note: the checkpoint carries no EMA teacher (older code): the teacher restarts as a copy of the "
                 "resumed weights")
@@ -2877,9 +2881,12 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                 if trk_out is not None and getattr(model, "last_jepa_tracks", None) is not None:
                     feats_ = G.jepa_track_features(trk_out, jepa_track_dims).to(model.last_jepa_tracks.device)
                     r_ = trk_bin // unit                  # core steps per head bin
-                    trk_loss = G.jepa_track_loss(G.pool_bins(model.last_jepa_tracks, r_), feats_,
-                                                 G.pool_bins(blk_bins & keep_bins, r_))
+                    hid_core_ = blk_bins & keep_bins
+                    hid_head_ = G.pool_bins(hid_core_, r_)
+                    trk_loss = G.jepa_track_loss(G.pool_bins(model.last_jepa_tracks, r_), feats_, hid_head_)
                     jepa_track_losses.append(float(trk_loss.detach()))
+                    # the share of hidden core steps inside fully hidden head bins: the part the track loss sees
+                    jepa_track_cover.append(float(hid_head_.sum()) * r_ / max(float(hid_core_.sum()), 1.0))
                     mlm = mlm + jepa_track_weight * trk_loss
                 z = ctx_core.float()[vis_bins]
             if parts_log is not None:                                   # jepa.csv: no gradient, no random numbers
@@ -2997,6 +3004,7 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
 
     jepa_losses: list[float] = []
     jepa_track_losses: list[float] = []    # --jepa-track-dims
+    jepa_track_cover: list[float] = []     # its share of hidden steps
     bench_losses: list[float] = []
     jepa_std: list[float] = []
     epi_keep: list = []
@@ -3260,7 +3268,7 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
             model.core_norm.weight.grad = None
         if step < freeze_trunk_until:   # --freeze-trunk-until: the predictor's warm-up on the frozen model
             for n_, p_ in model.named_parameters():
-                if not n_.startswith("jepa_pred."):
+                if not n_.startswith(("jepa_pred.", "jepa_tracks.")):     # the predictor and its track readout
                     p_.grad = None
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         if xstage is not None:          # each group's rate: the run's schedule (the line above) as a share of --lr,
@@ -3529,7 +3537,8 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                        + (f", mito {mito_bits:.3f}" if mito_bits is not None else "")
                        + "".join(f", {genomes[k].name} {b_:.3f}" for k, b_ in zip(g_eval, genome_bits))
                        + (f", jepa {np.mean(jepa_losses):.4f} (core std {np.mean(jepa_std):.3f})" if jepa_losses else "")
-                       + (f", jepa tracks {np.mean(jepa_track_losses):.4f}" if jepa_track_losses else "")
+                       + (f", jepa tracks {np.mean(jepa_track_losses):.4f} (covers {np.mean(jepa_track_cover):.0%} of hidden "
+                          f"steps)" if jepa_track_losses else "")
                        + (f", chunk every {unit / np.mean(chunk_rates):.0f} bp" if chunk_rates else "") + f", {h:.2f} h, "
                        + (f"peak {torch.cuda.max_memory_allocated(dev) / 2**30:.1f} GiB" if split_devs is None else
                           "peak " + ", ".join(f"{d_} {torch.cuda.max_memory_allocated(d_) / 2**30:.1f}"
@@ -3550,6 +3559,7 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                 slice_losses.clear()
             jepa_losses.clear()
             jepa_track_losses.clear()
+            jepa_track_cover.clear()
             jepa_std.clear()
             chunk_rates.clear()
             _save_atomic({"model": model.state_dict(), "optimizer": opt.state_dict(), "config": config.to_dict(),
