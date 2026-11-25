@@ -100,3 +100,10 @@ def objective_loss(name: str, logits: torch.Tensor, labels: torch.Tensor, alpha:
     if name == "hierarchical":
         return hierarchical_cross_entropy(logits, labels, alpha=alpha)
     raise ValueError(f"objective must be one of {OBJECTIVES}, got {name!r}")
+
+
+def variance_floor(std: torch.Tensor, frac: float = 0.5) -> torch.Tensor:
+    """VICReg's variance hinge relative to the states' own spread: mean over dimensions of ``relu(frac * mean(std) -
+    std)``, no gradient through the mean. Zero while every dimension's std is at least ``frac`` of the mean; a
+    dimension falling below it is pushed back up, and only it (genome-train --jepa-var-floor)."""
+    return torch.relu(frac * std.mean().detach() - std).mean()

@@ -29,7 +29,7 @@ from kron_core.paths import input_dir, interim_dir, run_name, runs_dir
 from kron_dna.data import PackedRows, doc_ids_from_tokens, is_packed, mask_codons, sequence_files
 from kron_dna.data import prepare as prepare_rows
 from kron_dna.sources import DOMAIN, SOURCES
-from kron_dna.losses import OBJECTIVES, mlm_cross_entropy, objective_loss
+from kron_dna.losses import OBJECTIVES, mlm_cross_entropy, objective_loss, variance_floor
 from kron_dna.model import KronDNA, KronDNAConfig
 
 app = typer.Typer(add_completion=False, no_args_is_help=True)
@@ -947,6 +947,15 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                                               "states: none, vicreg (variance hinge + covariance) or sigreg (LeJEPA: "
                                               "random projections towards an isotropic Gaussian, Epps-Pulley)"),
                  jepa_reg_weight: float = typer.Option(1.0, help="weight of --jepa-reg"),
+                 jepa_var_floor: float = typer.Option(0.0, help="weight of a per-dimension variance floor on the "
+                                                      "context core states beside --jepa-reg: mean over dimensions "
+                                                      "of relu(frac x mean std - std), VICReg's hinge relative to "
+                                                      "the states' own spread. SIGReg rescales by the mean std and "
+                                                      "reads 64 random directions, so one dimension dying moves it "
+                                                      "little; this term holds each one up. 0: off"),
+                 jepa_var_floor_frac: float = typer.Option(0.5, help="with --jepa-var-floor: each dimension's std is "
+                                                           "held above this fraction of the mean std (no gradient "
+                                                           "through the mean)"),
                  jepa_reg_own_stream: bool = typer.Option(False, help="--jepa-reg sigreg draws its random directions "
                                                           "from a stream of its own, so every other draw (the soft "
                                                           "bases) is that of the --jepa-weight 0 run with the same "
@@ -1230,6 +1239,9 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
     if jepa_decode_pred and (jepa_block_share <= 0 or jepa_block_heads != "include"):
         raise typer.BadParameter("--jepa-decode-pred needs --jepa-block-share > 0 and --jepa-block-heads include "
                                  "(the heads must be scored inside the blocks for the decoded states to train)")
+    if jepa_var_floor < 0 or not 0.0 < jepa_var_floor_frac <= 1.0 or (jepa_var_floor > 0 and jepa_weight <= 0):
+        raise typer.BadParameter("--jepa-var-floor must be >= 0 and needs --jepa-weight > 0; --jepa-var-floor-frac "
+                                 "must lie in (0, 1]")
     if jepa_log_every < 0 or (jepa_log_every > 0 and jepa_weight <= 0):
         raise typer.BadParameter("--jepa-log-every must be >= 0 and needs --jepa-weight > 0")
     if jepa_block_share > 0:
@@ -2790,6 +2802,9 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                 ep = ((ecf_re - gauss).pow(2) + ecf_im.pow(2)) * gauss  # Epps-Pulley, Gaussian-weighted
                 reg_t = ep.mean()
                 mlm = mlm + reg_w * reg_t
+            if jepa_var_floor > 0:      # each dimension's std held above a fraction of the mean std
+                floor_t = variance_floor(std, jepa_var_floor_frac)
+                mlm = mlm + jepa_var_floor * floor_t
         if parts_log is not None:
             parts_log["core_std"] = jepa_std[-1] if target is not None and model.last_jepa is not None else float("nan")
             parts_log["total"] = float(mlm.detach())
