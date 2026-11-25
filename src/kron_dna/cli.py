@@ -144,6 +144,40 @@ def info(d_model: int = 512, n_heads: int = 8, n_layers: int = 12, ff_units: int
     typer.echo(f"{n / 1e6:.1f}M parameters: {json.dumps(config.to_dict())}")
 
 
+def parse_span_mask(spec: str) -> list[tuple[int, float]]:
+    """``genome-train --span-mask LEN:SHARE,...`` -> [(length in bases, share of the row's bases), ...]."""
+    out = []
+    for part in filter(None, (p_.strip() for p_ in spec.split(","))):
+        ln, _, sh = part.partition(":")
+        try:
+            out.append((int(ln), float(sh)))
+        except ValueError:
+            raise typer.BadParameter(f"--span-mask: LEN:SHARE pairs, got {part!r}") from None
+        if out[-1][0] < 1 or not 0 < out[-1][1] < 1:
+            raise typer.BadParameter(f"--span-mask: length >= 1 and 0 < share < 1, got {part!r}")
+    return out
+
+
+def add_span_masks(seq: torch.Tensor, inputs: torch.Tensor, targets: torch.Tensor, specs: list[tuple[int, float]],
+              generator: torch.Generator | None = None) -> tuple[torch.Tensor, torch.Tensor]:
+    """Contiguous all-MASK spans on top of ``inputs``/``targets`` (after :func:`G.mask_bases`): for each (length,
+    share), ``round(share x L / length)`` spans per row at uniform starts (they may overlap, so the realised share is
+    at most ``share``); every known base (A, C, G, T) inside becomes MASK and is scored. ``seq`` ``[B, L]`` codes."""
+    from kron_dna import genome as G
+    b, length = seq.shape
+    hide = torch.zeros_like(seq, dtype=torch.bool)
+    for ln, share in specs:
+        ln = min(ln, length)
+        n = int(round(share * length / ln))
+        if n <= 0:
+            continue
+        starts = torch.randint(0, length - ln + 1, (b, n), generator=generator, device=seq.device)
+        idx = (starts.unsqueeze(-1) + torch.arange(ln, device=seq.device)).reshape(b, -1)
+        hide.scatter_(1, idx, True)
+    hide &= seq < 4
+    return inputs.masked_fill(hide, G.MASK_CHANNEL), torch.where(hide, seq, targets)
+
+
 def _param_groups(model: torch.nn.Module, weight_decay: float) -> list[dict]:
     decay, no_decay = [], []
     for name, p in model.named_parameters():
@@ -986,6 +1020,13 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                                                   "(pos.i64, feat.u16, val.u8, scale.f32, codons.json)"),
                  codon_weight: float = typer.Option(0.0, help="weight of the codon head's loss (1 - cosine) on "
                                                     "primary-genome training rows. 0: the head is not trained"),
+                 span_mask: str = typer.Option("", help="training: contiguous all-MASK spans on top of the scattered "
+                                               "masks, LEN:SHARE,... (e.g. 32:0.05,512:0.05,4096:0.05: 5 %% of each "
+                                               "row's bases in spans of each length; every known base inside scored). "
+                                               "Evaluation masks are unchanged"),
+                 span_scatter: float = typer.Option(-1.0, help="with --span-mask: the scattered masking rate in "
+                                                    "training (e.g. 0 for spans only); -1: --mask-prob. Evaluation "
+                                                    "keeps --mask-prob"),
                  codon_on: str = typer.Option("masked", help="with --codon-weight: 'masked' scores only codons with "
                                               "at least one masked base (with 15 % masking about 61 % of codons are "
                                               "fully visible, and the amino acid can be read off them); 'all' every "
@@ -1770,6 +1811,10 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
     rep_genome: list = [None] * len(genomes)
     rep_batch: list = []
     foc_batch: list = []             # --focus-mask-tilt: the batch's per-base weights
+    span_specs = parse_span_mask(span_mask)
+    if span_specs:
+        say(f"span masks in training: " + ", ".join(f"{sh:.0%} of bases in {ln:,}-base spans" for ln, sh in span_specs)
+            + f"; scattered rate {mask_prob if span_scatter < 0 else span_scatter:g} (evaluation {mask_prob:g})")
     codon_batch: list = []           # --codon-weight: per row of the batch, (store rows [k], in-row positions [k, 3])
     codon_st = None
     if codon_weight > 0:
@@ -2738,6 +2783,8 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
             inputs, targets = seq.to(dev), None
         else:   # held-out masks are always plain MASK (bert only in training), so runs with and without it compare
             prob_ = mask_prob
+            if span_specs and span_scatter >= 0 and model.training:   # --span-scatter: the training scatter rate
+                prob_ = span_scatter
             if focus_mask_tilt > 0 and model.training and foc_batch:   # --focus-mask-tilt: masked bases leaning
                 fw_ = foc_batch[0].to(dev).float()                       # toward annotated, signal-rich cells
                 known_ = (seq.to(dev) < 4).float() if seq.dim() == 2 else torch.ones_like(fw_)
@@ -2746,6 +2793,8 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                          ).clamp(0.0, 0.9)
             inputs, targets = G.mask_bases(seq.to(dev), prob_, generator=mask_gen,
                                            bert=bert_mask and model.training)
+            if span_specs and model.training and seq.dim() == 2:       # --span-mask: all-MASK spans on top
+                inputs, targets = add_span_masks(seq.to(dev), inputs, targets, span_specs, mask_gen)
         fwd_kw = {}                     # training-only inputs; evaluation always reads hard bases, no repeat channel
         # --jepa-block-share: hidden bins [B, bins] and bases [B, L] of this training batch (None: no blocks). The
         # blocks come from a stream of their own, so the masks and everything else drawn are those of a run without
