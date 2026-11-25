@@ -12,7 +12,13 @@ maintainer's. Its runs run on the GPU cluster in a second clone of this reposito
 
 ## What it owns
 
-- the DNA training pipeline and its job chain (`src/kron_dna/`, its corpus prepares);
+- the DNA training pipeline and its job chain: the training loop and its options (`src/kron_dna/cli.py`), the
+  recipes, launchers and evaluation tools, its corpus prepares;
+- the runs: preparing, launching and controlling them, benches on cards, evaluations, merges to main. Changes to the
+  model's architecture (`genome.py`, `xheads.py`: bins, layers, heads, memory savings, the JEPA's model code) are
+  `dna-builder`'s to design and build; this seat benches, runs and merges them (Anton, 2026-11-25: "does not
+  builder build the architecture and you prepare and control the run?", then "if you think my version is better
+  than do it"). Agreed: nothing checks it;
 - `<status file>`, its clock the scheduler's;
 - its jobs on the cluster, `kron-dna-*`, and `DNA_TRAINER_NOTES.md`.
 
