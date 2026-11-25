@@ -323,6 +323,12 @@ def report(bench: Path, n_boot: int = 1000, n_boot_ap: int = 200, seed: int = 0,
         typer.echo(f"{lab}: {len(p['rows'])} windows; DNase r mean {np.nanmean(r):.4f} over {int(have.sum())} channels; "
                    f"splice AP {', '.join(f'{a:.3f}' for a in aps)} (mean {aps.mean():.4f})")
     res = pl.DataFrame(rows_out)
+    # written before the paired comparisons, whose bootstraps grow with the square of the sources: a run that
+    # is cut short there still leaves every source's own numbers
+    res.write_csv(bench / "results.csv")
+    summ = (res.group_by("source", "task").agg(pl.col("value").mean().alias("mean"), pl.col("value").is_not_nan().sum().alias("channels"),
+                                               pl.col("n_windows").first()).sort("task", "source"))
+    summ.write_csv(bench / "summary.csv")
 
     # paired differences on shared windows (and shared channels): bootstrap over windows
     labs = list(preds)
@@ -356,10 +362,6 @@ def report(bench: Path, n_boot: int = 1000, n_boot_ap: int = 200, seed: int = 0,
             pairs.append(dict(a=a, b=b, n_windows=len(shared), dnase_channels=int(both.sum()),
                               dnase_r_mean_diff=d0, dnase_lo=float(np.percentile(bd, 2.5)), dnase_hi=float(np.percentile(bd, 97.5)),
                               splice_ap_mean_diff=s0, splice_lo=float(np.percentile(bs, 2.5)), splice_hi=float(np.percentile(bs, 97.5))))
-    res.write_csv(bench / "results.csv")
-    summ = (res.group_by("source", "task").agg(pl.col("value").mean().alias("mean"), pl.col("value").is_not_nan().sum().alias("channels"),
-                                               pl.col("n_windows").first()).sort("task", "source"))
-    summ.write_csv(bench / "summary.csv")
     pl.DataFrame(pairs).write_csv(bench / "pairs.csv") if pairs else None
     charts(bench, res, preds)
     typer.echo(summ)
