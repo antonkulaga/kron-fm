@@ -23,6 +23,7 @@ done (``parts/``). Sequences with characters outside the 20 amino acids are look
 """
 from __future__ import annotations
 
+import gc
 import gzip
 import hashlib
 import io
@@ -137,6 +138,10 @@ def fetch_shard(shard: str, wanted: list[str], parts: Path) -> int:
         for r in pf.read_row_group(g, columns=["protein_hash", "per_position"]).to_pylist():
             if r["protein_hash"] in hashes:
                 rows.append({"md5": r["protein_hash"], "per_position": r["per_position"]})
+    del pf                                                            # footers of 1,000 row groups add up over
+    if hash(shard) % 64 == 0:                                         # tens of thousands of shards: give them back
+        gc.collect()
+        pa.default_memory_pool().release_unused()
     tmp = dst.with_suffix(".part")
     pq.write_table(pa.Table.from_pylist(rows, schema=pa.schema([("md5", pa.string()), ("per_position", pa.large_binary())])), tmp)
     tmp.replace(dst)

@@ -453,6 +453,12 @@ class ChannelRMSNorm(nn.Module):
 LEAN_CONV = False
 
 
+def _norm_weights(norm: nn.Module) -> list[torch.Tensor]:
+    """A norm's learned tensors by attribute (on a split replica they are plain attributes, not parameters)."""
+    return [t for t in (getattr(norm, "weight", None), getattr(norm, "bias", None), getattr(norm, "scale", None),
+                        getattr(norm, "gain", None)) if isinstance(t, torch.Tensor)]
+
+
 def norm_act(norm: nn.Module, x: torch.Tensor, act: bool = True) -> torch.Tensor:
     """``gelu(norm(x))`` (or ``norm(x)`` with ``act=False``), recomputed in backward under ``LEAN_CONV``."""
     f = (lambda t: F.gelu(norm(t))) if act else norm
@@ -565,8 +571,8 @@ class MLPHead(nn.Module):
             out[where] = got
         else:                                                          # nothing selected: zero gradients, not None,
             # as the dense head would give; the weights by name: on a split replica parameters() is empty
-            zero = sum(w.sum() for w in (self.fc1.weight, self.fc1.bias, self.fc2.weight, self.fc2.bias)) * 0
-            out = out + zero.to(out.dtype)
+            ws = [self.fc1.weight, self.fc1.bias, self.fc2.weight, self.fc2.bias, *_norm_weights(self.norm)]
+            out = out + (sum(w.sum() for w in ws) * 0).to(out.dtype)
         return out.transpose(1, 2)
 
 
@@ -584,8 +590,8 @@ class CodonHead(nn.Module):
     def forward(self, x: torch.Tensor, rows: torch.Tensor, pos: torch.Tensor) -> torch.Tensor:
         if rows.numel() == 0:
             # the weights by name: on a split replica they are plain attributes and parameters() is empty
-            zero = sum(w.sum() for w in (self.fc1.weight, self.fc1.bias, self.fc2.weight, self.fc2.bias)) * 0
-            return x.new_zeros(0, self.fc2.out_features) + zero.to(x.dtype)
+            ws = [self.fc1.weight, self.fc1.bias, self.fc2.weight, self.fc2.bias, *_norm_weights(self.norm)]
+            return x.new_zeros(0, self.fc2.out_features) + (sum(w.sum() for w in ws) * 0).to(x.dtype)
         cols = x[rows.unsqueeze(1), :, pos]                             # [N, 3, C]: only the codons' bases
         cols = norm_act(self.norm, cols.reshape(-1, cols.shape[-1]).t().unsqueeze(0), act=False)[0].t()
         return self.fc2(F.gelu(self.fc1(cols.reshape(rows.shape[0], -1))))
@@ -1193,7 +1199,7 @@ class KronGenome(nn.Module):
             x = block(F.interpolate(x, scale_factor=2, mode="nearest")) + skip
         return x
 
-    def forward_contig(self, seq: torch.Tensor, train_at: list[int], chunk: int = 1 << 20, halo: int = 4096,
+    def forward_contig(self, seq: torch.Tensor, train_at: list[int], chunk: int = 1 << 20, halo: int | None = None,
                        context: int | list[int] | None = None, extra: torch.Tensor | None = None
                        ) -> list[tuple[torch.Tensor, torch.Tensor | None]]:
         """A whole contig in one recurrence. ``seq`` is ``[L]`` integer codes or ``[6, L]`` float base weights (L a
@@ -1206,12 +1212,15 @@ class KronGenome(nn.Module):
         chunk, as training on windows of ``chunk`` bases does, so a chunk of the window length matches training."""
         unit = 2 ** self.config.n_down       # no further heads on this path: the core's own step is the unit
         length = seq.shape[-1]
+        # the halo covers the conv path's reach (bin convolutions, in-tower blocks included), at least the 4,096
+        # bases this path always used; pieces start and end where a restarting recurrence restarts
+        halo = max(4096, split_halo(self.config)) if halo is None else halo
         if length % unit or chunk % unit or halo % unit:
             raise ValueError(f"length, chunk and halo must be multiples of {unit}")
         grad = torch.is_grad_enabled()
         cut = lambda t, lo, hi: None if t is None else t[..., lo:hi].unsqueeze(0)   # noqa: E731
         enc = lambda piece, piece_x: self.encode(piece, piece_x)[0]                # noqa: E731
-        span = lambda s: (max(0, s - halo), min(length, s + chunk + halo))  # noqa: E731
+        span = lambda s: piece_bounds(self.config, s, min(length, s + chunk), length, halo)  # noqa: E731
         bins, scored = [], set(train_at)
         for s in range(0, length, chunk):
             lo, hi = span(s)
@@ -1368,9 +1377,10 @@ class KronGenome(nn.Module):
             enc[k] = None                                             # drop this function's hold on the skips
         if codon_parts:                                               # each codon lies in at most one piece
             ok = torch.stack([m for m, _ in codon_parts]).any(0)
-            out = codon_parts[0][1].new_zeros(ok.shape[0], self.config.codon_dims, device=dev0)
-            for m, p in codon_parts:
-                out[m.to(dev0)] = p.to(dev0)
+            dtype = next((p.dtype for m, p in codon_parts if p.shape[0]), codon_parts[0][1].dtype)
+            out = torch.zeros(ok.shape[0], self.config.codon_dims, device=dev0, dtype=dtype)   # an empty piece's
+            for m, p in codon_parts:                                  # output may have another dtype (autocast)
+                out[m.to(dev0)] = p.to(dev0, dtype)
             self.last_codon, self.last_codon_ok = out, ok.to(dev0)
         return pieces, core
 
@@ -1733,6 +1743,26 @@ def _plain_reach(config: KronGenomeConfig) -> int:
     convolutions between them carry it on)."""
     from dataclasses import replace
     return split_reach(replace(config, inter_levels=[]))
+
+
+def piece_step(config: KronGenomeConfig) -> int:
+    """The bases a piece's encoded stretch must start and end on, wherever a window is run in pieces (the split
+    forward, the capped evaluation, a whole contig): the grid, and with a recurrence that restarts every
+    ``local_span`` bases (the local track, the in-tower blocks) a multiple of that span too, so the state restarts
+    where one whole forward would restart it."""
+    unit = grid_of(config)
+    if config.local_width or config.inter_levels:
+        return config.local_span * unit // math.gcd(config.local_span, unit)
+    return unit
+
+
+def piece_bounds(config: KronGenomeConfig, start: int, end: int, length: int, halo: int | None = None
+                 ) -> tuple[int, int]:
+    """``(lo, hi)``: bases ``start:end`` of a ``length``-base window widened by ``halo`` (default
+    :func:`split_halo`) on both sides and out to :func:`piece_step`, clipped to the window."""
+    halo = split_halo(config) if halo is None else halo
+    step = piece_step(config)
+    return max(0, (start - halo) // step * step), min(length, -(-(end + halo) // step) * step)
 
 
 def split_halo(config: KronGenomeConfig) -> int:

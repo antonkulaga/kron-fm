@@ -83,3 +83,15 @@ def test_split_gives_the_same_codons_and_marks_those_cut(cpu_mixer, monkeypatch)
     with torch.no_grad():
         m.forward_split(seq, devices=["cpu", "cpu"], by="rows")
     assert bool(m.last_codon_ok.all()) and torch.allclose(m.last_codon, whole, atol=1e-5)
+
+
+def test_a_piece_without_codons_joins_one_with_codons_under_mixed_precision(cpu_mixer, monkeypatch):
+    forced_replicas(monkeypatch)
+    m = small()
+    seq = torch.randint(0, 4, (1, 128))
+    for pos in ([[3, 4, 5], [10, 11, 12]], [[100, 101, 102]]):       # all in the first piece; all in the second
+        m.codon_at = (torch.zeros(len(pos), dtype=torch.long), torch.tensor(pos))
+        with torch.no_grad(), torch.autocast("cpu", dtype=torch.bfloat16):
+            m.forward_split(seq, devices=["cpu", "cpu"], by="length")
+        assert bool(m.last_codon_ok.all()) and m.last_codon.shape == (len(pos), 12)
+        assert float(m.last_codon.float().abs().sum()) > 0

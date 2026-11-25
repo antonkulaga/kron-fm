@@ -62,7 +62,8 @@ def core_capped(model, seq: torch.Tensor, ctx: torch.Tensor | None, chunk: int) 
     L, halo = seq.shape[-1], G.split_halo(model.config)
     parts = []
     for s in range(0, L, chunk):
-        lo, hi, e = max(0, s - halo), min(L, s + chunk + halo), min(L, s + chunk)
+        e = min(L, s + chunk)
+        lo, hi = G.piece_bounds(model.config, s, e, L, halo)     # where a restarting recurrence restarts
         x, _ = model.encode(seq[None, lo:hi])
         parts.append(x[..., (s - lo) // unit:(e - lo) // unit])
     h = torch.cat(parts, dim=-1).transpose(1, 2)
@@ -79,10 +80,7 @@ def decode_span(model, seq: torch.Tensor, core: torch.Tensor, span: tuple[int, i
     from kron_dna import genome as G
     c = model.config
     unit, L, halo = 2 ** c.n_down, seq.shape[-1], G.split_halo(c)
-    step = c.local_span if c.local_width else unit
-    step = step * unit // math.gcd(step, unit)
-    lo = max(0, (span[0] - halo) // step * step)
-    hi = min(L, -(-(span[1] + halo) // step) * step)
+    lo, hi = G.piece_bounds(c, span[0], span[1], L, halo)       # the local track and the in-tower blocks restart
     _, skips = model.encode(seq[None, lo:hi])
     x = model.add_local(model.decode(core[:, lo // unit:hi // unit].transpose(1, 2), skips), skips)
     keep = model.x_span
