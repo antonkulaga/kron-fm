@@ -86,6 +86,9 @@ class KronGenomeConfig:
                                 # at hidden bins, then bidirectional KronLSTM layers over the core states and a residual
                                 # readout that starts as the identity, so it begins as the masked core: JepaContextPredictor)
     jepa_pred_layers: int = 2   # context: KronLSTM layers of the predictor
+    jepa_track_dims: int = 0    # > 0: the predictor also predicts this many track features at hidden bins (a linear
+                                # readout, ``last_jepa_tracks``): the target model's own track-head predictions on the
+                                # clean window, compressed by jepa_track_features. New parameters only
     n_contexts: int = 0         # v2: learned context embeddings added to the core's input bins: 0 nuclear, else
                                 # the organelle's NCBI genetic code table (2 vertebrate mito, 5 invertebrate, ...)
     n_ntv3: int = 0             # quantitative per-base assay tracks (NTv3 bigwigs): one output per track, predicted
@@ -144,6 +147,64 @@ def make_jepa_predictor(c: "KronGenomeConfig") -> nn.Module | None:
         raise ValueError(f"jepa_pred_kind must be mlp or context, got {c.jepa_pred_kind!r}")
     return nn.Sequential(nn.RMSNorm(c.d_model, eps=1e-5), nn.Linear(c.d_model, 2 * c.d_model), nn.GELU(),
                          nn.Linear(2 * c.d_model, c.d_model))
+
+
+def make_jepa_track_readout(c: "KronGenomeConfig") -> nn.Module | None:
+    """The predictor's linear readout to ``jepa_track_dims`` track features, or None."""
+    if not c.jepa_track_dims:
+        return None
+    if not c.jepa:
+        raise ValueError("jepa_track_dims needs jepa")
+    return nn.Linear(c.d_model, c.jepa_track_dims)
+
+
+def track_projection(name: str, channels: int, dims: int) -> torch.Tensor:
+    """A fixed ``[channels, dims]`` projection for one head's outputs: Gaussian, seeded by the head's name and both
+    sizes, so it is the same after every restart and on every machine, with nothing to fit or to save."""
+    import zlib
+    g = torch.Generator().manual_seed(zlib.crc32(f"{name}:{channels}:{dims}".encode()))
+    return torch.randn(channels, dims, generator=g) / math.sqrt(dims)
+
+
+def jepa_track_features(outputs: dict[str, torch.Tensor], dims: int, eps: float = 1e-6) -> torch.Tensor:
+    """The richer JEPA target: the target model's track-head predictions on the clean window, ``{head: [B, n,
+    channels]}`` at one bin size, as ``[B, n, dims]`` dense features. Each head (in name order) gets an equal share
+    of ``dims`` (the first takes the remainder): its outputs are centred per channel over the batch's bins, projected
+    by ``track_projection`` and scaled to unit spread, so a head with 1,643 channels weighs as much as one with
+    196. Predictions are dense at every bin, unlike the measured tracks, which are mostly zeros. No gradient."""
+    names = sorted(outputs)
+    if not names or dims < len(names):
+        raise ValueError(f"{dims} dims for {len(names)} heads")
+    share = [dims // len(names)] * len(names)
+    share[0] += dims - sum(share)
+    blocks = []
+    with torch.no_grad():
+        for name, k in zip(names, share):
+            y = outputs[name].float()
+            y = y - y.mean((0, 1), keepdim=True)
+            z = y @ track_projection(name, y.shape[-1], k).to(y.device)
+            blocks.append(z / (z.std() + eps))
+    return torch.cat(blocks, -1)
+
+
+def pool_bins(x: torch.Tensor, ratio: int) -> torch.Tensor:
+    """``[B, bins, ...]`` core-step states (float: the mean) or a hidden mask (bool: all of them) per ``ratio``
+    steps: a core at 32 bp against heads at 128 bp has ratio 4."""
+    if ratio == 1:
+        return x
+    b, n = x.shape[:2]
+    if n % ratio:
+        raise ValueError(f"{n} bins are not whole groups of {ratio}")
+    g = x.reshape(b, n // ratio, ratio, *x.shape[2:])
+    return g.all(2) if x.dtype == torch.bool else g.mean(2)
+
+
+def jepa_track_loss(pred: torch.Tensor, target: torch.Tensor, hidden: torch.Tensor) -> torch.Tensor:
+    """Mean squared error between the predictor's track features ``pred`` and the target's ``target`` (both ``[B, n,
+    dims]``) over the hidden bins ``hidden`` ``[B, n]``; zero when they are equal, and zero without a hidden bin."""
+    if not bool(hidden.any()):
+        return pred.sum() * 0.0
+    return (pred.float()[hidden] - target.float()[hidden].detach()).pow(2).mean()
 
 
 MAX_HEAD_BIN = 1024
@@ -356,18 +417,23 @@ class KronHead(nn.Module):
         self.out = nn.Conv1d(d, t, 1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # The 1x1 map to the KronLSTM's width runs on the bin means, not on every base before pooling (a 1x1
+        # convolution and a mean commute): one tensor of d channels per base less. What a per-base head still makes
+        # at single bases, the normalised states, is recomputed in backward by checkpoint_xheads (--xhead-recompute).
         z = self.norm(x)
-        p = F.avg_pool1d(self.down(z), self.bin)                       # [B, d, n]
+        local = self.local(z)
+        if x.shape[-1] < self.bin:                                     # shorter than one step: the readout alone
+            return local
+        means = F.avg_pool1d(z, self.bin)
+        p = self.down(means)                                           # [B, d, n]
         b, d, n = p.shape
-        if n == 0:                                                     # shorter than one step: the readout alone
-            return self.local(z)
         cu = torch.arange(0, b * n + 1, n, device=x.device, dtype=torch.int32)
         h = p.transpose(1, 2).reshape(1, b * n, d)
         for block in self.blocks:
             h = block(h, cu)
         h = h.reshape(b, n, d).transpose(1, 2)
         wide = torch.repeat_interleave(self.out(h), self.bin, dim=-1)
-        return self.local(z) + F.pad(wide, (0, x.shape[-1] - wide.shape[-1]))
+        return local + F.pad(wide, (0, x.shape[-1] - wide.shape[-1]))
 
 
 class KronGenome(nn.Module):
@@ -423,8 +489,9 @@ class KronGenome(nn.Module):
         self._init_xheads(c, widths[0])
         self.context = nn.Embedding(c.n_contexts, c.d_model) if c.n_contexts else None
         self.jepa_pred = make_jepa_predictor(c)
+        self.jepa_tracks = make_jepa_track_readout(c)
         self.jepa_hidden, self.jepa_decode_pred = None, False
-        self.last_jepa = None
+        self.last_jepa = self.last_jepa_tracks = None
         if c.n_epigenomes:
             hid = 256
             self.epi_in = nn.Sequential(nn.RMSNorm(c.d_model, eps=1e-5), nn.Linear(c.d_model, hid))
@@ -616,8 +683,9 @@ class KronGenome(nn.Module):
         if self.context is not None:
             nn.init.zeros_(self.context.weight)
         self.jepa_pred = make_jepa_predictor(c)
+        self.jepa_tracks = make_jepa_track_readout(c)
         self.jepa_hidden, self.jepa_decode_pred = None, False
-        self.last_jepa = self.last_epi = self.last_ratio_loss = self.last_chunks = None
+        self.last_jepa = self.last_jepa_tracks = self.last_epi = self.last_ratio_loss = self.last_chunks = None
         self.checkpoint_core = False
         if c.n_epigenomes:
             hid = 256
@@ -843,6 +911,9 @@ class KronGenome(nn.Module):
         else:
             p = self.jepa_pred(x)
         self.last_jepa_loss = p + (x.detach() - x) if self.jepa_skip_cut else None
+        # the track features are read from what the latent loss reads, so the gate and the skip cut apply alike
+        self.last_jepa_tracks = (self.jepa_tracks(self.last_jepa_loss if self.jepa_skip_cut else p)
+                                 if self.jepa_tracks is not None else None)
         return p
 
     def core_to_decode(self, core: torch.Tensor) -> torch.Tensor:
