@@ -1027,6 +1027,10 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                  span_scatter: float = typer.Option(-1.0, help="with --span-mask: the scattered masking rate in "
                                                     "training (e.g. 0 for spans only); -1: --mask-prob. Evaluation "
                                                     "keeps --mask-prob"),
+                 repeat_loss_weight: float = typer.Option(1.0, help="with --repeat-channel: masked bases in "
+                                                          "soft-masked repeats are scored with this weight (each one "
+                                                          "is kept as a target with this probability; Evo 2 and GPN "
+                                                          "use 0.1). Evaluation scores every base. 1: off"),
                  codon_on: str = typer.Option("masked", help="with --codon-weight: 'masked' scores only codons with "
                                               "at least one masked base (with 15 % masking about 61 % of codons are "
                                               "fully visible, and the amino acid can be read off them); 'all' every "
@@ -1811,6 +1815,15 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
     rep_genome: list = [None] * len(genomes)
     rep_batch: list = []
     foc_batch: list = []             # --focus-mask-tilt: the batch's per-base weights
+    if not 0.0 <= repeat_loss_weight <= 1.0:
+        raise typer.BadParameter("--repeat-loss-weight is in [0, 1]")
+    if repeat_loss_weight < 1.0 and not repeat_channel:
+        raise typer.BadParameter("--repeat-loss-weight reads repeat.u8 through --repeat-channel")
+    rw_batch: list = []              # --repeat-loss-weight: the batch's repeat flags, never dropped
+    rw_rng = np.random.default_rng([seed, rank, 2029])   # its own stream: the masks and windows stay those of a run without it
+    if repeat_loss_weight < 1.0:
+        say(f"repeat loss weight {repeat_loss_weight:g}: masked bases in soft-masked repeats are kept as targets with "
+            f"that probability in training")
     span_specs = parse_span_mask(span_mask)
     if span_specs:
         say(f"span masks in training: " + ", ".join(f"{sh:.0%} of bases in {ln:,}-base spans" for ln, sh in span_specs)
@@ -1961,6 +1974,7 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
         xh_t = {n_: [] for n_ in xstores}            # --xhead: each head's stored targets per row
         xh_m = {n_: [] for n_ in xstores}            # and the channels each row supervises
         rep_rows = []
+        rw_rows = []                                 # --repeat-loss-weight: each row's full repeat flags
         foc_rows = []                                # --focus-mask-tilt: per base weight of each row (float16)
         codon_rows = []                              # --codon-weight: each row's codons (store rows, positions)
         row_len, row_wt = [], []                     # per row: its length, and its share of one window
@@ -2065,6 +2079,14 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                     if flip_row:
                         r_[:take] = r_[:take][::-1].copy()
                 rep_rows.append(r_)
+                if repeat_loss_weight < 1.0:         # the flags whether or not the input channel was dropped
+                    w_ = np.zeros(wrow, dtype=np.uint8)
+                    if rsrc is not None:
+                        w_[:take] = (XH.read_rows(rsrc, rsel.start, rsel.stop) if isinstance(rsel, slice)
+                                     else rsrc[rsel])
+                        if flip_row:
+                            w_[:take] = w_[:take][::-1].copy()
+                    rw_rows.append(w_)
             if focus_mask_tilt > 0:                  # the primary genome's cells; flat elsewhere
                 f_ = np.ones(wrow, dtype=np.float16)
                 if not (from_mito or xs is not None or fg is not None) and take > 0:
@@ -2188,10 +2210,11 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
             rep_ = [torch.from_numpy(rows(rep_rows))] if rep_rows else []
             foc_ = [torch.from_numpy(rows(foc_rows))] if foc_rows else []
             cod_ = [[codon_rows[i] for i in ix]] if codon_rows else []
+            rw_ = [torch.from_numpy(rows(rw_rows))] if rw_rows else []
             out = [torch.from_numpy(rows(seqs)), torch.from_numpy(rows(segs)), torch.tensor([ctxs[i] for i in ix])]
             if labels:
                 out += [torch.from_numpy(rows(x)) for x in (labs, acts, valid)]
-            return tuple(out), (epi_, nt_, rep_, foc_, cod_)
+            return tuple(out), (epi_, nt_, rep_, foc_, cod_, rw_)
 
         if pack:                                     # one part per row length, the full window first
             parts = []
@@ -2199,7 +2222,8 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                 ix = [i for i, l_ in enumerate(row_len) if l_ == w_]
                 parts.append((sum(row_wt[i] for i in ix) / batch, *stacked(ix)))
             return parts
-        out, (epi_batch[:], ntv3_batch[:], rep_batch[:], foc_batch[:], codon_batch[:]) = stacked(range(len(seqs)))
+        out, (epi_batch[:], ntv3_batch[:], rep_batch[:], foc_batch[:], codon_batch[:], rw_batch[:]) = stacked(
+            range(len(seqs)))
         return out
 
     dev = torch.device("cuda", torch.cuda.current_device())
@@ -2795,6 +2819,10 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                                            bert=bert_mask and model.training)
             if span_specs and model.training and seq.dim() == 2:       # --span-mask: all-MASK spans on top
                 inputs, targets = add_span_masks(seq.to(dev), inputs, targets, span_specs, mask_gen)
+            if repeat_loss_weight < 1.0 and model.training and rw_batch:  # --repeat-loss-weight: keep a repeat
+                rp_ = rw_batch[0].to(dev) > 0                               # target with probability W
+                u_ = torch.from_numpy(rw_rng.random(tuple(rp_.shape), dtype=np.float32)).to(dev)
+                targets = targets.masked_fill(rp_ & (u_ >= repeat_loss_weight), -100)
         fwd_kw = {}                     # training-only inputs; evaluation always reads hard bases, no repeat channel
         # --jepa-block-share: hidden bins [B, bins] and bases [B, L] of this training batch (None: no blocks). The
         # blocks come from a stream of their own, so the masks and everything else drawn are those of a run without
@@ -3149,7 +3177,7 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
             return loss_on(*parts, **kw)
         loss = track = None
         for w_, rows_, sides_ in parts:
-            epi_batch[:], ntv3_batch[:], rep_batch[:], foc_batch[:], codon_batch[:] = sides_
+            epi_batch[:], ntv3_batch[:], rep_batch[:], foc_batch[:], codon_batch[:], rw_batch[:] = sides_
             l_, t_ = loss_on(*rows_, **kw)
             loss = w_ * l_ if loss is None else loss + w_ * l_
             if t_ is not None:
