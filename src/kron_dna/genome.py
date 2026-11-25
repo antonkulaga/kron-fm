@@ -757,15 +757,28 @@ class KronGenome(nn.Module):
             x = F.max_pool1d(block(x), 2)
         return x, skips
 
+    jepa_gate = 1.0                     # genome-train --jepa-gate: share of the predictor's gradient into the core
+    jepa_skip_cut = False               # genome-train --jepa-skip-cut: the latent loss reads ``last_jepa_loss``
+    last_jepa_loss = None
+
     def predict_jepa(self, core: torch.Tensor, cu: torch.Tensor | None = None) -> torch.Tensor:
         """The JEPA predictor on core states ``[B, bins, d]``: per bin (``mlp``), or reading the packed rows ``cu`` with
-        the hidden bins ``self.jepa_hidden`` [B, bins] bool (None: no mask embedding) marked (``context``)."""
+        the hidden bins ``self.jepa_hidden`` [B, bins] bool (None: no mask embedding) marked (``context``).
+
+        ``jepa_gate`` a < 1 feeds it ``sg(core) + a (core - sg(core))``: the same values, a times the gradient into
+        the core. ``last_jepa_loss`` is the prediction without the derivative of the identity skip (``p +
+        sg(x) - x`` for the predictor's input x), what the latent loss reads under ``jepa_skip_cut``; the returned
+        prediction (the decoder's, with --jepa-decode-pred) keeps it."""
+        x = core if self.jepa_gate >= 1.0 else core.detach() + self.jepa_gate * (core - core.detach())
         if isinstance(self.jepa_pred, JepaContextPredictor):
             if cu is None:
                 b_, n_ = core.shape[:2]
                 cu = torch.arange(0, b_ * n_ + 1, n_, device=core.device, dtype=torch.int32)
-            return self.jepa_pred(core, cu, self.jepa_hidden)
-        return self.jepa_pred(core)
+            p = self.jepa_pred(x, cu, self.jepa_hidden)
+        else:
+            p = self.jepa_pred(x)
+        self.last_jepa_loss = p + (x.detach() - x) if self.jepa_skip_cut else None
+        return p
 
     def core_to_decode(self, core: torch.Tensor) -> torch.Tensor:
         """The core states the decoder reads: ``core``, or with ``jepa_decode_pred`` (genome-train --jepa-decode-pred,

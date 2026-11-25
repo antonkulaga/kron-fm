@@ -960,6 +960,17 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                  jepa_var_floor_frac: float = typer.Option(0.5, help="with --jepa-var-floor: each dimension's std is "
                                                            "held above this fraction of the mean std (no gradient "
                                                            "through the mean)"),
+                 jepa_skip_cut: bool = typer.Option(False, help="the latent loss reads the predictor's output without "
+                                                    "the derivative of its identity skip, so the loss cannot pull the "
+                                                    "core toward the prediction through it (the decoder's reading "
+                                                    "under --jepa-decode-pred keeps it)"),
+                 jepa_gate: str = typer.Option("", help="ZERO:RAMP: the predictor's gradient into the core is 0 for "
+                                                "ZERO steps from this run's start, then rises linearly to 1 over "
+                                                "RAMP steps (the predictor itself trains throughout): a handover from "
+                                                "a predictor fitted on detached states. Empty: off"),
+                 freeze_core_gain: bool = typer.Option(False, help="keep the core's final RMSNorm gain "
+                                                       "(core_norm.weight) at its starting values: no gradient, so "
+                                                       "AdamW does not move it"),
                  jepa_reg_own_stream: bool = typer.Option(False, help="--jepa-reg sigreg draws its random directions "
                                                           "from a stream of its own, so every other draw (the soft "
                                                           "bases) is that of the --jepa-weight 0 run with the same "
@@ -1243,6 +1254,16 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
     if jepa_decode_pred and (jepa_block_share <= 0 or jepa_block_heads != "include"):
         raise typer.BadParameter("--jepa-decode-pred needs --jepa-block-share > 0 and --jepa-block-heads include "
                                  "(the heads must be scored inside the blocks for the decoded states to train)")
+    gate_zero = gate_ramp = 0
+    if jepa_gate:
+        try:
+            gate_zero, gate_ramp = (int(v) for v in jepa_gate.split(":"))
+        except ValueError:
+            raise typer.BadParameter("--jepa-gate must be ZERO:RAMP (two integers)") from None
+        if gate_zero < 0 or gate_ramp < 0:
+            raise typer.BadParameter("--jepa-gate must be ZERO:RAMP (two integers)")
+    if (jepa_skip_cut or jepa_gate) and jepa_weight <= 0:
+        raise typer.BadParameter("--jepa-skip-cut and --jepa-gate need --jepa-weight > 0")
     if eval_fixed < 0:
         raise typer.BadParameter("--eval-fixed must be >= 0")
     if jepa_var_floor < 0 or not 0.0 < jepa_var_floor_frac <= 1.0 or (jepa_var_floor > 0 and jepa_weight <= 0):
@@ -2436,7 +2457,8 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                 _, want_, _ = target(seqs_, segm_, ctx_)
             with autocast:
                 train_model(inp_, segm_, ctx_)
-            pred_ = model.last_jepa.float()
+            pred_ = getattr(model, "last_jepa_loss", None)               # --jepa-skip-cut
+            pred_ = (model.last_jepa if pred_ is None else pred_).float()
         finally:
             model.x_active, model.jepa_hidden, model.jepa_decode_pred = old_
         want_ = want_.float()
@@ -2737,13 +2759,15 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                 else:
                     _, want_core, _ = target(seq.to(dev), seg.to(dev), ctx.to(dev) if ctx_on else None, **tgt_kw)
             keep_bins = seg.to(dev) == 0                                # not padding
+            lj_ = getattr(model, "last_jepa_loss", None)
+            lj_ = model.last_jepa if lj_ is None else lj_   # --jepa-skip-cut
             if jepa_loss == "cos":
                 frame = None
-                cos = F.cosine_similarity(model.last_jepa.float(), want_core.float(), dim=-1)
+                cos = F.cosine_similarity(lj_.float(), want_core.float(), dim=-1)
                 dist = 1 - cos
             else:                       # --jepa-loss zcos: both sides in the target's standardised frame
                 frame = jnorm_frame(want_core, keep_bins)
-                zp_ = (model.last_jepa.float() - frame[0]) / frame[1]
+                zp_ = (lj_.float() - frame[0]) / frame[1]
                 zt_ = (want_core.float() - frame[0]) / frame[1]
                 cos = F.cosine_similarity(zp_, zt_, dim=-1)
                 dist = 1 - cos + ((zp_ - zt_).pow(2).mean(-1) if jepa_loss == "zcos-mse" else 0.0)
@@ -3047,7 +3071,12 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
     slice_losses: list[float] = []                    # its unweighted training loss per step
     model.train()
     end_step = stop_step or steps                     # TR02: evaluate and save at the step the run stops at
+    model.jepa_skip_cut = jepa_skip_cut
+    gate_from = step                    # --jepa-gate counts from this run's first step
     while step < end_step:
+        if jepa_gate:
+            done_ = step - gate_from - gate_zero
+            model.jepa_gate = 0.0 if done_ < 0 else (1.0 if done_ >= gate_ramp else done_ / max(gate_ramp, 1))
         t_step = time.time()
         for g in opt.param_groups:
             g["lr"] = genome_lr(step, lr, warmup, steps, lr_total, cooldown_from)
@@ -3130,6 +3159,8 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
             for n_, p_ in model.named_parameters():                # so AdamW leaves their moments and step count as
                 if not n_.startswith("xheads."):                   # the checkpoint had them and they do not enter the
                     p_.grad = None                                 # clip norm (review 23 Nov)
+        if freeze_core_gain:            # --freeze-core-gain: AdamW skips a parameter without a gradient
+            model.core_norm.weight.grad = None
         if step < freeze_trunk_until:   # --freeze-trunk-until: the predictor's warm-up on the frozen model
             for n_, p_ in model.named_parameters():
                 if not n_.startswith("jepa_pred."):
