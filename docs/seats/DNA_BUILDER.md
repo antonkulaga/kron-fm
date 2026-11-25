@@ -16,6 +16,11 @@ training runs alive, so Anton asked for a second DNA seat (2026-11-18, through `
 - the plan's new data pipelines: bulk track targets (NTv3_tracks' 7,362 hg38 tracks, ENCODE and GTEx downloads,
   AlphaGenome or NTv3 predictions as targets), on new versioned outputs under the kron-fm data folder;
 - the new heads (splicing first) and one shared benchmark against AlphaGenome;
+- the model's architecture: designing and building changes to it (bin size and pooling levels, layer layout,
+  heads, memory savings, the JEPA's model code: `genome.py`, `xheads.py`), each with a test, on its branch;
+  `dna-trainer` benches it on cards, runs it and merges it. Anton, 2026-11-25, in the trainer's session: "does not
+  builder build the architecture and you prepare and control the run?", then "if you think my version is better
+  than do it". Agreed: nothing checks it;
 - its branch `dna-builder` in its own clone, `/data/uq2347/sources/kron-fm-dna-builder`, and its worktrees;
 - its jobs on the cluster, `kron-dna-build-*`, and `DNA_BUILDER_NOTES.md`.
 

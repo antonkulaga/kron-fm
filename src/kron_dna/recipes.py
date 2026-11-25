@@ -49,7 +49,7 @@ def _paths(root: Path) -> dict[str, Path]:
 def base_args(stem: int = 256) -> list[str]:
     return ["--name", "hg38", "--val-chroms", "chr8,chr9", "--arch", "v2", "--eval-window", "1048576",
             "--warmup", "2000", "--bert-mask", "--rc", "--stem-channels", str(stem), "--n-contexts", "256",
-            "--n-in-extra", "8", "--epigenome-weight", "1.0"]
+            "--n-in-extra", "8", "--epigenome-weight", "1.0", "--lean-convs"]
 
 
 def ntv3_args(p: dict) -> list[str]:
