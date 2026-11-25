@@ -1031,6 +1031,16 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                                                           "soft-masked repeats are scored with this weight (each one "
                                                           "is kept as a target with this probability; Evo 2 and GPN "
                                                           "use 0.1). Evaluation scores every base. 1: off"),
+                 hole_share: float = typer.Option(0.0, help="with --focus-map: hide this share of each primary row's "
+                                                  "scored centre in all-MASK holes of --hole-len bases whose letters "
+                                                  "are not scored; the track heads are scored inside them as "
+                                                  "anywhere else (hide DNA, predict function). 0: off"),
+                 hole_len: int = typer.Option(2048, help="with --hole-share: the length of each hole"),
+                 hole_peak_share: float = typer.Option(0.5, help="with --hole-share: share of holes centred (jitter "
+                                                       "+-512) on distal DNase peak cells (signal>=4 of the DNase "
+                                                       "store, no promoter within --hole-distal); the rest uniform"),
+                 hole_distal: int = typer.Option(32768, help="with --hole-share: a peak cell counts as distal with "
+                                                 "no promoter cell within this many bases"),
                  codon_on: str = typer.Option("masked", help="with --codon-weight: 'masked' scores only codons with "
                                               "at least one masked base (with 15 % masking about 61 % of codons are "
                                               "fully visible, and the amino acid can be read off them); 'all' every "
@@ -1647,6 +1657,19 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
         fm_ = np.memmap(focus_map / "focus.u8", dtype=np.uint8, mode="r").reshape(int(fj_["cells"]), len(cols_))
         focus_w = fm_[:, [cols_.index(c_) for c_ in pick_]]
         say(f"focus map: {len(pick_)} of {len(cols_)} columns, {focus_bin}-bp cells; mask tilt {focus_mask_tilt:g}")
+    hole_pk = hole_pr = None
+    hole_rng = np.random.default_rng([seed, rank, 2031])   # its own stream: windows and masks as without holes
+    hole_count = [0, 0]                                       # holes placed on distal peaks, uniform
+    if hole_share > 0:
+        if focus_map is None:
+            raise typer.BadParameter("--hole-share needs --focus-map (DNase peak and promoter columns)")
+        if not (0 < hole_share < 1 and 0 <= hole_peak_share <= 1 and hole_len >= 128):
+            raise typer.BadParameter("--hole-share in (0, 1), --hole-peak-share in [0, 1], --hole-len >= 128")
+        hole_pk = fm_[:, cols_.index("signal>=4:dnase-biosamples-v1-bin128")]
+        hole_pr = fm_[:, cols_.index("label:promoter")]
+        say(f"holes: {hole_share:.0%} of each primary row's scored centre in {hole_len:,}-base all-MASK holes, "
+            f"{hole_peak_share:.0%} on distal DNase peaks (no promoter within {hole_distal:,} bases); letters inside "
+            f"not scored, track heads scored")
     # the model's grid (genome.grid_of): window and row lengths, packs, split halos and head spans are multiples of the
     # core's step or of the widest head bin, whichever is larger (a 32-bp core with 128-bp heads: 128)
     grid = max([unit] + [b_ for b_ in x_bin.values() if b_ > 1])
@@ -1820,6 +1843,7 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
     if repeat_loss_weight < 1.0 and not repeat_channel:
         raise typer.BadParameter("--repeat-loss-weight reads repeat.u8 through --repeat-channel")
     rw_batch: list = []              # --repeat-loss-weight: the batch's repeat flags, never dropped
+    hole_batch: list = []            # --hole-share: the batch's hidden bases
     rw_rng = np.random.default_rng([seed, rank, 2029])   # its own stream: the masks and windows stay those of a run without it
     if repeat_loss_weight < 1.0:
         say(f"repeat loss weight {repeat_loss_weight:g}: masked bases in soft-masked repeats are kept as targets with "
@@ -1975,6 +1999,7 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
         xh_m = {n_: [] for n_ in xstores}            # and the channels each row supervises
         rep_rows = []
         rw_rows = []                                 # --repeat-loss-weight: each row's full repeat flags
+        hole_rows = []                               # --hole-share: each row's hidden bases
         foc_rows = []                                # --focus-mask-tilt: per base weight of each row (float16)
         codon_rows = []                              # --codon-weight: each row's codons (store rows, positions)
         row_len, row_wt = [], []                     # per row: its length, and its share of one window
@@ -2096,6 +2121,35 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                     if flip_row:
                         f_[:take] = f_[:take][::-1].copy()
                 foc_rows.append(f_)
+            if hole_pk is not None:                  # --hole-share: holes in the scored centre of primary rows
+                h_ = np.zeros(wrow, dtype=np.uint8)
+                if not (from_mito or xs is not None or fg is not None) and take > 2 * hole_len:
+                    cen_ = ntv3_center if ntv3_center < 1 else 1.0
+                    lo_, hi_ = int(take * (1 - cen_) / 2), int(take * (1 + cen_) / 2) - hole_len
+                    if hi_ > lo_:
+                        n_ = max(1, int(round(hole_share * (hi_ - lo_ + hole_len) / hole_len)))
+                        n_pk_ = int(round(n_ * hole_peak_share))
+                        fb_, pad_ = focus_bin, -(-hole_distal // focus_bin)
+                        c0_, c1_ = at // fb_, -(-(at + take) // fb_)
+                        pr_ = np.asarray(hole_pr[max(0, c0_ - pad_):c1_ + pad_]) > 0
+                        near_ = np.convolve(pr_.astype(np.int32), np.ones(2 * pad_ + 1, np.int32), "same") > 0
+                        near_ = near_[c0_ - max(0, c0_ - pad_):][:c1_ - c0_]
+                        pk_ = (np.asarray(hole_pk[c0_:c1_]) > 0) & ~near_
+                        cen_pos_ = np.flatnonzero(pk_) * fb_ + c0_ * fb_ - at + fb_ // 2 - hole_len // 2
+                        cen_pos_ = cen_pos_[(cen_pos_ >= lo_) & (cen_pos_ <= hi_)]
+                        starts_ = []
+                        if len(cen_pos_) and n_pk_:
+                            starts_ += list(np.clip(hole_rng.choice(cen_pos_, min(n_pk_, len(cen_pos_)), replace=False)
+                                                    + hole_rng.integers(-512, 513, min(n_pk_, len(cen_pos_))), lo_, hi_))
+                        hole_count[0] += len(starts_)
+                        n_u_ = n_ - len(starts_)
+                        starts_ += list(hole_rng.integers(lo_, hi_ + 1, n_u_))
+                        hole_count[1] += n_u_
+                        for s_ in starts_:
+                            h_[int(s_):int(s_) + hole_len] = 1
+                        if flip_row:
+                            h_[:take] = h_[:take][::-1].copy()
+                hole_rows.append(h_)
             if codon_st is not None:                 # the primary genome's codons lying wholly in the row
                 ci_, cp_ = np.zeros(0, np.int64), np.zeros((0, 3), np.int64)
                 if not (from_mito or xs is not None or fg is not None) and take > 0:
@@ -2211,10 +2265,11 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
             foc_ = [torch.from_numpy(rows(foc_rows))] if foc_rows else []
             cod_ = [[codon_rows[i] for i in ix]] if codon_rows else []
             rw_ = [torch.from_numpy(rows(rw_rows))] if rw_rows else []
+            hole_ = [torch.from_numpy(rows(hole_rows))] if hole_rows else []
             out = [torch.from_numpy(rows(seqs)), torch.from_numpy(rows(segs)), torch.tensor([ctxs[i] for i in ix])]
             if labels:
                 out += [torch.from_numpy(rows(x)) for x in (labs, acts, valid)]
-            return tuple(out), (epi_, nt_, rep_, foc_, cod_, rw_)
+            return tuple(out), (epi_, nt_, rep_, foc_, cod_, rw_, hole_)
 
         if pack:                                     # one part per row length, the full window first
             parts = []
@@ -2222,8 +2277,8 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                 ix = [i for i, l_ in enumerate(row_len) if l_ == w_]
                 parts.append((sum(row_wt[i] for i in ix) / batch, *stacked(ix)))
             return parts
-        out, (epi_batch[:], ntv3_batch[:], rep_batch[:], foc_batch[:], codon_batch[:], rw_batch[:]) = stacked(
-            range(len(seqs)))
+        out, (epi_batch[:], ntv3_batch[:], rep_batch[:], foc_batch[:], codon_batch[:], rw_batch[:],
+              hole_batch[:]) = stacked(range(len(seqs)))
         return out
 
     dev = torch.device("cuda", torch.cuda.current_device())
@@ -2823,6 +2878,9 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                 rp_ = rw_batch[0].to(dev) > 0                               # target with probability W
                 u_ = torch.from_numpy(rw_rng.random(tuple(rp_.shape), dtype=np.float32)).to(dev)
                 targets = targets.masked_fill(rp_ & (u_ >= repeat_loss_weight), -100)
+            if hole_pk is not None and model.training and hole_batch:      # --hole-share: hide, do not score letters
+                hole_at = hole_batch[0].to(dev) > 0
+                inputs, targets = inputs.masked_fill(hole_at, G.MASK_CHANNEL), targets.masked_fill(hole_at, -100)
         fwd_kw = {}                     # training-only inputs; evaluation always reads hard bases, no repeat channel
         # --jepa-block-share: hidden bins [B, bins] and bases [B, L] of this training batch (None: no blocks). The
         # blocks come from a stream of their own, so the masks and everything else drawn are those of a run without
@@ -2839,6 +2897,8 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
         if model.training and repeat_channel and rep_batch:
             extra_in = torch.zeros(seq.shape[0], n_in_extra, seq.shape[-1], device=dev)
             extra_in[:, G.EXTRA_INPUT_CHANNELS["repeat"]] = rep_batch[0].to(dev).float()
+            if hole_pk is not None and hole_batch:                     # nothing of a hole shows, its repeat flag too
+                extra_in = extra_in.masked_fill((hole_batch[0].to(dev) > 0).unsqueeze(1), 0.0)
             fwd_kw["extra"] = extra_in
             if blk_at is not None:      # the target keeps the repeat channel; the online input loses it in blocks
                 tgt_kw = {"extra": extra_in}
@@ -3177,7 +3237,7 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
             return loss_on(*parts, **kw)
         loss = track = None
         for w_, rows_, sides_ in parts:
-            epi_batch[:], ntv3_batch[:], rep_batch[:], foc_batch[:], codon_batch[:], rw_batch[:] = sides_
+            epi_batch[:], ntv3_batch[:], rep_batch[:], foc_batch[:], codon_batch[:], rw_batch[:], hole_batch[:] = sides_
             l_, t_ = loss_on(*rows_, **kw)
             loss = w_ * l_ if loss is None else loss + w_ * l_
             if t_ is not None:
@@ -3752,6 +3812,9 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                           "peak " + ", ".join(f"{d_} {torch.cuda.max_memory_allocated(d_) / 2**30:.1f}"
                                               for d_ in split_devs) + " GiB")
                        + (f", tracks {tracks_note}" if tracks_note else ""))
+            if hole_pk is not None:       # --hole-share: holes placed since the last report
+                say(f"holes: {hole_count[0]:,} on distal DNase peaks, {hole_count[1]:,} uniform since the last report")
+                hole_count[:] = [0, 0]
             if codon_losses:            # --codon-weight: the codon head's training loss since the last report
                 say(f"codon head: train 1 - cosine {np.mean(codon_losses):.4f} over {len(codon_losses)} micro-batches")
                 codon_losses.clear()
