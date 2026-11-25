@@ -223,7 +223,8 @@ def cmd_skips(a):
     for i in range(r.model.config.n_down):
         h = r.model.skip_proj[i].register_forward_hook(lambda m, i_, o: torch.zeros_like(o))
         b = bits(); h.remove()
-        print(f"skip {i} ({2 ** i} bp level) zeroed: {b:.4f} ({b - b0:+.4f})", flush=True)
+        level = 2 ** (r.model.config.n_down - 1 - i)   # decode() reads the skips coarsest first (skip_proj[0])
+        print(f"skip_proj[{i}] ({level} bp level) zeroed: {b:.4f} ({b - b0:+.4f})", flush=True)
 
 
 def _dnase_setup(a, r):
