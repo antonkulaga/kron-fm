@@ -74,9 +74,11 @@ class Genome:
 def classes_of(genes, off: int) -> np.ndarray:
     """Per base of the window at layout offset ``off``: the class index in CLASSES (priority CDS first)."""
     gid = list(genes.ids)
-    g = genes.window(off, WIN, WIN).astype(bool)
+    pad = 1000                                     # start sites up to 1 kb outside the window still make promoters
+    g = genes.window(off - pad, WIN + 2 * pad, WIN + 2 * pad).astype(bool)
     ch = lambda n: g[:, gid.index(n + "_plus")] | g[:, gid.index(n + "_minus")]  # noqa: E731
-    tss = np.convolve(ch("tss").astype(np.int32), np.ones(2001, np.int32), "same") > 0
+    tss = (np.convolve(ch("tss").astype(np.int32), np.ones(2001, np.int32), "same") > 0)[pad:pad + WIN]
+    g = g[pad:pad + WIN]
     cls = np.full(WIN, 6, np.int8)
     for k, m in [(5, ch("intron")), (4, tss), (3, ch("ncexon")), (2, ch("utr3")), (1, ch("utr5")), (0, ch("cds"))]:
         cls[m] = k
@@ -136,7 +138,10 @@ def cmd_classes(a):
         codes = gen.codes(row["chrom"], row["start"] - FL, row["end"] + FL)
         cls, rp, mid = classes_of(genes, off), gen.repeat[off:off + WIN] > 0, codes[FL:FL + WIN]
         gc = np.isin(mid, (1, 2)).reshape(-1, 128).mean(1).repeat(128)
-        cp = ((mid == 1) & (np.roll(mid, -1) == 2)) | ((mid == 2) & (np.roll(mid, 1) == 1))
+        cp = np.zeros(WIN, bool)                     # C of a CpG and its G, no wrap at the window's ends
+        dinuc = (mid[:-1] == 1) & (mid[1:] == 2)
+        cp[:-1] |= dinuc
+        cp[1:] |= dinuc
         ws, wn = 0.0, 0
         for k in range(a.passes):
             pos, bits, hit = r.masked(codes, 1000 * w + k)
