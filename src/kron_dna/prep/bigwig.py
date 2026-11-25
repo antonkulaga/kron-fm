@@ -11,6 +11,30 @@ from kron_dna.prep.transforms import encode_u8
 CHUNK = 1 << 22
 
 
+class Signed:
+    """A bigWig read with non-negative signal whatever its sign convention. ENCODE's minus-strand signal files of
+    PRO-cap and eCLIP hold their values as negative numbers (header: maximum 0 or below); read as they are, every
+    value would be clipped to zero and the track would be empty. ``sign`` is -1 for such a file, else 1, and
+    ``values`` returns the signal times it; everything else is the bigWig's own."""
+
+    def __init__(self, bw) -> None:
+        h = bw.header()
+        self.bw, self.sign = bw, (-1.0 if h["maxVal"] <= 0 and h["minVal"] < 0 else 1.0)
+
+    def values(self, *a, **k):
+        x = self.bw.values(*a, **k)
+        return x if self.sign > 0 else -x
+
+    def chroms(self, *a):
+        return self.bw.chroms(*a)
+
+    def header(self):
+        return self.bw.header()
+
+    def close(self) -> None:
+        self.bw.close()
+
+
 def sample_windows(rows, rng, n, width=100_000, have=None, split=None, tries=200_000):
     """``n`` windows of ``width`` bases at random on contigs the bigWig lists; with ``split``, only windows whose bases
     are at least 90 % training split (code 1), so held-out chromosomes never calibrate an encoding."""

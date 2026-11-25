@@ -80,3 +80,45 @@ def test_direct_cells_equal_the_per_base_route(genomes, tmp_path, monkeypatch):
     # the check reads the raw signal, unclipped: here the scale falls back to log1p(1) (no 100 kb window to sample in
     # the test genome), so much of the signal is clipped and r stays near 0.9; real tracks clip at their 99.99th
     assert all(t["check_pearson_cells_vs_bigwig"] > 0.5 for t in meta["tracks"])
+
+
+def test_a_negative_minus_strand_file_gives_the_same_cells(genomes, tmp_path, monkeypatch):
+    """ENCODE's minus-strand PRO-cap and eCLIP files hold their signal as negative numbers: read as they are, the
+    track would be all zeros. The same signal written positive and negative gives identical cells, the negative one
+    marked sign -1; a file with both signs is left as it is."""
+    hgt, root = genomes["hgt"], genomes["root"]
+    idx = pl.read_parquet(hgt / "contigs.parquet").sort("offset")
+    total = int((idx["end"] - idx["start"]).sum())
+    (hgt / "ntv3").mkdir(exist_ok=True)
+    np.ones(total, dtype=np.uint8).tofile(hgt / "ntv3" / "split.u8")
+    bwd = tmp_path / "bw"
+    bwd.mkdir()
+    sizes = [(r["chrom"], int(r["end"])) for r in idx.iter_rows(named=True)]
+    for fid, sign in (("POS", 1.0), ("NEG", -1.0)):
+        rng = np.random.default_rng(0)
+        bw = pyBigWig.open(str(bwd / f"{fid}.bigWig"), "w")
+        bw.addHeader(sizes)
+        for c, n in sizes:
+            v = np.where(rng.random(n) < 0.3, rng.gamma(1.0, 3.0, n), 0.0)
+            bw.addEntries(c, 0, values=(sign * v).astype(np.float64), span=1, step=1)
+        bw.close()
+    sel = tmp_path / "select.tsv"
+    sel.write_text("experiment\tfile\tassay\tbiosample\ttarget\toutput_type\tchannel\n"
+                   "E1\tPOS\tPRO-cap\tK562\t\tplus strand signal of unique reads\tE1_P\n"
+                   "E1\tNEG\tPRO-cap\tK562\t\tminus strand signal of unique reads\tE1_M\n")
+    BB = load("prep_bigwig_binned")
+    monkeypatch.setattr(BB, "interim_dir", lambda *p: root.joinpath(*p))
+    out = tmp_path / "store"
+    BB.main(sel, bwd, out, name="hgt", bin=16, workers=1, scale_percentile=99.99, convert_only=False,
+            provenance=None, check_cells=200, split=None)
+    meta = json.loads((out / "binned.json").read_text())
+    assert meta["ids"] == ["E1_P", "E1_M"] and [t["sign"] for t in meta["tracks"]] == [1.0, -1.0]
+    tg = np.memmap(out / "target.f16", dtype=np.float16, mode="r", shape=(meta["cells"], 2))
+    assert float(np.abs(np.asarray(tg[:, 1])).max()) > 0 and np.array_equal(np.asarray(tg[:, 0]), np.asarray(tg[:, 1]))
+    assert all(t["check_pearson_cells_vs_bigwig"] > 0.5 and t["negative_values"] == 0 for t in meta["tracks"])
+    from kron_dna.prep.bigwig import Signed
+
+    class Mixed:                                                     # both signs: not a strand convention
+        def header(self):
+            return dict(minVal=-2.0, maxVal=3.0)
+    assert Signed(Mixed()).sign == 1.0

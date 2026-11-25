@@ -47,14 +47,14 @@ _G: dict = {}
 def one(fid: str) -> dict:
     import pyBigWig
 
-    from kron_dna.prep.bigwig import ScanStats, nonzero_mean, scale_of, scan
+    from kron_dna.prep.bigwig import ScanStats, Signed, nonzero_mean, scale_of, scan
     from kron_dna.prep.transforms import decode_u8, encode_u8, targets_np
 
     rows, total, src, out, b = _G["rows"], _G["total"], _G["src"], _G["out"], _G["bin"]
     side = out / "cells" / f"{fid}.json"
     if side.exists():
         return json.loads(side.read_text())
-    bw = pyBigWig.open(str(src / f"{fid}.bigWig"))
+    bw = Signed(pyBigWig.open(str(src / f"{fid}.bigWig")))      # minus-strand files may be negative
     split = _G["split"]
     sc = scale_of(bw, rows, _G["percentile"], split)        # the shared calibration (kron_dna.prep.bigwig)
     nz = nonzero_mean(bw, rows, sc, split)
@@ -79,7 +79,7 @@ def one(fid: str) -> dict:
         tmp = str(dst) + PART
         arr.astype(np.float16).tofile(tmp)
         os.replace(tmp, dst)
-    info = {"file": fid, "log1p_scale": sc, "nonzero_mean": nz, **stats.info()}
+    info = {"file": fid, "log1p_scale": sc, "nonzero_mean": nz, "sign": bw.sign, **stats.info()}
     Path(str(side) + PART).write_text(json.dumps(info))
     os.replace(str(side) + PART, side)
     return info
@@ -96,6 +96,8 @@ def main(select: Path, bigwigs: Path, out: Path, name: str = "hg38", bin: int = 
          split: Path = typer.Option(None, help="uint8 per base of the layout, 1 = training (the non-zero mean is "
                                                 "sampled there); default: the genome's ntv3/split.u8")) -> None:
     import pyBigWig
+
+    from kron_dna.prep.bigwig import Signed
 
     genome = interim_dir("genome", name)
     if genome.resolve() in [out.resolve(), *out.resolve().parents]:
@@ -141,7 +143,7 @@ def main(select: Path, bigwigs: Path, out: Path, name: str = "hg38", bin: int = 
     pick = [r for r in rows if r[2] - r[1] > 50 * bin]
     pear = np.zeros(t)
     for k, fid in enumerate(files):
-        bw = pyBigWig.open(str(bigwigs / f"{fid}.bigWig"))
+        bw = Signed(pyBigWig.open(str(bigwigs / f"{fid}.bigWig")))
         xs, ys = [], []
         for _ in range(check_cells // 50):
             c, s, e, off = pick[int(rng.integers(0, len(pick)))]
@@ -174,12 +176,17 @@ def main(select: Path, bigwigs: Path, out: Path, name: str = "hg38", bin: int = 
                                                                              "target", "output_type")},
                              **{c: infos[r["file"]][c] for c in ("log1p_scale", "nonzero_mean", "nan_share",
                                                                  "observed_bases", "negative_values", "unobserved_contigs")},
+                             sign=infos[r["file"]].get("sign", 1.0),
                              check_pearson_cells_vs_bigwig=float(pear[k]),
                              **{c: prov.get(r["file"], {}).get(c) for c in ("assembly", "md5", "size", "lab")})
                         for k, r in enumerate(sel)])
     (out / "binned.json").write_text(json.dumps(meta, indent=1))
+    empty = [ids[k] for k in range(t) if not np.isfinite(pear[k])]
     typer.echo(f"wrote {out / 'binned.json'}: {t} tracks, {cells:,} cells; check r (cells vs bigWig) min "
-               f"{np.nanmin(pear):.4f} median {np.nanmedian(pear):.4f}")
+               f"{np.nanmin(pear):.4f} median {np.nanmedian(pear):.4f}; {sum(infos[f].get('sign', 1.0) < 0 for f in files)} "
+               f"tracks read with the sign turned (negative minus-strand files)")
+    if empty:                                        # a track without signal in every checked cell: say so, loudly
+        typer.echo(f"WARNING: {len(empty)} tracks show no signal in the checked cells: {empty[:8]}", err=True)
 
 
 if __name__ == "__main__":

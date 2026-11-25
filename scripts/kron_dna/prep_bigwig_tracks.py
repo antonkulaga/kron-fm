@@ -57,13 +57,14 @@ def scale_of(bw, rows: list[tuple], percentile: float = 99.9, split=None) -> flo
 
 def one(fid: str) -> dict:
     import pyBigWig
+    from kron_dna.prep.bigwig import Signed
 
     rows, total, src, out = _G["rows"], _G["total"], _G["src"], _G["out"]
     dst = out / "tracks" / f"{fid}.u8"
     side = out / "tracks" / f"{fid}.json"
     if dst.exists() and dst.stat().st_size == total and side.exists():
         return json.loads(side.read_text())
-    bw = pyBigWig.open(str(src / f"{fid}.bigWig"))
+    bw = Signed(pyBigWig.open(str(src / f"{fid}.bigWig")))      # minus-strand files may be negative
     have = bw.chroms()
     sc = scale_of(bw, rows, _G.get("percentile", 99.9), _G.get("split"))
     part = str(dst) + f".part.{socket.gethostname()}.{os.getpid()}"
@@ -92,6 +93,7 @@ def main(select: Path, bigwigs: Path, out: Path, name: str = "hg38", provenance:
          scale_percentile: float = typer.Option(99.9, help="percentile of non-zero signal the encoding clips at"),
          convert_only: bool = typer.Option(False, help="write the per-track files only, no store")) -> None:
     import pyBigWig
+    from kron_dna.prep.bigwig import Signed
 
     genome = interim_dir("genome", name)
     if genome.resolve() in [out.resolve(), *out.resolve().parents]:
@@ -175,7 +177,7 @@ def main(select: Path, bigwigs: Path, out: Path, name: str = "hg38", provenance:
     rng = np.random.default_rng(1)
     worst, pear = np.zeros(T), np.zeros(T)
     for k, fid in enumerate(files):
-        bw = pyBigWig.open(str(bigwigs / f"{fid}.bigWig"))
+        bw = Signed(pyBigWig.open(str(bigwigs / f"{fid}.bigWig")))
         have = bw.chroms()
         a_src, a_dec = [], []
         ok = [r for r in rows if r[0] in have and r[2] - r[1] > (1 << 17)]
