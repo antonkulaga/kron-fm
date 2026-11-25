@@ -502,7 +502,7 @@ def test_jepa_on_all_heads_include_and_log_without_blocks(jgenomes, tmp_path, mo
 
 
 @pytest.mark.parametrize("more,words", [
-    (["--jepa-block-share", "0.2"], "needs --jepa-weight"),
+    (["--jepa-block-share", "0.2", "--whole-contigs"], "does not take --whole-contigs"),
     (JEPA + ["--jepa-block-share", "0.95"], "must lie in [0, 0.9]"),
     (JEPA + ["--jepa-block-share", "0.2", "--jepa-block-len", "1000:8192"], "multiples of 128"),
     (JEPA + ["--jepa-block-share", "0.2", "--jepa-on", "some"], "--jepa-on must be"),
@@ -639,3 +639,38 @@ def test_no_new_parameters_and_old_checkpoints_resume(jgenomes, tmp_path, monkey
     assert after["step"] == 6 and list(after["model"]) == list(before["model"])
     assert [r[0] for r in metric_rows(out / "metrics.csv")] == ["step", "2", "4", "6"]
     assert [line.split(",")[0] for line in (out / "jepa.csv").read_text().strip().split("\n")] == ["step", "4", "6"]
+
+
+def test_blocks_at_jepa_weight_zero_are_the_jepa_off_twin(jgenomes, tmp_path, monkeypatch):
+    """--jepa-block-share at --jepa-weight 0: the same blocks hidden from the same inputs as the run with JEPA on
+    and --jepa-reg-own-stream (SIGReg's directions off the global stream), and no target, predictor or jepa.csv, so
+    the pair differs in the latent loss alone."""
+    root = jgenomes["root"]
+    base = SMALLJ + RECIPE + ["--steps", "8", "--eval-every", "4", "--batch-size", "4",
+                              "--jepa-block-share", "0.25", "--jepa-block-len", "256:1024"]
+    stub_jepa(monkeypatch)
+    from kron_dna import cli as new
+    blocks = {"on": [], "off": []}
+    which = ["on"]
+    real = G.block_mask
+
+    def spy(*a, **k):
+        out = real(*a, **k)
+        blocks[which[0]].append(out)
+        return out
+
+    monkeypatch.setattr(G, "block_mask", spy)
+    res1, ev1 = run(new, monkeypatch, root, tmp_path / "on", base + JEPA + ["--jepa-reg-own-stream"])
+    assert res1.exit_code == 0, res1.output + repr(res1.exception)
+    which[0] = "off"
+    res0, ev0 = run(new, monkeypatch, root, tmp_path / "off", base + ["--jepa-weight", "0"])
+    assert res0.exit_code == 0, res0.output + repr(res0.exception)
+    assert len(blocks["off"]) == len(blocks["on"]) == 8
+    assert all(np.array_equal(a, b) for a, b in zip(blocks["off"], blocks["on"]))
+    on_train = [e for e in ev1 if e[0] == "forward" and e[1]]
+    off_train = [e for e in ev0 if e[0] == "forward" and e[1]]
+    assert len(off_train) == 8                                              # online passes only: no target
+    assert len(on_train) == 8 and len([e for e in ev1 if e[0] == "forward"]) > len([e for e in ev0 if e[0] == "forward"])
+    assert all(torch.equal(a[3], b[3]) and torch.equal(a[4], b[4]) for a, b in zip(off_train, on_train))
+    assert not (tmp_path / "off" / "jepa.csv").exists()
+    assert "block JEPA: 0.25 of each row's bins hidden" in " ".join(res0.output.split())

@@ -82,6 +82,10 @@ class KronGenomeConfig:
     local_span: int = 8192      # the local track's state restarts every this many bases (bounded memory)
     chunk_length_feature: bool = False  # with chunking: tell the core each chunk's log-length (time-aware gating)
     jepa: bool = False          # a predictor of an EMA target's core states from the masked input's (JEPA-DNA)
+    jepa_pred_kind: str = "mlp"  # the JEPA predictor: "mlp" (per bin, as before) or "context" (a mask embedding
+                                # at hidden bins, then bidirectional KronLSTM layers over the core states and a residual
+                                # readout that starts as the identity, so it begins as the masked core: JepaContextPredictor)
+    jepa_pred_layers: int = 2   # context: KronLSTM layers of the predictor
     n_contexts: int = 0         # v2: learned context embeddings added to the core's input bins: 0 nuclear, else
                                 # the organelle's NCBI genetic code table (2 vertebrate mito, 5 invertebrate, ...)
     n_ntv3: int = 0             # quantitative per-base assay tracks (NTv3 bigwigs): one output per track, predicted
@@ -103,6 +107,43 @@ class KronGenomeConfig:
 
     def to_dict(self) -> dict:
         return asdict(self)
+
+
+class JepaContextPredictor(nn.Module):
+    """A JEPA predictor that reads context (genome-train --jepa-pred context): a learned mask embedding is added at the
+    hidden bins, ``layers`` bidirectional KronLSTM blocks run over the core states of each packed row, and a residual
+    readout zero-initialised, so at the start it returns the core states as they are (the masked core, the
+    baseline it must beat)."""
+
+    def __init__(self, c: "KronGenomeConfig") -> None:
+        super().__init__()
+        self.mask = nn.Parameter(torch.zeros(c.d_model))
+        self.layers = nn.ModuleList(BiKronLSTMBlock(c.d_model, c.n_heads, c.ff_units, c.dropout, c.n_layers + i)
+                                    for i in range(c.jepa_pred_layers))
+        self.out_norm = nn.RMSNorm(c.d_model, eps=1e-5)
+        self.out = nn.Linear(c.d_model, c.d_model)
+        nn.init.zeros_(self.out.weight)
+        nn.init.zeros_(self.out.bias)
+
+    def forward(self, core: torch.Tensor, cu: torch.Tensor, hidden: torch.Tensor | None = None) -> torch.Tensor:
+        h = core if hidden is None else core + hidden.unsqueeze(-1).to(core.dtype) * self.mask.to(core.dtype)
+        for layer in self.layers:
+            h = layer(h, cu)
+        return core + self.out(self.out_norm(h))
+
+
+def make_jepa_predictor(c: "KronGenomeConfig") -> nn.Module | None:
+    """The config's JEPA predictor, or None without ``jepa``."""
+    if not c.jepa:
+        return None
+    if c.jepa_pred_kind == "context":
+        if c.arch == "v3" or c.chunk_ratio:
+            raise ValueError("jepa_pred_kind context needs arch v1, v2 or v2l without learned chunking")
+        return JepaContextPredictor(c)
+    if c.jepa_pred_kind != "mlp":
+        raise ValueError(f"jepa_pred_kind must be mlp or context, got {c.jepa_pred_kind!r}")
+    return nn.Sequential(nn.RMSNorm(c.d_model, eps=1e-5), nn.Linear(c.d_model, 2 * c.d_model), nn.GELU(),
+                         nn.Linear(2 * c.d_model, c.d_model))
 
 
 def one_hot(seq: torch.Tensor) -> torch.Tensor:
@@ -216,6 +257,29 @@ class ChannelRMSNorm(nn.Module):
         return (x32 * torch.rsqrt(x32.pow(2).mean(1, keepdim=True) + self.eps)).to(x.dtype) * self.weight[:, None]
 
 
+# genome-train --lean-convs: the same function with less kept for backward. Norm+GELU is recomputed in backward
+# (non-reentrant checkpoint: only its input is saved, not the fp32 copy, the cast-back and the scaled copy, nor GELU's
+# input), and pooling takes the max of even and odd positions (no int64 index tensor; at exact ties the gradient is
+# split instead of going to the first). Set by the CLI; parameters and checkpoints are unchanged.
+LEAN_CONV = False
+
+
+def norm_act(norm: nn.Module, x: torch.Tensor, act: bool = True) -> torch.Tensor:
+    """``gelu(norm(x))`` (or ``norm(x)`` with ``act=False``), recomputed in backward under ``LEAN_CONV``."""
+    f = (lambda t: F.gelu(norm(t))) if act else norm
+    if LEAN_CONV and torch.is_grad_enabled() and x.requires_grad:
+        return torch.utils.checkpoint.checkpoint(f, x, use_reentrant=False)
+    return f(x)
+
+
+def pool2(x: torch.Tensor) -> torch.Tensor:
+    """``max_pool1d(x, 2)``; under ``LEAN_CONV`` without the index tensor."""
+    if not LEAN_CONV:
+        return F.max_pool1d(x, 2)
+    n = x.shape[-1] - x.shape[-1] % 2
+    return torch.maximum(x[..., 0:n:2], x[..., 1:n:2])
+
+
 class ConvBlock2(nn.Module):
     """v2: two pre-norm k=5 convolutions with GELU and one residual (NTv3's encoder block), per-position norm."""
 
@@ -226,8 +290,8 @@ class ConvBlock2(nn.Module):
         self.skip = nn.Conv1d(c_in, c_out, 1) if c_in != c_out else nn.Identity()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        h = self.conv1(F.gelu(self.norm1(x)))
-        return self.skip(x) + self.conv2(F.gelu(self.norm2(h)))
+        h = self.conv1(norm_act(self.norm1, x))
+        return self.skip(x) + self.conv2(norm_act(self.norm2, h))
 
 
 class ResConv(nn.Module):
@@ -240,7 +304,7 @@ class ResConv(nn.Module):
         self.skip = nn.Conv1d(c_in, c_out, 1) if c_in != c_out else nn.Identity()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.skip(x) + self.conv(F.gelu(self.norm(x)))
+        return self.skip(x) + self.conv(norm_act(self.norm, x))
 
 
 class MLPHead(nn.Module):
@@ -251,7 +315,7 @@ class MLPHead(nn.Module):
         self.norm, self.fc1, self.fc2 = ChannelRMSNorm(c_in), nn.Conv1d(c_in, hidden, 1), nn.Conv1d(hidden, c_out, 1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.fc2(F.gelu(self.fc1(self.norm(x))))
+        return self.fc2(F.gelu(self.fc1(norm_act(self.norm, x, act=False))))
 
 
 class KronHead(nn.Module):
@@ -333,8 +397,8 @@ class KronGenome(nn.Module):
         self.last_ntv3 = None
         self._init_xheads(c, widths[0])
         self.context = nn.Embedding(c.n_contexts, c.d_model) if c.n_contexts else None
-        self.jepa_pred = nn.Sequential(nn.RMSNorm(c.d_model, eps=1e-5), nn.Linear(c.d_model, 2 * c.d_model), nn.GELU(),
-                                       nn.Linear(2 * c.d_model, c.d_model)) if c.jepa else None
+        self.jepa_pred = make_jepa_predictor(c)
+        self.jepa_hidden, self.jepa_decode_pred = None, False
         self.last_jepa = None
         if c.n_epigenomes:
             hid = 256
@@ -518,8 +582,8 @@ class KronGenome(nn.Module):
         self.context = nn.Embedding(c.n_contexts, c.d_model) if c.n_contexts else None
         if self.context is not None:
             nn.init.zeros_(self.context.weight)
-        self.jepa_pred = nn.Sequential(nn.RMSNorm(c.d_model, eps=1e-5), nn.Linear(c.d_model, 2 * c.d_model), nn.GELU(),
-                                       nn.Linear(2 * c.d_model, c.d_model)) if c.jepa else None
+        self.jepa_pred = make_jepa_predictor(c)
+        self.jepa_hidden, self.jepa_decode_pred = None, False
         self.last_jepa = self.last_epi = self.last_ratio_loss = self.last_chunks = None
         self.checkpoint_core = False
         if c.n_epigenomes:
@@ -621,9 +685,9 @@ class KronGenome(nn.Module):
         core = self.run_core(h.reshape(1, b * bins, -1), cu,
                              checkpoint=self.checkpoint_core and torch.is_grad_enabled()).reshape(b, bins, -1)
         # inside forward, so data-parallel training syncs the predictor's gradients
-        self.last_jepa = self.jepa_pred(core) if self.jepa_pred is not None and self.training else None
+        self.last_jepa = self.predict_jepa(core, cu) if self.jepa_pred is not None and self.training else None
         self.last_epi = self.epigenome_logits(core) if self.config.n_epigenomes else None
-        x = self.add_local(self.decode(core.transpose(1, 2), skips), skips)
+        x = self.add_local(self.decode(self.core_to_decode(core).transpose(1, 2), skips), skips)
         tracks = self.tracks(x).transpose(1, 2) if self.tracks is not None else None   # [B, L, n_tracks]
         self.last_ntv3 = self.ntv3(x).transpose(1, 2) if self.ntv3 is not None else None
         self.last_x, self.last_x_at = self.run_xheads(x)
@@ -705,16 +769,46 @@ class KronGenome(nn.Module):
         if self.config.arch == "v2l":              # stem branch at 1 bp, pool, then the tower (pool after each block)
             x = self.stem_res(x)
             skips = [x]
-            x = F.max_pool1d(x, 2)
+            x = pool2(x)
             for block in self.down:
                 skips.append(x)
-                x = F.max_pool1d(block(x), 2)
+                x = pool2(block(x))
             return x, skips
         skips = []
         for block in self.down:
             skips.append(x)
-            x = F.max_pool1d(block(x), 2)
+            x = pool2(block(x))
         return x, skips
+
+    jepa_gate = 1.0                     # genome-train --jepa-gate: share of the predictor's gradient into the core
+    jepa_skip_cut = False               # genome-train --jepa-skip-cut: the latent loss reads ``last_jepa_loss``
+    last_jepa_loss = None
+
+    def predict_jepa(self, core: torch.Tensor, cu: torch.Tensor | None = None) -> torch.Tensor:
+        """The JEPA predictor on core states ``[B, bins, d]``: per bin (``mlp``), or reading the packed rows ``cu`` with
+        the hidden bins ``self.jepa_hidden`` [B, bins] bool (None: no mask embedding) marked (``context``).
+
+        ``jepa_gate`` a < 1 feeds it ``sg(core) + a (core - sg(core))``: the same values, a times the gradient into
+        the core. ``last_jepa_loss`` is the prediction without the derivative of the identity skip (``p +
+        sg(x) - x`` for the predictor's input x), what the latent loss reads under ``jepa_skip_cut``; the returned
+        prediction (the decoder's, with --jepa-decode-pred) keeps it."""
+        x = core if self.jepa_gate >= 1.0 else core.detach() + self.jepa_gate * (core - core.detach())
+        if isinstance(self.jepa_pred, JepaContextPredictor):
+            if cu is None:
+                b_, n_ = core.shape[:2]
+                cu = torch.arange(0, b_ * n_ + 1, n_, device=core.device, dtype=torch.int32)
+            p = self.jepa_pred(x, cu, self.jepa_hidden)
+        else:
+            p = self.jepa_pred(x)
+        self.last_jepa_loss = p + (x.detach() - x) if self.jepa_skip_cut else None
+        return p
+
+    def core_to_decode(self, core: torch.Tensor) -> torch.Tensor:
+        """The core states the decoder reads: ``core``, or with ``jepa_decode_pred`` (genome-train --jepa-decode-pred,
+        training only) the predictor's states at the hidden bins, so the decoder and the heads train on them."""
+        if not (self.training and self.jepa_decode_pred and self.last_jepa is not None and self.jepa_hidden is not None):
+            return core
+        return torch.where(self.jepa_hidden.unsqueeze(-1), self.last_jepa.to(core.dtype), core)
 
     def run_core(self, h: torch.Tensor, cu: torch.Tensor, checkpoint: bool = False) -> torch.Tensor:
         """The KronLSTM core over ``[1, N, d_model]`` packed bins; ``checkpoint`` recomputes each layer in backward."""
@@ -795,7 +889,8 @@ class KronGenome(nn.Module):
         return outs
 
     #: what a piece of a split window runs on its own device (see :meth:`forward_split`)
-    SPLIT_LOCAL = ("stem", "stem_res", "down", "up", "up2", "skip_proj", "head", "tracks", "ntv3", "xheads")
+    SPLIT_LOCAL = ("stem", "stem_res", "down", "up", "up2", "skip_proj", "head", "tracks", "ntv3", "xheads",
+                   "local_in", "local_core", "local_out")     # the local track runs on each piece's card too
 
     def split_replica(self, device, force: bool = False) -> "KronGenome":
         """A shallow copy of this model for :meth:`forward_split` whose conv path and per-base heads read
@@ -841,9 +936,9 @@ class KronGenome(nn.Module):
         the first device. ``last_jepa``/``last_epi`` are set as by forward; ``last_ntv3`` is None (it is in the
         pieces; :func:`gather_split` joins them). ``core_only``: stop after the core (no decoder, no heads)."""
         c = self.config
-        if c.arch not in ("v2", "v2l") or c.chunk_ratio or c.local_width:
-            raise ValueError("forward_split needs arch v2 or v2l without learned chunking or a local track (v1's "
-                             "GroupNorm takes statistics over the whole window, so a piece would see other ones)")
+        if c.arch not in ("v2", "v2l") or c.chunk_ratio:
+            raise ValueError("forward_split needs arch v2 or v2l without learned chunking (v1's GroupNorm takes "
+                             "statistics over the whole window, so a piece would see other ones)")
         devices = [_device(d) for d in devices]
         dev0 = next(self.parameters()).device
         if devices[0] != dev0:
@@ -851,7 +946,9 @@ class KronGenome(nn.Module):
         b, length = seq.shape[0], seq.shape[-1]
         unit = 2 ** c.n_down
         halo = split_halo(c) if halo is None else int(halo)
-        plan = split_plan(b, length, len(devices), unit, halo, by)
+        # a local track restarts every local_span bases: pieces cut there hold whole segments of it (exact)
+        plan = split_plan(b, length, len(devices), unit, halo, by,
+                          **({"align": c.local_span} if c.local_width else {}))
         by = plan[0][0]
         reps = {}
         enc = []                                                      # per piece: (skips, its core-input bins)
@@ -878,17 +975,18 @@ class KronGenome(nn.Module):
         cu = torch.cat([starts, torch.tensor([flat.numel()], device=dev0)]).to(torch.int32)
         core = self.run_core(h.reshape(1, b * bins, -1), cu,
                              checkpoint=self.checkpoint_core and torch.is_grad_enabled()).reshape(b, bins, -1)
-        self.last_jepa = self.jepa_pred(core) if self.jepa_pred is not None and self.training else None
+        self.last_jepa = self.predict_jepa(core, cu) if self.jepa_pred is not None and self.training else None
         self.last_epi = self.epigenome_logits(core) if self.config.n_epigenomes else None
         self.last_ntv3 = None
         self.last_x = {}
         if core_only:
             return [], core
         pieces = []
+        core_dec = self.core_to_decode(core)
         for k, (_, rows, start, end, lo, hi) in enumerate(plan):
             d, r = devices[k], reps[devices[k]]
             skips = enc[k][0]
-            y = r.decode(core[rows, lo // unit:hi // unit].transpose(1, 2).to(d), skips)
+            y = r.add_local(r.decode(core_dec[rows, lo // unit:hi // unit].transpose(1, 2).to(d), skips), skips)
             y = y[:, :, start - lo:end - lo]                          # heads are per position: crop first
             pieces.append(SplitPiece(rows=rows, start=start, end=end, device=d, logits=r.head(y).transpose(1, 2),
                                      tracks=r.tracks(y).transpose(1, 2) if r.tracks is not None else None,
@@ -1251,18 +1349,34 @@ def split_halo(config: KronGenomeConfig) -> int:
     return -(-split_reach(config) // unit) * unit
 
 
-def split_plan(batch: int, length: int, n: int, unit: int, halo: int, by: str | None = None) -> list[tuple]:
+def split_plan(batch: int, length: int, n: int, unit: int, halo: int, by: str | None = None,
+               align: int = 0) -> list[tuple]:
     """``n`` pieces of a ``[batch, length]`` window: ``(by, rows, start, end, lo, hi)`` each, where the piece owns
     bases ``start:end`` of ``rows`` and is encoded over ``lo:hi`` (its stretch plus ``halo`` each side, clipped
     to the window). ``by``: "rows" (whole windows, no halo; needs ``batch % n == 0``), "length" (contiguous
     stretches on ``unit`` boundaries), None: rows when the batch divides evenly, else length; or "balanced"
     (--short-sources pack, whose packs may hold an odd number of short rows): rows when the batch divides
     evenly, else whichever of uneven whole rows (``ceil(batch / n)`` rows on the busiest piece, no halo) and
-    length pieces (with their halo) puts fewer encoded bases on the busiest piece; ties go to length."""
+    length pieces (with their halo) puts fewer encoded bases on the busiest piece; ties go to length.
+    ``align`` > 0 (a local track's restart span): length pieces are cut at multiples of ``align`` and the halo is
+    rounded up to one, so each piece's own stretch holds whole recurrent segments of the track; a window whose
+    length is not a multiple of ``align`` is then split by rows only."""
     if n < 1:
         raise ValueError("split over at least one device")
     if length % unit or halo % unit or halo < 0:
         raise ValueError(f"length and halo must be non-negative multiples of {unit}")
+    if align:
+        if align % unit:
+            raise ValueError(f"align must be a multiple of {unit}")
+        halo = -(-halo // align) * align
+        if length % align or length // align < n:
+            if by == "length" or batch < n:
+                raise ValueError(f"a local track restarting every {align} bases cannot split a {length}-base window "
+                                 f"into {n} pieces by length")
+            if batch % n == 0 or by == "balanced":
+                edges = [round(i * batch / n) for i in range(n + 1)]
+                return [("rows", slice(a, b), 0, length, 0, length) for a, b in zip(edges[:-1], edges[1:])]
+        unit = align
     if by == "balanced":
         if batch % n == 0:
             by = "rows"

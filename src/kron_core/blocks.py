@@ -16,6 +16,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from kron_core import triton_lock
+
+triton_lock.install()       # split-card backward threads must not tune one kernel at once (see triton_lock)
+
 class SwiGLU(nn.Module):
     def __init__(self, d_model: int, hidden: int, dropout: float) -> None:
         super().__init__()
