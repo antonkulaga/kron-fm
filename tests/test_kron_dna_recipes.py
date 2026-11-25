@@ -77,7 +77,7 @@ def test_genome_sh_submits_the_resolved_recipe(tmp_path):
     (bin_ / "uv").chmod(0o755)
     env = dict(os.environ, PATH=f"{bin_}:{os.environ['PATH']}", KRON_GPU_PARTITION="gpus", KRON_ACCOUNT="acct",
                KRON_FM_DATA=str(tmp_path / "data"), LOG_DIR=str(tmp_path / "logs"), SBATCH_LOG=str(tmp_path / "sb"),
-               COMMENT="seat=x; what=test", NODE="n1", PYTHONPATH=str(repo / "src"),
+               COMMENT="seat=x; what=test", NODE="n1", KRON_NO_ENV_LOCAL="1", PYTHONPATH=str(repo / "src"),
                HOME=str(tmp_path))      # env.sh puts ~/.local/bin (a real uv) first
     res = subprocess.run(["bash", str(repo / "slurm" / "genome.sh"), "G", str(tmp_path / "runs" / "G"), "--cards", "2",
                           "--edits", "--", "--stop-step", "10"], env=env, capture_output=True, text=True)
