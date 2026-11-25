@@ -94,7 +94,7 @@ class KronGenomeConfig:
                                 # dosage, methylation, ...): zero-initialised stem weights, so absent = zero = today
     xheads: list = field(default_factory=list)   # further heads, each its own module: [name, outputs] or
                                 # [name, outputs, bin] in registration order (v2/v2l). bin 1 (default) predicts per
-                                # base; bin k (a power of two up to 2**n_down) predicts per k bases from the mean of
+                                # base; bin k (a power of two up to 1024; may exceed 2**n_down) predicts per k bases from the mean of
                                 # the decoder states over them, so memory falls k-fold and thousands of outputs fit.
                                 # A head added to a trained model is new parameters only; the inherited heads keep
                                 # their keys, shapes and outputs
@@ -144,6 +144,16 @@ def make_jepa_predictor(c: "KronGenomeConfig") -> nn.Module | None:
         raise ValueError(f"jepa_pred_kind must be mlp or context, got {c.jepa_pred_kind!r}")
     return nn.Sequential(nn.RMSNorm(c.d_model, eps=1e-5), nn.Linear(c.d_model, 2 * c.d_model), nn.GELU(),
                          nn.Linear(2 * c.d_model, c.d_model))
+
+
+MAX_HEAD_BIN = 1024
+
+
+def grid_of(config: KronGenomeConfig) -> int:
+    """The bases every window, split piece and head span must be a multiple of: the core's step (``2**n_down``),
+    or the widest further head's bin when that is wider. A core at 32 bp with track heads at 128 bp has a grid of
+    128: the heads average decoder states over whole bins wherever the core's own steps fall."""
+    return max([2 ** config.n_down] + [int(h[2]) for h in config.xheads if len(h) > 2])
 
 
 def one_hot(seq: torch.Tensor) -> torch.Tensor:
@@ -317,6 +327,21 @@ class MLPHead(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.fc2(F.gelu(self.fc1(norm_act(self.norm, x, act=False))))
 
+    def at(self, x: torch.Tensor, where: torch.Tensor | None) -> torch.Tensor:
+        """The head's outputs ``[B, out, L]`` computed only at the positions ``where`` (``[B, L]`` bool) and zero
+        elsewhere; ``where`` None: everywhere. The head is per position, so the selected outputs are those of
+        ``forward``; its hidden layer (the wide tensor) exists only for the selected positions, which is the point:
+        a loss on 15 % of a million bases then pays for 15 % of the head."""
+        if where is None:
+            return self(x)
+        cols = x.transpose(1, 2)[where]                                # [N, C]: the selected positions' states
+        out = x.new_zeros(x.shape[0], x.shape[2], self.fc2.out_channels)
+        if cols.shape[0]:
+            got = self(cols.t().unsqueeze(0))[0].t()                   # [N, out]
+            out = out.to(got.dtype)
+            out[where] = got
+        return out.transpose(1, 2)
+
 
 class KronHead(nn.Module):
     """A per-base linear readout plus ``layers`` bidirectional KronLSTM layers over ``bin``-base means of the states
@@ -439,8 +464,8 @@ class KronGenome(nn.Module):
         if c.xheads and (c.arch not in ("v2", "v2l") or c.chunk_ratio):      # a local track is fine: it is added to the
             raise ValueError("xheads need arch v2 or v2l without learned chunking")   # decoder's output the heads read
         for n, _, b in rows:
-            if b < 1 or b & (b - 1) or b > 2 ** c.n_down:
-                raise ValueError(f"xhead {n}: bin {b} must be a power of two up to {2 ** c.n_down}")
+            if b < 1 or b & (b - 1) or b > MAX_HEAD_BIN:      # wider than the core's step is fine (grid_of): a core
+                raise ValueError(f"xhead {n}: bin {b} must be a power of two up to {MAX_HEAD_BIN}")   # at 32 bp, tracks at 128
         if c.xhead_kind == "mlp":
             hidden = c.xhead_hidden or c.head_hidden or 2 * width
             self.xheads = nn.ModuleDict({n: MLPHead(width, hidden, k) for n, k, _ in rows})
@@ -451,8 +476,8 @@ class KronGenome(nn.Module):
                                  f"width {c.xhead_width} a multiple of 4 in [64, 1024] (4 KronLSTM heads of 16-256)")
             # a binned head reads bin means; its KronLSTM steps over xhead_bin bases, or one bin when the bin is wider
             step = {n: max(1, kb // b) for n, _, b in rows}
-            for n, _, b in rows:                      # a span is a multiple of 2**n_down: whole steps in every bin
-                if b * step[n] > 2 ** c.n_down:
+            for n, _, b in rows:                      # a span is a multiple of grid_of: whole steps in every bin
+                if b * step[n] > max(2 ** c.n_down, b):
                     raise ValueError(f"xhead {n}: bin {b} x KronLSTM step {step[n]} exceeds {2 ** c.n_down} bases")
             self.xheads = nn.ModuleDict({n: KronHead(width, k, step[n], c.xhead_width, c.xhead_layers)
                                          for n, k, _ in rows})
@@ -461,6 +486,11 @@ class KronGenome(nn.Module):
         self.xhead_bin = {n: b for n, _, b in rows}
         self.x_active: set[str] | None = None
         self.checkpoint_xheads = False                # recompute each head's inside in backward (not saved)
+        # where the per-base MLP heads run (not saved): [B, L] bool masks of the window, or None for every base. The
+        # masked-base head needs its outputs only at masked bases, the NTv3 head only where a track is supervised;
+        # elsewhere the outputs are zero and must not enter a loss (MLPHead.at)
+        self.head_at: torch.Tensor | None = None
+        self.ntv3_at: torch.Tensor | None = None
         self.x_span: tuple[int, int] | None = None    # window bases the heads run on (not saved; a multiple of
         self.last_x: dict[str, torch.Tensor] = {}     # 2**n_down at both ends); last_x_at: the bases last_x covers
         self.last_x_at: tuple[int, int] = (0, 0)
@@ -486,6 +516,9 @@ class KronGenome(nn.Module):
             if hi == lo:                                  # nothing of the span in this stretch
                 out[n] = x.new_zeros(x.shape[0], 0, h.n_out if isinstance(h, KronHead) else h.fc2.out_channels)
                 continue
+            if (lo % b) or ((hi - lo) % b):               # a cut bin would be averaged over fewer bases, or dropped
+                raise ValueError(f"xhead {n}: bases {lo}:{hi} are not whole bins of {b} (windows, split pieces and "
+                                 f"spans must be multiples of {grid_of(self.config)})")
             if b not in pooled:
                 pooled[b] = F.avg_pool1d(x, b)
             if self.checkpoint_xheads and torch.is_grad_enabled():    # keep the input and output, recompute inside
@@ -689,9 +722,18 @@ class KronGenome(nn.Module):
         self.last_epi = self.epigenome_logits(core) if self.config.n_epigenomes else None
         x = self.add_local(self.decode(self.core_to_decode(core).transpose(1, 2), skips), skips)
         tracks = self.tracks(x).transpose(1, 2) if self.tracks is not None else None   # [B, L, n_tracks]
-        self.last_ntv3 = self.ntv3(x).transpose(1, 2) if self.ntv3 is not None else None
+        self.last_ntv3 = self._base_head(self.ntv3, x, self.ntv3_at) if self.ntv3 is not None else None
         self.last_x, self.last_x_at = self.run_xheads(x)
-        return self.head(x).transpose(1, 2), core, tracks
+        return self._base_head(self.head, x, self.head_at), core, tracks
+
+    @staticmethod
+    def _base_head(head: nn.Module, x: torch.Tensor, where: torch.Tensor | None, rows=slice(None), start: int = 0
+                   ) -> torch.Tensor:
+        """A per-base head on decoder states ``x`` [B, C, n] that cover window bases ``start:start + n`` of ``rows``:
+        ``[B, n, out]``, computed only where the window mask ``where`` says (MLP heads; a conv head runs everywhere)."""
+        if where is None or not isinstance(head, MLPHead):
+            return head(x).transpose(1, 2)
+        return head.at(x, where[rows][:, start:start + x.shape[-1]].to(x.device)).transpose(1, 2)
 
     def _forward_chunked(self, h: torch.Tensor, skips: list[torch.Tensor], segments: torch.Tensor | None):
         """H-Net dynamic chunking between the encoder and the core: a boundary probability per position from the
@@ -843,7 +885,7 @@ class KronGenome(nn.Module):
         that start at ``train_at``: returns per chunk ``(logits [1, len, 4], tracks [1, len, n_tracks] or None)``.
         Memory grows with the contig only at bin resolution. The encoder's GroupNorm takes its statistics per
         chunk, as training on windows of ``chunk`` bases does, so a chunk of the window length matches training."""
-        unit = 2 ** self.config.n_down
+        unit = 2 ** self.config.n_down       # no further heads on this path: the core's own step is the unit
         length = seq.shape[-1]
         if length % unit or chunk % unit or halo % unit:
             raise ValueError(f"length, chunk and halo must be multiples of {unit}")
@@ -944,7 +986,7 @@ class KronGenome(nn.Module):
         if devices[0] != dev0:
             raise ValueError(f"the first split device must be the model's own ({dev0}), got {devices[0]}")
         b, length = seq.shape[0], seq.shape[-1]
-        unit = 2 ** c.n_down
+        unit, step = grid_of(c), 2 ** c.n_down       # pieces are cut on the grid; the core counts its own steps
         halo = split_halo(c) if halo is None else int(halo)
         # a local track restarts every local_span bases: pieces cut there hold whole segments of it (exact)
         plan = split_plan(b, length, len(devices), unit, halo, by,
@@ -959,8 +1001,8 @@ class KronGenome(nn.Module):
             piece = seq[rows][..., lo:hi].to(d)
             piece_x = None if extra is None else extra[rows][..., lo:hi].to(d)
             x, skips = reps[d].encode(piece, piece_x)
-            a = (start - lo) // unit
-            enc.append((None if core_only else skips, x[:, :, a:a + (end - start) // unit].to(dev0)))
+            a = (start - lo) // step
+            enc.append((None if core_only else skips, x[:, :, a:a + (end - start) // step].to(dev0)))
         x = torch.cat([e[1] for e in enc], 2 if by == "length" else 0)
         h = x.transpose(1, 2)                                         # [B, bins, d_model], as in forward
         if self.context is not None:
@@ -986,11 +1028,13 @@ class KronGenome(nn.Module):
         for k, (_, rows, start, end, lo, hi) in enumerate(plan):
             d, r = devices[k], reps[devices[k]]
             skips = enc[k][0]
-            y = r.add_local(r.decode(core_dec[rows, lo // unit:hi // unit].transpose(1, 2).to(d), skips), skips)
+            y = r.add_local(r.decode(core_dec[rows, lo // step:hi // step].transpose(1, 2).to(d), skips), skips)
             y = y[:, :, start - lo:end - lo]                          # heads are per position: crop first
-            pieces.append(SplitPiece(rows=rows, start=start, end=end, device=d, logits=r.head(y).transpose(1, 2),
+            pieces.append(SplitPiece(rows=rows, start=start, end=end, device=d,
+                                     logits=self._base_head(r.head, y, self.head_at, rows, start),
                                      tracks=r.tracks(y).transpose(1, 2) if r.tracks is not None else None,
-                                     ntv3=r.ntv3(y).transpose(1, 2) if r.ntv3 is not None else None,
+                                     ntv3=(self._base_head(r.ntv3, y, self.ntv3_at, rows, start)
+                                           if r.ntv3 is not None else None),
                                      **dict(zip(("x", "x_at"), self.run_xheads(y, r.xheads, at=start)))))
             enc[k] = None                                             # drop this function's hold on the skips
         return pieces, core
@@ -1344,8 +1388,8 @@ def split_reach(config: KronGenomeConfig) -> int:
 
 
 def split_halo(config: KronGenomeConfig) -> int:
-    """The default halo of :meth:`KronGenome.forward_split`: :func:`split_reach` rounded up to 2**n_down."""
-    unit = 2 ** config.n_down
+    """The default halo of :meth:`KronGenome.forward_split`: :func:`split_reach` rounded up to the grid."""
+    unit = grid_of(config)
     return -(-split_reach(config) // unit) * unit
 
 

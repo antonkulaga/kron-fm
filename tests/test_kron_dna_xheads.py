@@ -158,10 +158,35 @@ def test_a_binned_head_reads_the_mean_state_of_each_bin(device, monkeypatch, arc
     del probe
 
 
-@pytest.mark.parametrize("bad", [3, 0, 32])
-def test_a_bin_must_be_a_power_of_two_within_the_core_step(bad):
-    with pytest.raises(ValueError):                                  # small(): n_down 4, so bins up to 16
+@pytest.mark.parametrize("bad", [3, 0, 2048])
+def test_a_bin_must_be_a_power_of_two_up_to_the_limit(bad):
+    with pytest.raises(ValueError):
         with_heads(small("v2"), [["x", 2, bad]])
+
+
+@pytest.mark.parametrize("kind", ["mlp", "kron"])
+def test_a_head_bin_wider_than_the_core_step(device, monkeypatch, kind):
+    """A core at 16 bp (small(): n_down 4) with a head at 64 bp: the grid is 64; the head reads the mean decoder
+    state of each 64 bases; a window split over two devices gives the unsplit outputs; a span that cuts a bin is
+    refused."""
+    forced_replicas(monkeypatch)
+    m = with_heads(small("v2", xhead_kind=kind, xhead_bin=16, xhead_width=64), [["base", 3], ["wide", 3, 64]]).to(device).eval()
+    assert G.grid_of(m.config) == 64 and G.split_halo(m.config) % 64 == 0
+    seq, seg, ctx, extra = batch_for(2, 2048, device)
+    with torch.no_grad():
+        m(seq, seg, ctx, extra)
+        whole = {k: v.clone() for k, v in m.last_x.items()}
+        assert whole["wide"].shape == (2, 2048 // 64, 3) and whole["base"].shape == (2, 2048, 3)
+        pieces, _ = m.forward_split(seq, seg, ctx, extra, devices=[device, device], by="length")
+        got = torch.zeros_like(whole["wide"])
+        for p in pieces:
+            assert p.start % 64 == 0 and p.end % 64 == 0
+            got[p.rows, p.start // 64:p.end // 64] = p.x["wide"].to(device)
+    if kind == "mlp":                # a kron head's context is the stretch it is given: each piece, by design
+        assert torch.allclose(got, whole["wide"], atol=2e-4, rtol=2e-4)
+    m.x_span = (32, 1024)                                            # cuts the first 64-base bin
+    with pytest.raises(ValueError), torch.no_grad():
+        m(seq, seg, ctx, extra)
 
 
 # ---------------------------------------------------------------------------------------- KronLSTM heads (kind kron)
@@ -219,8 +244,7 @@ def test_kron_heads_read_context_beyond_one_step_and_run_on_the_span(device):
 def test_kron_head_settings_are_checked(kw):
     with pytest.raises(ValueError):
         kron_heads(small("v2"), [["x", 2]], **kw)
-    with pytest.raises(ValueError):                                  # a bin wider than the 16-base core step
-        kron_heads(small("v2"), [["x", 2, 32]])
+    assert G.grid_of(kron_heads(small("v2"), [["x", 2, 32]]).config) == 32    # wider than the core step: allowed
 
 
 
@@ -360,3 +384,44 @@ def test_species_stores_share_matching_channels_and_append_the_rest(tmp_path):
     assert b.ids == ["donor_plus", "donor_minus"] and b.positives.tolist() == [2, 4]
     with pytest.raises(ValueError, match="one kind"):
         XH.SpeciesStores(hs, {"mm": lab_m})
+
+
+def test_base_heads_run_only_where_asked(device, monkeypatch):
+    """The masked-base and NTv3 heads computed at selected bases only: there the outputs and the gradients are
+    those of the full forward, elsewhere the outputs are zero; the same through a window split over two devices."""
+    forced_replicas(monkeypatch)
+    m = small("v2").to(device).train()
+    for mod in m.modules():                                          # no dropout: the two forwards must agree
+        if isinstance(mod, torch.nn.Dropout):
+            mod.p = 0.0
+    seq, seg, ctx, extra = batch_for(2, 1024, device)
+    g = torch.Generator().manual_seed(3)
+    lm_at = (torch.rand(2, 1024, generator=g) < 0.15).to(device)
+    nt_at = (torch.rand(2, 1024, generator=g) < 0.4).to(device)
+    full, _, _ = m(seq, seg, ctx, extra)
+    full_nt = m.last_ntv3
+    (full[lm_at].float().pow(2).sum() + full_nt[nt_at].float().pow(2).sum()).backward()
+    want = {n: p.grad.clone() for n, p in m.named_parameters() if p.grad is not None}
+    m.zero_grad()
+    m.head_at, m.ntv3_at = lm_at, nt_at
+    part, _, _ = m(seq, seg, ctx, extra)
+    part_nt = m.last_ntv3
+    assert part.shape == full.shape and part_nt.shape == full_nt.shape
+    assert torch.allclose(part[lm_at], full[lm_at], atol=1e-5) and float(part[~lm_at].abs().max()) == 0.0
+    assert torch.allclose(part_nt[nt_at], full_nt[nt_at], atol=1e-5) and float(part_nt[~nt_at].abs().max()) == 0.0
+    (part[lm_at].float().pow(2).sum() + part_nt[nt_at].float().pow(2).sum()).backward()
+    for n, p in m.named_parameters():
+        if n in want:
+            assert torch.allclose(p.grad, want[n], atol=1e-4, rtol=1e-3), n
+    with torch.no_grad():                                            # and through the split
+        pieces, _ = m.forward_split(seq, seg, ctx, extra, devices=[device, device], by="length")
+        for p in pieces:
+            sel = lm_at[p.rows, p.start:p.end]
+            assert torch.allclose(p.logits.to(device)[sel], part[p.rows, p.start:p.end][sel].detach(), atol=2e-4)
+            assert float(p.logits.to(device)[~sel].abs().max()) == 0.0
+            sel = nt_at[p.rows, p.start:p.end]
+            assert float(p.ntv3.to(device)[~sel].abs().max()) == 0.0
+    m.head_at = m.ntv3_at = None
+    with torch.no_grad():
+        again, _, _ = m(seq, seg, ctx, extra)
+    assert float(again[~lm_at].abs().max()) > 0                       # back to every base
