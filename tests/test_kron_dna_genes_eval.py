@@ -129,3 +129,19 @@ def test_genes_eval_scores_two_annotations(tmp_path, monkeypatch):
     assert set(d) == {"utr3_plus", "polya_plus"} or "utr3_plus" in d     # the longer 3' exons are the difference
     for v in d.values():
         assert v["agrees_with"]["old"] + v["agrees_with"]["new"] == pytest.approx(1.0)
+
+
+def test_isoform_exons_keep_each_isoforms_ends(tmp_path):
+    """Two isoforms whose second exon ends differ give two reference exons (the label runs would pool them into
+    one); the stop codon joins its CDS; an exon crossing a window's edge is left out; minus-strand exons go apart."""
+    GE = load("genes_eval")
+    row = lambda typ, a, b, strand, tid: f"c1\tsrc\t{typ}\t{a}\t{b}\t.\t{strand}\t.\tgene_id \"g\"; transcript_id \"{tid}\";\n"
+    gtf = tmp_path / "toy.gtf"
+    gtf.write_text("".join([
+        row("CDS", 101, 150, "+", "t1"), row("CDS", 201, 250, "+", "t1"), row("stop_codon", 251, 253, "+", "t1"),
+        row("CDS", 101, 150, "+", "t2"), row("CDS", 201, 240, "+", "t2"),
+        row("CDS", 301, 330, "-", "t3"), row("CDS", 990, 1010, "+", "t4")]))
+    win = pl.DataFrame(dict(chrom=["c1"], start=[0], end=[1000]))
+    iso = GE.isoform_exons(gtf, win)
+    assert iso["plus"] == {(0, 100, 150), (0, 200, 253), (0, 200, 240)} and iso["minus"] == {(0, 300, 330)}
+    assert GE.isoform_exons(gtf, pl.DataFrame(dict(chrom=["c1"], start=[100], end=[1000])))["plus"] == {(0, 100, 153), (0, 100, 140)}

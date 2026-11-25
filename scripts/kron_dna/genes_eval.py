@@ -29,6 +29,12 @@ For each window the model reads 1,048,576 bases centred on it; its ``genes`` hea
   ``chain_exons_framed``); **terminal**: framed, plus first and last coding exons ending at a start or stop
   codon where the head's UTR channel says so. The last is the decoder to quote.
 
+- every site-based decoder is also scored **against each isoform's exons** (``..._isoforms``): the distinct coding
+  exons of every transcript of the annotation's GTF, wholly inside a window, exact ends. That is gffcompare's
+  exon level on a CDS-only reference (what Tiberius and Helixer report), except that windows are scored, not whole
+  genomes; ``..._isoforms_within3`` allows 3 bases at each end. The label runs above pool the isoforms instead: two
+  isoforms' overlapping exons become one run that matches neither.
+
 Writes ``OUT/<label>.splice.npy`` (the splice head's logits, float16 ``[windows, 131072, 4]``),
 ``OUT/<label>.genes.json`` with all of it and ``OUT/<label>.genes.npy`` (the logits, float16
 ``[windows, 131072, 14]``, so a later metric needs no card), and prints the summary.
@@ -419,11 +425,53 @@ def score(out: Path, checkpoints: list[str] = typer.Argument(..., help="LABEL=CH
             (d / f"{EK.tag(sh)}.json").write_text(json.dumps(dict(info, rows=rows, shard=list(sh)), indent=1))
             typer.echo(f"{label}: shard {EK.tag(sh)}, {len(rows)} windows in {info['seconds']:.0f} s")
             continue
-        finish(out, info, pred, lab, ids, sp, seqs_of(name, win))
+        finish(out, info, pred, lab, ids, sp, seqs_of(name, win), isoforms_of(labels, win))
 
 
 def ids_of(labels: list[str]) -> list[str]:
     return X.open_store(labels[0].split("=", 1)[1]).ids
+
+
+def isoform_exons(gtf: Path, win: pl.DataFrame, chrom_prefix: str = "") -> dict:
+    """The annotation's distinct coding exons as gffcompare sees a CDS-only reference: per transcript, its CDS rows
+    (the stop codon joined on, as in the labels) merged where they touch; the distinct ``(start, end)`` over all
+    transcripts, kept when the exon lies wholly inside a window (window coordinates). ``{"plus": {(window, start,
+    end)}, "minus": ...}``. Unlike the label runs, isoforms are not pooled: two isoforms' exons with different
+    ends stay two exons."""
+    from kron_dna.prep.features import read_features
+    g = read_features(gtf).filter(pl.col("type").is_in(["CDS", "stop_codon"])).sort("tid", "start0")
+    merged: set = set()
+    cur = None
+    for chrom, strand, tid, a, b in g.select("chrom", "strand", "tid", "start0", "end").iter_rows():
+        if cur and cur[2] == tid and a <= cur[4]:
+            cur[4] = max(cur[4], b)
+            continue
+        if cur:
+            merged.add((cur[0], cur[1], cur[3], cur[4]))
+        cur = [chrom_prefix + chrom, strand, tid, a, b]
+    if cur:
+        merged.add((cur[0], cur[1], cur[3], cur[4]))
+    by: dict = {}
+    for w, r in enumerate(win.iter_rows(named=True)):
+        by.setdefault(r["chrom"], []).append((int(r["start"]), int(r["end"]), w))
+    out = {"plus": set(), "minus": set()}
+    for chrom, strand, a, b in merged:
+        for lo, hi, w in by.get(chrom, ()):
+            if a > lo and b < hi:                      # wholly inside: an exon at a window's edge is not scored
+                out["plus" if strand == "+" else "minus"].add((w, a - lo, b - lo))
+    return out
+
+
+def isoforms_of(labels: list[str], win: pl.DataFrame) -> dict:
+    """``isoform_exons`` per annotation tag, from the GTF each label store records it was built from (its
+    ``labels.json``: ``annotation``); a store without that record, or whose file is gone, is left out."""
+    out = {}
+    for t, p in (s.split("=", 1) for s in labels):
+        meta = Path(p) / "labels.json"
+        gtf = Path(json.loads(meta.read_text()).get("annotation", "")) if meta.exists() else None
+        if gtf and gtf.is_file():
+            out[t] = isoform_exons(gtf, win)
+    return out
 
 
 def labels_of(labels: list[str], win: pl.DataFrame) -> tuple[dict, list[str]]:
@@ -464,7 +512,7 @@ def merge(out: Path, label: str, shards: int = typer.Option(..., help="n, as in 
     if not (seen == 1).all():
         raise typer.BadParameter(f"{label}: windows not covered exactly once")
     finish(out, dict(infos[0], seconds=sum(i["seconds"] for i in infos), shards=shards), pred, lab, ids, sp,
-           seqs_of(infos[0]["genome"], win))
+           seqs_of(infos[0]["genome"], win), isoforms_of(labels, win))
 
 
 @app.command()
@@ -477,11 +525,11 @@ def rescore(out: Path, label: str, labels: list[str] = typer.Option(..., help="T
     lab, ids = labels_of(labels, win)
     sp = out / f"{label}.splice.npy"
     finish(out, info, np.load(out / f"{label}.genes.npy"), lab, ids, np.load(sp) if sp.exists() else None,
-           seqs_of(info["genome"], win))
+           seqs_of(info["genome"], win), isoforms_of(labels, win))
 
 
 def finish(out: Path, info: dict, pred: np.ndarray, lab: dict, ids: list[str], splice: np.ndarray | None = None,
-           seqs: list | None = None) -> None:
+           seqs: list | None = None, iso: dict | None = None) -> None:
     """Every metric from the logits ``pred`` [windows, WIN, channels] against each annotation's labels; with the
     splice head's logits ``splice`` [windows, WIN, 4] also the snapped exons."""
     label = info["label"]
@@ -549,6 +597,19 @@ def finish(out: Path, info: dict, pred: np.ndarray, lab: dict, ids: list[str], s
             variants[nm] = dict(f1=f1(tp2, sum(v["predicted"] for v in per_st.values()) - tp2,
                                       sum(v["annotated"] for v in per_st.values()) - tp2), per_strand=per_st)
             summ[f"cds_exon_f1_{nm}"] = variants[nm]["f1"]
+            if iso and t in iso:                     # against each isoform's exons (gffcompare's CDS-exon level)
+                edge = pred.shape[1]
+                P = {st: {e for e in dec[st] if e[1] > 0 and e[2] < edge} for st in ("plus", "minus")}
+                n_p, n_t = sum(map(len, P.values())), sum(len(iso[t][st]) for st in P)
+                tp3 = sum(len(P[st] & iso[t][st]) for st in P)
+                hp = sum(near(P[st], iso[t][st], 3) for st in P)
+                ht = sum(near(iso[t][st], P[st], 3) for st in P)
+                pr, rc = hp / max(n_p, 1), ht / max(n_t, 1)
+                variants[nm]["isoforms"] = dict(f1=f1(tp3, n_p - tp3, n_t - tp3), predicted=n_p, annotated=n_t, exact=tp3,
+                                                precision=tp3 / max(n_p, 1), recall=tp3 / max(n_t, 1),
+                                                f1_within3=float(2 * pr * rc / max(pr + rc, 1e-12)))
+                summ[f"cds_exon_f1_{nm}_isoforms"] = variants[nm]["isoforms"]["f1"]
+                summ[f"cds_exon_f1_{nm}_isoforms_within3"] = variants[nm]["isoforms"]["f1_within3"]
         res["annotations"][t] = dict(channels=per, cds_exons=ex, cds_exon_variants=variants, **summ)
     tags = list(lab)
     if len(tags) == 2:                           # where the two annotations disagree: whose side the head takes
