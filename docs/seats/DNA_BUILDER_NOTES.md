@@ -305,3 +305,20 @@ Selection `$SCRATCH/kron-dna-build/tracks/dnase-pilot-v1/select.tsv`; downloads 
 ## To file at an idle turn
 
 - Nothing yet.
+
+## 26 Nov, 01:40 (night)
+
+- **Stores built and handed over:** `starr-wg-v1-bin128` (6 whole-genome STARR-seq tracks; two cautions: ratio noise
+  around 1, and two groups of cell lines that look like two input libraries); `tss3-stranded-v1-bin32` (890 tracks,
+  agrees with the 128-bp store). `encode_select.py --assays STARR-seq` (6a721f1).
+- **Plasmids (Anton's idea):** Addgene needs a login and a reviewed bulk-data request; Anton sends a login by
+  direct message "tomorrow or the day after". Meanwhile `prep_constructs.py` (464e7ba) turns GenBank flat files
+  into a small prepared genome with `parts.u8`; GenBank release 274 division SYN is in scratch
+  `constructs/genbank-syn`, job 6657460 builds `interim/genome/constructs_gbsyn274`. To do: read its
+  `constructs.json`, report yields, hand to the trainer; an Addgene JSON reader when the login comes.
+- **Multi-scale arm:** Astra 6.2 answered twice (writer's run and mine, scratch `consult-astra-5`). Agreed plan:
+  no 1-bp recurrent branch; `inter_parallel` (637ecd3) = KI's two 8-bp blocks as a side branch, zero at start,
+  `inter_branch_off` for rescoring; starts after KI and K5P reach 15k; trainer builds a 512-window bench.
+- **Open, mine:** in-tower blocks (`InterKron`) restart on a fixed grid and ignore contig gaps (needs segment ids
+  through encode/decode in the whole, split, capped and contig forwards); one `local_span` for every fine-scale
+  block. Both only if the in-tower design is kept after 15k.
