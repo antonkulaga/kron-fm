@@ -94,6 +94,9 @@ class KronGenomeConfig:
                                 # that resolution (InterKron: a light bidirectional KronLSTM, restarting every
                                 # local_span bases, added through a map that starts at zero). [3] = at 8 bp
     inter_width: int = 128      # the width of those blocks
+    inter_parallel: bool = False  # the same two blocks per level as a side branch instead of inside the tower: the
+                                # encoder's features of the level go through both, and (output - input) is added to
+                                # the decoder at that level (zero at the start); the tower itself stays plain
     bin_convs: int = 0          # v2/v2l: this many extra k=5 residual convolutions at bin resolution on each side of
                                 # the core (after the last pooling, before the first unpooling), dilation 1, 2, 4, 8,
                                 # 8, ...: local capacity and reach where it is cheap, for a core at fine bins whose
@@ -1135,10 +1138,22 @@ class KronGenome(nn.Module):
         skips = []
         for i, block in enumerate(self.down):
             skips.append(x)
-            x = self._inter("enc", i + 1, pool2(block(x)))
+            x = pool2(block(x))
+            if not self.config.inter_parallel:
+                x = self._inter("enc", i + 1, x)
         for block in getattr(self, "bin_pre", ()):
             x = block(x)
         return x, (skips + [x] if getattr(self, "bin_skip", None) is not None else skips)   # last: the core's input
+
+    inter_branch_off = False            # evaluation: leave the side branches of ``inter_parallel`` out
+
+    def _branch(self, level: int, skip: torch.Tensor) -> torch.Tensor | None:
+        """``inter_parallel``: what the side branch at pooling ``level`` adds to the decoder there, from the
+        encoder's features ``skip`` of that level: both blocks in sequence, minus their input."""
+        inter = getattr(self, "inter", None)
+        if not self.config.inter_parallel or self.inter_branch_off or not inter or f"enc{level}" not in inter:
+            return None
+        return self._inter("dec", level, self._inter("enc", level, skip)) - skip
 
     def _inter(self, side: str, level: int, x: torch.Tensor) -> torch.Tensor:
         """The recurrent block of ``side`` (enc, dec) at pooling ``level`` (positions of 2**level bases), if any."""
@@ -1202,7 +1217,12 @@ class KronGenome(nn.Module):
         if self.config.arch == "v2":
             for i, (block, skip) in enumerate(zip(self.up, reversed(skips))):
                 x = block(F.interpolate(x, scale_factor=2, mode="nearest"))
-                x = self._inter("dec", len(self.up) - 1 - i, self.up2[i](x + self.skip_scale[i] * self.skip_proj[i](skip)))
+                x = self.up2[i](x + self.skip_scale[i] * self.skip_proj[i](skip))
+                if self.config.inter_parallel:
+                    side = self._branch(len(self.up) - 1 - i, skip)
+                    x = x if side is None else x + side.to(x.dtype)
+                else:
+                    x = self._inter("dec", len(self.up) - 1 - i, x)
             return x
         for block, skip in zip(self.up, reversed(skips)):
             x = block(F.interpolate(x, scale_factor=2, mode="nearest")) + skip

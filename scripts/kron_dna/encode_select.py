@@ -33,6 +33,8 @@ WANT = {
     "eCLIP": ["plus strand signal of unique reads", "minus strand signal of unique reads"],
     "CAGE": ["plus strand signal of unique reads", "minus strand signal of unique reads"],
     "RAMPAGE": ["plus strand signal of unique reads", "minus strand signal of unique reads"],
+    # whole-genome reporter activity (genomic fragments in a plasmid), over the input library
+    "STARR-seq": ["control normalized signal"],
 }
 STRAND = {"plus strand signal of unique reads": "P", "minus strand signal of unique reads": "M"}
 FIELDS = ["accession", "dataset", "assay_term_name", "output_type", "file_size", "biological_replicates",
