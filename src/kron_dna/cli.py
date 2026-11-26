@@ -1040,6 +1040,9 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                                                   "that get a bidirectional KronLSTM block in encoder and decoder "
                                                   "(model config inter_levels; the KI arm). Empty: none"),
                  inter_width: int = typer.Option(128, help="with --inter-levels: the width of those blocks"),
+                 inter_parallel: bool = typer.Option(False, help="with --inter-levels: run the blocks on a side branch "
+                                                     "from the encoder level to the decoder level (model config "
+                                                     "inter_parallel; the branch's added term starts at zero)"),
                  codon_dims: int = typer.Option(0, help="a codon head predicting this many projected protein features "
                                                 "per codon from the decoder (model config codon_dims). 0: none"),
                  codon_store: Path = typer.Option(None, help="with --codon-weight: the primary genome's codon store "
@@ -2329,7 +2332,7 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                                 n_epigenomes=n_epi if epigenome_weight > 0 else 0, chunk_ratio=chunk_ratio,
                                 n_ntv3=len(ntv3["ids"]) if ntv3 else 0,
                                 chunk_length_feature=chunk_length_feature,
-                                bin_convs=bin_convs, inter_width=inter_width, codon_dims=codon_dims,
+                                bin_convs=bin_convs, inter_width=inter_width, codon_dims=codon_dims, inter_parallel=inter_parallel,
                                 inter_levels=[int(v_) for v_ in inter_levels.split(",") if v_.strip()],
                                 **(dict(zip(("local_width", "local_layers", "local_span"),
                                             map(int, local_track.split(",")))) if local_track else {}))
