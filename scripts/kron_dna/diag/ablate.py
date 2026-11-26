@@ -10,6 +10,12 @@ tower's skips. Inference only; one card.
     python scripts/kron_dna/diag/ablate.py reset CKPT BENCH OUT.json [--reach 8192 32768 131072] [--windows 32]
     python scripts/kron_dna/diag/ablate.py cpg CKPT BENCH OUT.json [--windows 32] [--passes 2]
     python scripts/kron_dna/diag/ablate.py spans CKPT BENCH OUT.json [--lens 1024 4096 16384] [--windows 16]
+    python scripts/kron_dna/diag/ablate.py flanks CKPT BENCH OUT.json [--keep 0 32768 131072] [--windows 32]
+
+``flanks`` (Astra 6.2's flank replacement): keep the scored window plus KEEP bases each side, replace everything
+beyond with the same stretch of another benchmark window (real sequence, window i takes the flanks of window i + n/2), and
+measure how far every head's output on the scored window moves (relative L2 of raw outputs), and DNase Pearson
+against the frozen targets, paired over windows. It tests use of distant DNA through every path, not only the core.
 
 ``spans``: masked bases inside contiguous blocks (every base of a block MASK, blocks covering about 10 % of the central
 window, placed at random with a fixed seed), scored for the intact model, with every core layer skipped, and with the
@@ -389,6 +395,45 @@ def cmd_spans(a):
     json.dump(res, open(a.out, "w"), indent=1)
 
 
+def cmd_flanks(a):
+    win = windows(a.bench, a.windows); gen = Genome()
+    r = Runner(a.ckpt)
+    heads = [h[0] for h in r.model.config.xheads]
+    r.model.x_active = set(heads); r.model.x_span = (FL, FL + WIN)
+    meta = json.load(open(f"{a.bench}/targets.json")); ds = X.open_store(meta["dnase_store"]); consts = ds.consts(r.dev)
+    tgt = np.load(f"{a.bench}/target_dnase_128.npy")[:win.height]
+    rows = [gen.codes(row["chrom"], row["start"] - FL, row["end"] + FL) for row in win.iter_rows(named=True)]
+    seg = torch.zeros(1, CTX // r.unit, dtype=torch.long, device=r.dev)
+    ctx = torch.zeros(1, dtype=torch.long, device=r.dev) if r.model.config.n_contexts > 0 else None
+
+    def outputs(codes):
+        with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
+            r.model(torch.from_numpy(codes).to(r.dev)[None], seg, ctx)
+        o = {h: r.model.last_x[h][0].float().clone() for h in heads}
+        if r.model.last_ntv3 is not None:
+            o["ntv3"] = r.model.last_ntv3[0, FL:FL + WIN].float().clone()
+        pd = o["dnase"]; p_log, _ = X.eval_pair(ds, pd, torch.zeros_like(pd), consts)
+        return o, p_log.cpu().numpy().reshape(-1, 128, p_log.shape[-1]).mean(1)
+
+    base = [outputs(c) for c in rows]
+    res = dict(ckpt=a.ckpt, windows=win.height, keep={})
+    for keep in a.keep:
+        lo, hi = FL - keep, FL + WIN + keep
+        moves = {k: [] for k in base[0][0]}; preds = []
+        for i, c in enumerate(rows):
+            donor = rows[(i + len(rows) // 2) % len(rows)]   # a distant window, never an overlapping neighbour
+            sw = donor.copy(); sw[lo:hi] = c[lo:hi]
+            o, d128 = outputs(sw)
+            preds.append(d128)
+            for k in o:
+                moves[k].append(float((o[k] - base[i][0][k]).norm() / (base[i][0][k].norm() + 1e-9)))
+        p = np.stack(preds); b = np.stack([x[1] for x in base])
+        res["keep"][str(keep)] = dict(output_move={k: float(np.mean(v)) for k, v in moves.items()},
+                                      **_paired(tgt, (b, np.zeros(len(rows))), (p, np.zeros(len(rows)))))
+        print(keep, json.dumps(res["keep"][str(keep)]), flush=True)
+    json.dump(res, open(a.out, "w"), indent=1)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -406,9 +451,11 @@ def main():
     p = sub.add_parser("spans"); p.add_argument("ckpt"); p.add_argument("bench"); p.add_argument("out")
     p.add_argument("--lens", nargs="+", type=int, default=[1024, 4096, 16384]); p.add_argument("--windows", type=int, default=16)
     p.add_argument("--reach", nargs="*", type=int, default=[8192, 32768, 131072])
+    p = sub.add_parser("flanks"); p.add_argument("ckpt"); p.add_argument("bench"); p.add_argument("out")
+    p.add_argument("--keep", nargs="+", type=int, default=[0, 32768, 131072]); p.add_argument("--windows", type=int, default=32)
     a = ap.parse_args()
     dict(classes=cmd_classes, core=cmd_core, layers=cmd_layers, skips=cmd_skips, joint=cmd_joint, reset=cmd_reset,
-         cpg=cmd_cpg, spans=cmd_spans)[a.cmd](a)
+         cpg=cmd_cpg, spans=cmd_spans, flanks=cmd_flanks)[a.cmd](a)
 
 
 if __name__ == "__main__":
