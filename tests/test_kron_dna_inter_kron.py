@@ -102,3 +102,45 @@ def test_every_piecewise_path_restarts_where_a_whole_forward_does(cpu_mixer):
         outs = m.forward_contig(seq, [1024, 3072], chunk=1024)
         for (lg, _), s in zip(outs, (1024, 3072)):
             assert torch.allclose(lg, logits[:, s:s + 1024], atol=1e-5)
+
+
+def test_the_parallel_branch_starts_at_zero_has_the_same_weights_and_can_be_switched_off(cpu_mixer):
+    """inter_parallel: the two blocks of a level as a side branch from the encoder's features into the decoder."""
+    plain, serial, par = small(), small(inter_levels=[2]), small(inter_levels=[2], inter_parallel=True)
+    assert {k: v.shape for k, v in par.state_dict().items()} == {k: v.shape for k, v in serial.state_dict().items()}
+    par.load_state_dict(serial.state_dict())
+    seq = torch.randint(0, 4, (2, 512))
+    with torch.no_grad():
+        a = plain(seq)
+        assert torch.allclose(par(seq)[0], a[0], atol=1e-6)
+        shake(par), shake(serial)
+        out = par(seq)
+        assert not torch.allclose(out[0], a[0], atol=1e-3)
+        assert torch.allclose(out[1], a[1], atol=1e-6)                 # the tower and the core are left plain
+        assert not torch.allclose(serial(seq)[1], a[1], atol=1e-4)     # the serial blocks sit before the core
+        assert not torch.allclose(out[0], serial(seq)[0], atol=1e-3)
+        par.inter_branch_off = True
+        assert torch.allclose(par(seq)[0], a[0], atol=1e-6)
+    par.inter_branch_off = False
+    par.train()(seq)[0].float().pow(2).sum().backward()
+    assert all(float(b.out.weight.grad.abs().sum()) > 0 for b in par.inter.values())
+
+
+def test_the_parallel_branch_in_a_split_window_and_in_the_piecewise_paths(cpu_mixer, monkeypatch):
+    from kron_dna import evalkit
+    forced_replicas(monkeypatch)
+    m = small(inter_levels=[2], inter_parallel=True, xheads=[["a", 2, 8]], xhead_kind="mlp")
+    shake(m)
+    seq = torch.randint(0, 4, (1, 4096))
+    with torch.no_grad():
+        logits, core, _ = m(seq)
+        whole_x = {k: v.clone() for k, v in m.last_x.items()}
+        pieces, _ = m.forward_split(seq, devices=["cpu", "cpu"], by="length")
+        assert [p.start % 128 for p in pieces] == [0, 0]
+        assert torch.allclose(G.gather_split(pieces, "logits", "cpu"), logits, atol=1e-5)
+        got = evalkit.decode_span(m, seq[0], core, (1024, 2048))
+        lo, hi = m.last_x_at
+        assert torch.allclose(got["a"], whole_x["a"][:, lo // 8:hi // 8], atol=1e-5)
+        outs = m.forward_contig(seq[0], [1024, 3072], chunk=1024)
+        for (lg, _), s in zip(outs, (1024, 3072)):
+            assert torch.allclose(lg, logits[:, s:s + 1024], atol=1e-5)
