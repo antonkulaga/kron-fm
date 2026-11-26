@@ -178,6 +178,32 @@ def add_span_masks(seq: torch.Tensor, inputs: torch.Tensor, targets: torch.Tenso
     return inputs.masked_fill(hide, G.MASK_CHANNEL), torch.where(hide, seq, targets)
 
 
+def grow_core_fn(model: torch.nn.Module, n_old: int, mode: str) -> list[str]:
+    """``genome-train --init ... --grow-core``: a trunk with ``n_old`` core layers loaded into a deeper core. ``zero``:
+    each new layer's three output projections (forward and backward scans, SwiGLU down) start at zero, so every new
+    residual block is the identity and the grown model computes what the old one did. ``copy``: new layer i takes the
+    weights of old layer i mod n_old (progressive stacking). Returns what it set, for the log."""
+    done = []
+    with torch.no_grad():
+        for i in range(n_old, len(model.core)):
+            blk = model.core[i]
+            if mode == "zero":
+                outs = [blk.forward_mixer.o_proj, blk.mlp.down]
+                if blk.backward_mixer is not None:
+                    outs.append(blk.backward_mixer.o_proj)
+                for lin in outs:
+                    lin.weight.zero_()
+                    if getattr(lin, "bias", None) is not None:
+                        lin.bias.zero_()
+                done.append(f"core.{i} identity")
+            elif mode == "copy":
+                blk.load_state_dict(model.core[i % n_old].state_dict())
+                done.append(f"core.{i} = core.{i % n_old}")
+            else:
+                raise ValueError(f"--grow-core is 'zero' or 'copy', got {mode!r}")
+    return done
+
+
 def _param_groups(model: torch.nn.Module, weight_decay: float) -> list[dict]:
     decay, no_decay = [], []
     for name, p in model.named_parameters():
@@ -1041,6 +1067,10 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                                                        "store, no promoter within --hole-distal); the rest uniform"),
                  hole_distal: int = typer.Option(32768, help="with --hole-share: a peak cell counts as distal with "
                                                  "no promoter cell within this many bases"),
+                 grow_core: str = typer.Option("", help="with --init from a checkpoint with fewer core layers: 'zero' "
+                                               "starts every new layer as the identity (output projections zero), "
+                                               "'copy' stacks the old layers (new i = old i mod n). Empty: new layers "
+                                               "start at their fresh initialisation"),
                  codon_on: str = typer.Option("masked", help="with --codon-weight: 'masked' scores only codons with "
                                               "at least one masked base (with 15 % masking about 61 % of codons are "
                                               "fully visible, and the amino acid can be read off them); 'all' every "
@@ -2535,6 +2565,13 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
         grown, notes = G.expand_state_dict(init_state["model"], model, new_contexts=new_contexts)
         missing, unexpected = model.load_state_dict(grown, strict=False)
         say(f"initialised from {init}; new: {missing}; dropped: {unexpected}; padded: {notes or 'nothing'}")
+        if grow_core:                                  # --grow-core: a shallower trunk's core grown to this depth
+            n_old_ = len({k_.split(".")[1] for k_ in init_state["model"] if k_.startswith("core.")})
+            if n_old_ >= len(model.core):
+                raise typer.BadParameter(f"--grow-core: the checkpoint has {n_old_} core layers, this model "
+                                         f"{len(model.core)}")
+            say(f"--grow-core {grow_core}: {n_old_} -> {len(model.core)} core layers: "
+                + ", ".join(grow_core_fn(model, n_old_, grow_core)))
         if xhead:
             other_ = [k_ for k_ in missing if not k_.startswith("xheads.")]
             say("--xhead: " + ("the new parameters are the heads' only" if not other_ else
