@@ -97,6 +97,7 @@ def main() -> None:
     a.add_argument("--lr-head", type=float, default=1e-3); a.add_argument("--lr-trunk", type=float, default=2e-5)
     a.add_argument("--mem-gib", type=float, default=0.0, help="cap this process's card memory (0: no cap)")
     a.add_argument("--max-rows", type=int, default=0, help="smoke runs: this many rows per split")
+    a.add_argument("--rc", action="store_true", help="train on both strands (random per row) and average both at test")
     a = a.parse_args()
     torch.manual_seed(a.seed); rng = np.random.default_rng(a.seed)
     dev = torch.device("cuda"); torch.cuda.init()
@@ -156,14 +157,26 @@ def main() -> None:
     opt = torch.optim.AdamW(groups, weight_decay=0.01)
     n_train = sum(p.numel() for p in head.parameters()) + sum(p.numel() for p in trunk)
 
+    def revcomp(xb: torch.Tensor, sb: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """The reverse strand: complemented bases in reverse order (N and others kept), the span mirrored."""
+        xr = torch.where(xb < 4, 3 - xb, xb).flip(-1)
+        n = xb.shape[-1]
+        return xr, torch.stack([n - sb[:, 1], n - sb[:, 0]], 1)
+
+    def forward_head(xb: torch.Tensor, sb: torch.Tensor) -> torch.Tensor:
+        model(xb, None, torch.zeros(len(xb), dtype=torch.long, device=dev))
+        return head(feats["x"], sb)
+
     def predict(split: str) -> np.ndarray:
         model.eval(); head.eval(); x, span, _ = data[split]; out = []
         with torch.no_grad():
             for i in range(0, len(x), a.batch):
                 xb = torch.from_numpy(x[i:i + a.batch]).to(dev); sb = torch.from_numpy(span[i:i + a.batch]).to(dev)
                 with torch.autocast("cuda", dtype=torch.bfloat16):
-                    model(xb, None, torch.zeros(len(xb), dtype=torch.long, device=dev))
-                    out.append(head(feats["x"], sb).float().cpu().numpy())
+                    p = forward_head(xb, sb).float()
+                    if a.rc:                                              # average both strands (MPRALegNet's test rule)
+                        p = 0.5 * (p + forward_head(*revcomp(xb, sb)).float())
+                    out.append(p.cpu().numpy())
         return np.concatenate(out)
 
     t0 = time.time(); best = (-2.0, None, -1); best_trunk = {}
@@ -174,6 +187,10 @@ def main() -> None:
         for i in range(steps_per_epoch):
             idx = order[i * a.batch:(i + 1) * a.batch]
             xb = torch.from_numpy(x[idx]).to(dev); sb = torch.from_numpy(span[idx]).to(dev)
+            if a.rc:                                                      # each row on a random strand
+                flip = torch.from_numpy(rng.random(len(idx)) < 0.5).to(dev)
+                xr, sr = revcomp(xb, sb)
+                xb = torch.where(flip[:, None], xr, xb); sb = torch.where(flip[:, None], sr, sb)
             with torch.autocast("cuda", dtype=torch.bfloat16):
                 if a.mode == "frozen":
                     with torch.no_grad():
@@ -196,7 +213,7 @@ def main() -> None:
                 p.copy_(best_trunk[n])
     pt, pv = predict("test"), predict("val")
     row = dict(ckpt=str(a.ckpt), step=state.get("step"), random_init=a.random_init, cell=a.cell, test_fold=a.test_fold,
-               mode=a.mode, form=a.form, window=a.window if a.form == "genomic" else None, share=a.share, seed=a.seed,
+               mode=a.mode, rc=a.rc, form=a.form, window=a.window if a.form == "genomic" else None, share=a.share, seed=a.seed,
                n_train=len(data["train"][2]), n_val=len(data["val"][2]), n_test=len(data["test"][2]),
                best_epoch=best[2], epochs=a.epochs, batch=a.batch, lr_head=a.lr_head, lr_trunk=a.lr_trunk,
                trainable_params=n_train,
