@@ -3,7 +3,7 @@
     uv run python scripts/kron_dna/encode_fetch.py SELECT.tsv OUT_DIR
 
 ``SELECT.tsv`` has at least the columns ``experiment``, ``file`` and ``url``. Each file goes to
-``OUT_DIR/files/<file>.bigWig.part`` with resume, is checked (size, md5 from ENCODE's file record), then renamed, so a
+``OUT_DIR/files/<file><the url's extension>.part`` with resume, is checked (size, md5 from ENCODE's file record), then renamed, so a
 rerun skips what is complete. ``OUT_DIR/provenance.jsonl`` gets one line per verified file: accessions, assembly,
 output type, replicates, lab, award, release date, size, md5, seconds and bytes downloaded in this run.
 ``OUT_DIR/status.tsv`` logs every attempt. The proxy is read from the environment by curl.
@@ -46,7 +46,8 @@ def main(select: Path, out: Path) -> int:
     failed = 0
     with open(select) as f, open(out / "status.tsv", "a") as status:
         for row in csv.DictReader(f, delimiter="\t"):
-            acc, final = row["file"], files / f"{row['file']}.bigWig"
+            ext = Path(row["url"]).suffix or ".bigWig"                 # .bigWig for tracks, .hic for contact maps
+            acc, final = row["file"], files / f"{row['file']}{ext}"
             if acc in done and final.exists() and final.stat().st_size == done[acc]["size"]:
                 continue
             meta = record(f"/files/{acc}/")
