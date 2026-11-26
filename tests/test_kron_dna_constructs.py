@@ -67,7 +67,7 @@ def test_store(tmp_path: Path) -> None:
                   + record("AB000004", other, "     intron          1..10\n", circular=False)
                   + record("AB000005", "ACGT" * 5, FEATURES))                                    # too short
     out = tmp_path / "out"
-    pc.main(out, [gb], min_len=100, max_len=1000, max_n=0.01, held_out_mod=10)
+    pc.main(out, [gb], min_len=100, max_len=1000, max_n=0.01, held_out_mod=10, keep="", drop="")
     info = json.loads((out / "constructs.json").read_text())
     assert info["records"] == 2 and info["left_out"]["duplicate"] == 1 and info["left_out"]["no_parts"] == 1
     assert info["left_out"]["short"] == 1
@@ -94,3 +94,17 @@ def test_store(tmp_path: Path) -> None:
     cds = np.flatnonzero((labels[:300] >> pc.LABEL_BITS["CDS"]) & 1).tolist()
     assert cds == list(range(30, 60)) + list(range(70, 80)) + list(range(90, 100))
     assert not ((labels >> pc.LABEL_BITS["exon"]) & 1).any()
+
+
+def test_keep_and_drop(tmp_path: Path) -> None:
+    rng = random.Random(1)
+    seqs = ["".join(rng.choice("ACGT") for _ in range(300)) for _ in range(3)]
+    gb = tmp_path / "x.gb"
+    gb.write_text(record("AB000001", seqs[0], FEATURES)
+                  + record("AB000002", seqs[1], FEATURES).replace("Cloning vector AB000002", "Mus musculus targeting vector")
+                  + record("AB000003", seqs[2], FEATURES).replace("Cloning vector AB000003", "Synthetic construct gene"))
+    out = tmp_path / "out"
+    pc.main(out, [gb], min_len=100, max_len=1000, max_n=0.01, held_out_mod=10, keep="VECTOR|plasmid", drop="mus musculus")
+    info = json.loads((out / "constructs.json").read_text())
+    assert info["records"] == 1 and info["left_out"]["not_kept"] == 1 and info["left_out"]["dropped"] == 1
+    assert pl.read_parquet(out / "contigs.parquet")["chrom"].to_list() == ["AB000001.1"]

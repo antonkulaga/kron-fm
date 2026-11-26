@@ -6,6 +6,10 @@ Any GenBank flat file serves: the synthetic-construct division of GenBank (``gbs
 set, a depositor's export. A record is kept when its length is in range, it has no base outside ACGT beyond
 ``--max-n`` of its length, it carries at least one feature of ``PART_BITS`` and its sequence was not seen before
 (the same vector is deposited many times; sequences are compared exactly, so a backbone with another insert stays).
+``--keep`` and ``--drop`` choose by the record's definition and organism: GenBank's synthetic division is mostly not
+vectors (three quarters of its bases in this size range are mouse gene-targeting constructs, which carry mouse
+genomic DNA, and there are 20,000 engineered virus genomes), so for vectors use ``--keep 'vector|plasmid'
+--drop 'Mus musculus|virus|phage'``.
 
 OUT_DIR, in ``genome-prepare``'s layout (one contig per record, laid end to end):
 
@@ -131,8 +135,11 @@ def to_labels(parts: np.ndarray) -> np.ndarray:
 
 
 def main(out: Path, gbff: list[Path], min_len: int = 2000, max_len: int = 50000, max_n: float = 0.01,
-         held_out_mod: int = 10) -> None:
-    left = dict(short=0, long=0, ambiguous=0, no_parts=0, duplicate=0, no_sequence=0)
+         held_out_mod: int = 10,
+         keep: str = typer.Option("", help="keep only records whose definition matches this (case ignored)"),
+         drop: str = typer.Option("", help="leave out records whose definition or organism matches this")) -> None:
+    left = dict(short=0, long=0, ambiguous=0, no_parts=0, duplicate=0, no_sequence=0, not_kept=0, dropped=0)
+    keep_re, drop_re = (re.compile(x, re.I) if x else None for x in (keep, drop))
     seen: set[bytes] = set()
     rows, base_chunks, part_chunks, offset = [], [], [], 0
     for path in gbff:
@@ -144,6 +151,12 @@ def main(out: Path, gbff: list[Path], min_len: int = 2000, max_len: int = 50000,
                     continue
                 if n < min_len or n > max_len:
                     left["short" if n < min_len else "long"] += 1
+                    continue
+                if keep_re and not keep_re.search(r["definition"]):
+                    left["not_kept"] += 1
+                    continue
+                if drop_re and (drop_re.search(r["definition"]) or drop_re.search(r["organism"])):
+                    left["dropped"] += 1
                     continue
                 if not r["features"]:
                     left["no_parts"] += 1
@@ -176,7 +189,7 @@ def main(out: Path, gbff: list[Path], min_len: int = 2000, max_len: int = 50000,
                 left_out=left, part_bits=PART_BITS,
                 share_of_bases={p: round(float(((parts >> b) & 1).mean()), 5) for p, b in PART_BITS.items()},
                 records_with={p: int(sum(bool(((c >> b) & 1).any()) for c in part_chunks)) for p, b in PART_BITS.items()},
-                sources=[p.name for p in gbff], min_len=min_len, max_len=max_len,
+                sources=[p.name for p in gbff], min_len=min_len, max_len=max_len, keep=keep, drop=drop,
                 labels="labels.u8 carries promoter, enhancer and CDS only; exon, donor and acceptor are not annotated")
     (out / "constructs.json").write_text(json.dumps(info, indent=1))
     typer.echo(json.dumps(info))
