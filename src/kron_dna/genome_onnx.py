@@ -144,7 +144,7 @@ class KronGenomeGraph(nn.Module):
         if m.context is not None:
             h = h + m.context_rows(None, b, bases.device).unsqueeze(1).to(h.dtype)
         cu = torch.arange(0, b * bins + 1, bins, device=bases.device, dtype=torch.int32)
-        core = m.run_core(h.reshape(1, -1, h.shape[-1]), cu).reshape(b, bins, -1)
+        core = m.run_core(h.reshape(1, -1, h.shape[-1]), cu, rows=b).reshape(b, bins, -1)
         x = m.add_local(m.decode(core.transpose(1, 2), skips), skips)
         m.last_ntv3 = m.ntv3(x).transpose(1, 2) if m.ntv3 is not None else None
         m.last_x, m.last_x_at = m.run_xheads(x)

@@ -113,7 +113,7 @@ def core_of(model: G.KronGenome, seq: torch.Tensor) -> tuple[torch.Tensor, list[
         rows = model.context_rows(torch.zeros(b, dtype=torch.long, device=seq.device), b, seq.device)
         h = h + rows.unsqueeze(1).to(h.dtype)
     cu = torch.arange(0, b * bins + 1, bins, device=seq.device, dtype=torch.int32)
-    return model.run_core(h.reshape(1, b * bins, -1), cu).reshape(b, bins, -1), skips
+    return model.run_core(h.reshape(1, b * bins, -1), cu, rows=b).reshape(b, bins, -1), skips
 
 
 def heads_of(model: G.KronGenome, core: torch.Tensor, skips: list[torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor | None]:

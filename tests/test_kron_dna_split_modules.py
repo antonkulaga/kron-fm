@@ -11,7 +11,7 @@ from kron_core.testing import CausalMixer
 from kron_dna import genome as G
 
 #: what runs once, on the first card: the core over the whole batch and what reads its states
-WHOLE_BATCH = {"core", "core_norm", "context", "jepa_pred", "jepa_tracks", "epi_in", "epi_film", "epi_out"}
+WHOLE_BATCH = {"core", "core_norm", "coarse", "context", "jepa_pred", "jepa_tracks", "epi_in", "epi_film", "epi_out"}
 
 
 @pytest.fixture
