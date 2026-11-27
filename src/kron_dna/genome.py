@@ -1309,7 +1309,8 @@ class KronGenome(nn.Module):
                 n = h.shape[1]
                 if n % rows:
                     raise ValueError(f"{n} packed bins are not {rows} equal rows")
-                h = coarse(h.reshape(rows, n // rows, -1)).reshape(1, n, -1)
+                if (n // rows) % self.config.coarse_ratio == 0:   # rows too short to pool (the mito slice's packed
+                    h = coarse(h.reshape(rows, n // rows, -1)).reshape(1, n, -1)   # mtDNA rows): no coarse term
         return self.core_norm(h)
 
     def decode(self, x: torch.Tensor, skips: list[torch.Tensor]) -> torch.Tensor:
