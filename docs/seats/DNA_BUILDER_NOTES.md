@@ -362,3 +362,21 @@ Selection `$SCRATCH/kron-dna-build/tracks/dnase-pilot-v1/select.tsv`; downloads 
   10 or 25 kb cells before judging.
 - Not done: a card run of any of this; ONNX export of a coarse-block model after the segment change.
 - Still waiting on Anton: Addgene login (by direct message); publishing track stores.
+
+## 28 Nov, 00:30: catching up with AlphaGenome on tracks (Anton, 644260742)
+
+Counts per kind posted (644260738; AlphaGenome's column is the trainer's, from its output list: 644260689). Built
+human stores: 6,156 channels (RNA 462, CAGE+RAMPAGE 442, PRO-cap 448, DNase 196, histone 1,923, TF 1,643, eCLIP
+1,026, STARR 6, contacts 6, splice sites 4); mouse 1,989. Missing kinds: human ATAC, splice-site usage and
+junctions, most contact maps, mouse CAGE and contacts. Plan promised to Anton (644261218), each store to the
+trainer once validated:
+
+| Step | State |
+|---|---|
+| 1 Human ATAC, ENCODE (464 experiments, 206 biosamples, 659 GB) | downloading since 28 Nov 00:05, jobs 6668024-6, `$SCRATCH/kron-dna-build/tracks/atac-hg38-v1/` (`selection.tsv`, `part{0,1,2}.tsv`); then convert, bin to `tracks/hg38/atac-v1-bin128`, validate; promised Sat 28 Nov ~16:00 |
+| 2 More contact maps | ENCODE has MAPQ-thresholded `.hic` for 190 human biosample groups and 16 mouse; select one per single biosample (one LCL only), `prep_hic.py`; promised Sun 29 Nov |
+| 3 Rest of ENCODE human DNase and RNA-seq beyond NTv3's list | `encode_select.py --assembly GRCh38`, minus what the stores hold; Sun 29 Nov |
+| 4 CAGE from FANTOM5, human and mouse | source and build (hg38/mm10 reprocessed CTSS) to check; Mon 30 Nov |
+| 5 Splice junctions and usage | check recount3 junction tables (build, strand, licence) and report to Anton before building; first version Thu 3 Dec |
+
+`slurm/submit.sh cpu NAME` takes the command as words after `uv run` (not one shell string: "Failed to spawn").
