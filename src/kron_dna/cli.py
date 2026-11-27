@@ -1043,11 +1043,14 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                  inter_parallel: bool = typer.Option(False, help="with --inter-levels: run the blocks on a side branch "
                                                      "from the encoder level to the decoder level (model config "
                                                      "inter_parallel; the branch's added term starts at zero)"),
-                 slow_layers: str = typer.Option("", help="core layers (0-based, comma separated) whose --slow-heads longest-memory "
+                 slow_layers: str = typer.Option("", help="core layers (0-based, comma separated) whose --slow-heads (--slow-pick) "
                                                   "heads per direction start with slow memory (model config "
                                                   "slow_layers; half-lives over --slow-range). With --init from a "
                                                   "checkpoint whose slow heads differ (none, or other layers, heads or range), set again after the load"),
                  slow_heads: int = typer.Option(2, help="with --slow-layers: heads per direction and layer made slow"),
+                 slow_pick: str = typer.Option("longest", help="with --slow-layers: which heads are made slow, those with "
+                                               "the 'longest' or the 'shortest' memory as the layer stands (model "
+                                               "config slow_pick)"),
                  slow_range: str = typer.Option("30000,1000000", help="with --slow-layers: the half-lives' range in bases, "
                                                 "spread log-uniformly over those heads' channels"),
                  coarse_ratio: int = typer.Option(0, help="> 0: a block over the core states pooled by this many bins "
@@ -2347,7 +2350,7 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                                 n_ntv3=len(ntv3["ids"]) if ntv3 else 0,
                                 chunk_length_feature=chunk_length_feature,
                                 bin_convs=bin_convs, inter_width=inter_width, codon_dims=codon_dims, inter_parallel=inter_parallel,
-                                slow_layers=[int(v_) for v_ in slow_layers.split(",") if v_.strip()], slow_heads=slow_heads,
+                                slow_layers=[int(v_) for v_ in slow_layers.split(",") if v_.strip()], slow_heads=slow_heads, slow_pick=slow_pick,
                                 slow_range=[int(v_) for v_ in slow_range.split(",")], coarse_ratio=coarse_ratio,
                                 coarse_after=coarse_after, coarse_kind=coarse_kind, coarse_width=coarse_width,
                                 coarse_heads=coarse_heads,
@@ -2587,7 +2590,7 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
         missing, unexpected = model.load_state_dict(grown, strict=False)
         say(f"initialised from {init}; new: {missing}; dropped: {unexpected}; padded: {notes or 'nothing'}")
         src_cfg_ = init_state.get("config") or {}
-        slow_ = lambda c_: (sorted(int(v_) for v_ in (c_.get("slow_layers") or [])), int(c_.get("slow_heads", 2)),
+        slow_ = lambda c_: (sorted(int(v_) for v_ in (c_.get("slow_layers") or [])), int(c_.get("slow_heads", 2)), c_.get("slow_pick", "longest"),
                             [int(v_) for v_ in (c_.get("slow_range") or [30_000, 1_000_000])])
         if model.config.slow_layers and slow_(src_cfg_) != slow_(vars(model.config)):
             # the load overwrote the slow init, or the checkpoint's slow heads were set otherwise (other layers, heads
