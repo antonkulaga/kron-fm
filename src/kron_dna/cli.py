@@ -1081,7 +1081,9 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                                                   "scored centre in all-MASK holes of --hole-len bases whose letters "
                                                   "are not scored; the track heads are scored inside them as "
                                                   "anywhere else (hide DNA, predict function). 0: off"),
-                 hole_len: int = typer.Option(2048, help="with --hole-share: the length of each hole"),
+                 hole_len: str = typer.Option("2048", help="with --hole-share: the length of each hole, LEN or LO:HI "
+                                              "(each hole's length drawn log-uniformly in [LO, HI], around its centre: "
+                                              "a promoter hidden with flanks of varying extent)"),
                  hole_peak_share: float = typer.Option(0.5, help="with --hole-share: share of holes centred (jitter "
                                                        "+-512) on distal DNase peak cells (signal>=4 of the DNase "
                                                        "store, no promoter within --hole-distal); the rest uniform"),
@@ -1731,13 +1733,23 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
     if hole_share > 0:
         if focus_map is None:
             raise typer.BadParameter("--hole-share needs --focus-map (DNase peak and promoter columns)")
+        try:
+            hole_lo, hole_hi = (int(v_) for v_ in (hole_len.split(":") if ":" in hole_len else (hole_len, hole_len)))
+        except ValueError:
+            raise typer.BadParameter(f"--hole-len is LEN or LO:HI, got {hole_len!r}") from None
+        if not 128 <= hole_lo <= hole_hi:
+            raise typer.BadParameter("--hole-len: 128 <= LO <= HI")
+        hole_len = hole_hi                                    # the bound placement works with
+        hole_mean = hole_lo if hole_hi == hole_lo else (hole_hi - hole_lo) / math.log(hole_hi / hole_lo)
         if hole_target not in ("distal", "promoter"):
             raise typer.BadParameter("--hole-target is 'distal' or 'promoter'")
         if not (0 < hole_share < 1 and 0 <= hole_peak_share <= 1 and hole_len >= 128):
             raise typer.BadParameter("--hole-share in (0, 1), --hole-peak-share in [0, 1], --hole-len >= 128")
         hole_pk = fm_[:, cols_.index("signal>=4:dnase-biosamples-v1-bin128")]
         hole_pr = fm_[:, cols_.index("label:promoter")]
-        say(f"holes: {hole_share:.0%} of each primary row's scored centre in {hole_len:,}-base all-MASK holes, "
+        say(f"holes: {hole_share:.0%} of each primary row's scored centre in "
+            + (f"{hole_lo:,}-base" if hole_lo == hole_hi else f"{hole_lo:,}-{hole_hi:,}-base (log-uniform)")
+            + " all-MASK holes, "
             + (f"{hole_peak_share:.0%} on distal DNase peaks (no promoter within {hole_distal:,} bases)"
                if hole_target == "distal" else f"{hole_peak_share:.0%} on promoter cells")
             + "; letters inside "
@@ -2201,7 +2213,7 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                     cen_ = ntv3_center if ntv3_center < 1 else 1.0
                     lo_, hi_ = int(take * (1 - cen_) / 2), int(take * (1 + cen_) / 2) - hole_len
                     if hi_ > lo_:
-                        n_ = max(1, int(round(hole_share * (hi_ - lo_ + hole_len) / hole_len)))
+                        n_ = max(1, int(round(hole_share * (hi_ - lo_ + hole_len) / hole_mean)))
                         n_pk_ = int(round(n_ * hole_peak_share))
                         fb_, pad_ = focus_bin, -(-hole_distal // focus_bin)
                         c0_, c1_ = at // fb_, -(-(at + take) // fb_)
@@ -2221,7 +2233,12 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                         starts_ += list(hole_rng.integers(lo_, hi_ + 1, n_u_))
                         hole_count[1] += n_u_
                         for s_ in starts_:
-                            h_[int(s_):int(s_) + hole_len] = 1
+                            if hole_lo == hole_hi:
+                                h_[int(s_):int(s_) + hole_len] = 1
+                            else:                    # a length in [LO, HI] around the placed hole's centre
+                                l_ = int(round(math.exp(hole_rng.uniform(math.log(hole_lo), math.log(hole_hi)))))
+                                a_ = max(0, int(s_) + hole_len // 2 - l_ // 2)
+                                h_[a_:a_ + l_] = 1
                         if flip_row:
                             h_[:take] = h_[:take][::-1].copy()
                 hole_rows.append(h_)
