@@ -19,6 +19,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from kron_core.bidirectional import BiKronLSTMBlock
+from kron_dna.contacts import ContactHead
 
 #: Input channels: A, C, G, T, N (unknown or gap), MASK.
 BASES = "ACGTN"
@@ -119,6 +120,11 @@ class KronGenomeConfig:
     codon_dims: int = 0         # > 0: a head that predicts this many protein features per codon from the decoder
                                 # states of the codon's three bases (CodonHead; targets: protein_targets, a protein
                                 # model's per-residue features laid on codons). New parameters only
+    contact_tracks: int = 0     # > 0: a head that predicts contact maps (one per biosample) between the cells of a
+                                # window from the core's states (contacts.ContactHead; targets: prep_hic.py's stores
+                                # through contacts.ContactStores). Run by the trainer on forward's core states
+    contact_width: int = 64
+    contact_reach: int = 201    # pairs up to this many cells apart, the store's diagonals (1 Mb at 5 kb cells)
     n_contexts: int = 0         # v2: learned context embeddings added to the core's input bins: 0 nuclear, else
                                 # the organelle's NCBI genetic code table (2 vertebrate mito, 5 invertebrate, ...)
     n_ntv3: int = 0             # quantitative per-base assay tracks (NTv3 bigwigs): one output per track, predicted
@@ -857,6 +863,8 @@ class KronGenome(nn.Module):
             nn.init.zeros_(self.bin_skip.weight)
             nn.init.zeros_(self.bin_skip.bias)
         self.codon_head = CodonHead(widths[0], c.head_hidden or 2 * widths[0], c.codon_dims) if c.codon_dims else None
+        self.contact_head = (ContactHead(c.d_model, c.contact_width, c.contact_reach, c.contact_tracks)
+                             if c.contact_tracks else None)
         if c.coarse_ratio and (c.chunk_ratio or c.arch == "v3" or not 0 < c.coarse_after <= c.n_layers):
             raise ValueError("coarse_ratio needs a plain core (no learned chunking) and 0 < coarse_after <= n_layers")
         self.coarse = (CoarseBlock(c.d_model, c.coarse_width, c.coarse_heads, c.coarse_kind, c.coarse_ratio, c.n_layers)

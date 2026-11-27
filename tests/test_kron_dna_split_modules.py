@@ -11,7 +11,7 @@ from kron_core.testing import CausalMixer
 from kron_dna import genome as G
 
 #: what runs once, on the first card: the core over the whole batch and what reads its states
-WHOLE_BATCH = {"core", "core_norm", "coarse", "context", "jepa_pred", "jepa_tracks", "epi_in", "epi_film", "epi_out"}
+WHOLE_BATCH = {"core", "core_norm", "coarse", "contact_head", "context", "jepa_pred", "jepa_tracks", "epi_in", "epi_film", "epi_out"}
 
 
 @pytest.fixture
@@ -23,7 +23,7 @@ def everything() -> G.KronGenome:
     return G.KronGenome(G.KronGenomeConfig(
         d_model=32, n_heads=2, n_layers=1, ff_units=64, stem_channels=8, n_down=3, arch="v2", bin_convs=1,
         inter_levels=[1], codon_dims=4, n_ntv3=3, n_tracks=2, xheads=[["a", 2, 8]], xhead_kind="mlp", jepa=True,
-        jepa_track_dims=4, n_contexts=2, n_epigenomes=2, local_width=16))
+        jepa_track_dims=4, n_contexts=2, n_epigenomes=2, local_width=16, contact_tracks=2, contact_reach=5))
 
 
 def test_every_module_has_a_side_in_a_split(cpu_mixer):
