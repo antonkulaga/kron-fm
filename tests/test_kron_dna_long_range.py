@@ -59,14 +59,15 @@ def test_slow_heads_set_the_vendored_layers_decay():
         assert torch.equal(mixer.A_log[k], before[0][k])
         assert torch.equal(mixer.dt_bias[k * per:(k + 1) * per], before[1][k * per:(k + 1) * per])
         assert torch.equal(mixer.f_proj[-1].weight[k * per:(k + 1) * per], before[2][k * per:(k + 1) * per])
-    for bad in ((5, 10.0, 20.0), (0, 10.0, 20.0), (1, 1.0, 20.0), (1, 30.0, 20.0)):
+    assert G.set_slow_heads(mixer, 1, 234.0, 8192.0, "shortest") in ([0], [2])     # one of the untouched heads
+    for bad in ((5, 10.0, 20.0), (0, 10.0, 20.0), (1, 1.0, 20.0), (1, 30.0, 20.0), (1, 10.0, 20.0, "first")):
         with pytest.raises(ValueError):
             G.set_slow_heads(mixer, *bad)
 
 
 def test_slow_layers_reach_both_directions_and_are_refused_out_of_range(monkeypatch):
     seen = []
-    monkeypatch.setattr(G, "set_slow_heads", lambda mixer, heads, lo, hi: seen.append((mixer, heads, lo, hi)))
+    monkeypatch.setattr(G, "set_slow_heads", lambda mixer, heads, lo, hi, pick: seen.append((mixer, heads, lo, hi, pick)))
 
     class WithDecay(CausalMixer):
         def __init__(self, *a):
@@ -75,7 +76,7 @@ def test_slow_layers_reach_both_directions_and_are_refused_out_of_range(monkeypa
 
     monkeypatch.setattr(kron_core.blocks, "kronlstm_mixer", WithDecay)
     m = small(slow_layers=[1], slow_heads=1, slow_range=[800, 8000])
-    assert [x[1:] for x in seen] == [(1, 100.0, 1000.0)] * 2          # bases over 8-bp bins
+    assert [x[1:] for x in seen] == [(1, 100.0, 1000.0, "longest")] * 2   # bases over 8-bp bins
     assert {id(x[0]) for x in seen} == {id(m.core[1].forward_mixer), id(m.core[1].backward_mixer)}
     assert G.apply_slow_heads(m) == 2
     with pytest.raises(ValueError):

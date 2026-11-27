@@ -100,6 +100,7 @@ class KronGenomeConfig:
     slow_layers: list = field(default_factory=list)   # core layers (0-based) where slow_heads heads (the ones with
                                 # the longest memory) start with a slow memory, in both directions (set_slow_heads)
     slow_heads: int = 2         # heads per direction and layer that are made slow
+    slow_pick: str = "longest"  # which heads: those with the "longest" or the "shortest" memory as the layer stands
     slow_range: list = field(default_factory=lambda: [30_000, 1_000_000])   # their channels' half-lives, bases,
                                 # spread log-uniformly from the first to the second
     coarse_ratio: int = 0       # > 0: a block over the core's states pooled by this many bins (64 at 32-bp bins =
@@ -568,10 +569,11 @@ class InterKron(nn.Module):
         return x + self.out(h.reshape(b, n, -1).transpose(1, 2))
 
 
-def set_slow_heads(mixer: nn.Module, heads: int, lo: float, hi: float) -> list[int]:
+def set_slow_heads(mixer: nn.Module, heads: int, lo: float, hi: float, pick: str = "longest") -> list[int]:
     """``heads`` heads of a KronLSTM mixer get a slow memory, until training moves it: the heads whose memory is
     longest as the layer stands (median half-life of their channels with the input term at zero; in a trained layer
-    the ones that cost least to take). Their rate ``A`` is 1, each head's decay channels get half-lives spread
+    the ones that cost least to take), or with ``pick`` "shortest" the heads whose memory is shortest (the longest
+    heads of a trained layer may be the ones that carry what distal signal it has). Their rate ``A`` is 1, each head's decay channels get half-lives spread
     log-uniformly from ``lo`` to ``hi`` steps (``dt = ln 2 / half-life``; every slow head has the whole range), and
     the input-dependent part of those channels (the last map of ``f_proj``) is zeroed, so each channel's decay per
     step is exactly ``2 ** (-1 / half-life)`` for every input. Returns the heads taken. The layer draws its decays
@@ -583,10 +585,12 @@ def set_slow_heads(mixer: nn.Module, heads: int, lo: float, hi: float) -> list[i
         raise ValueError(f"{heads} slow heads asked of a layer with {n_heads}")
     if not 1 < lo <= hi:
         raise ValueError("slow half-lives are more than one step, lo <= hi")
+    if pick not in ("longest", "shortest"):
+        raise ValueError("slow_pick is 'longest' or 'shortest'")
     half = torch.logspace(math.log10(lo), math.log10(hi), per, dtype=torch.float64)
     with torch.no_grad():
         now = math.log(2.0) / (mixer.A_log.double().exp()[:, None] * F.softplus(mixer.dt_bias.double().view(n_heads, per)))
-        taken = torch.argsort(now.median(1).values, descending=True, stable=True)[:heads].tolist()
+        taken = torch.argsort(now.median(1).values, descending=pick == "longest", stable=True)[:heads].tolist()
         for k in taken:
             mixer.A_log[k] = 0.0
             mixer.dt_bias[k * per:(k + 1) * per] = torch.log(torch.expm1(math.log(2.0) / half)).float()   # inverse softplus
@@ -607,7 +611,7 @@ def apply_slow_heads(model: "KronGenome") -> int:
         for mixer in (block.forward_mixer, block.backward_mixer):
             if mixer is not None and hasattr(mixer, "dt_bias"):
                 lo, hi = (float(b) / 2 ** c.n_down for b in c.slow_range)
-                set_slow_heads(mixer, c.slow_heads, lo, hi)
+                set_slow_heads(mixer, c.slow_heads, lo, hi, c.slow_pick)
                 n += 1
     return n
 
