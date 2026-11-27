@@ -341,3 +341,24 @@ Selection `$SCRATCH/kron-dna-build/tracks/dnase-pilot-v1/select.tsv`; downloads 
 - **Codon head:** arm finished (train 1-cosine 0.561 to 0.505, no cost to the trunk); readout `codon_eval.py`
   (7576c42), not yet run on a card; the trainer runs it.
 - **Waiting on Anton:** Addgene login; hictk row; HF publishing of track stores.
+
+## 27 Nov, 23:00 (night)
+
+- **Astra's implementation review, model side, done** (Anton: "fix where you agree"): the coarse block keeps the
+  core's segments (90334b7; one segment per row gives what it gave before, difference 0.0), `coarse_local` is the
+  control without mixing between positions, `set_slow_heads` takes the longest-memory heads, each with the whole
+  range, as the trainer's surgery did; `slow_pick` "shortest" (8c48d1a) leaves the long heads alone (arm s2).
+  `diag/slow_band.py` (d340100) shortens one band of half-lives in a checkpoint for rescoring.
+- **Arms s (slow memory) and ca (coarse attention): level with mask a** on enhancer-gene AUPRC (scorer v2). The
+  reading everyone holds now: nothing in training asks for reach. Two routes to a loss that does: the trainer's
+  promoter-hole arm p, and contact maps (mine).
+- **Hi-C: own reader, no outside code** (`scripts/kron_dna/prep_hic.py`, a1309ed): the hictk question to Anton is
+  closed. Stores for 6 cell lines under `interim/contacts/hg38/intact-<line>-5kb` (5 kb cells, 201 diagonals,
+  observed / expected, float16). Checked against each file: counts read / file's own sum = 1.000000 everywhere.
+  Depth: beyond 250 kb only GM12878 is dense (others 27-48 % empty pairs at 500 kb).
+- **Contact head** (`src/kron_dna/contacts.py`, b65bef5): `ContactStores.window`, `ContactHead` on forward's core
+  states, `contact_loss`, `contact_correlation`. Handed to the trainer to wire (general chat). Noise ceiling at
+  5 kb is low (cell lines correlate 0.26-0.47 with each other on one window): if the loss does not move, pool to
+  10 or 25 kb cells before judging.
+- Not done: a card run of any of this; ONNX export of a coarse-block model after the segment change.
+- Still waiting on Anton: Addgene login (by direct message); publishing track stores.
