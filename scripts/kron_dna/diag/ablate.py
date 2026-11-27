@@ -10,6 +10,12 @@ tower's skips. Inference only; one card.
     python scripts/kron_dna/diag/ablate.py reset CKPT BENCH OUT.json [--reach 8192 32768 131072] [--windows 32]
     python scripts/kron_dna/diag/ablate.py cpg CKPT BENCH OUT.json [--windows 32] [--passes 2]
     python scripts/kron_dna/diag/ablate.py spans CKPT BENCH OUT.json [--lens 1024 4096 16384] [--windows 16]
+    python scripts/kron_dna/diag/ablate.py flanks CKPT BENCH OUT.json [--keep 0 32768 131072] [--windows 32]
+
+``flanks`` (Astra 6.2's flank replacement): keep the scored window plus KEEP bases each side, replace everything
+beyond with the same stretch of another benchmark window (real sequence, window i takes the flanks of window i + n/2), and
+measure how far every head's output on the scored window moves (relative L2 of raw outputs), and DNase Pearson
+against the frozen targets, paired over windows. It tests use of distant DNA through every path, not only the core.
 
 ``spans``: masked bases inside contiguous blocks (every base of a block MASK, blocks covering about 10 % of the central
 window, placed at random with a fixed seed), scored for the intact model, with every core layer skipped, and with the
@@ -74,9 +80,11 @@ class Genome:
 def classes_of(genes, off: int) -> np.ndarray:
     """Per base of the window at layout offset ``off``: the class index in CLASSES (priority CDS first)."""
     gid = list(genes.ids)
-    g = genes.window(off, WIN, WIN).astype(bool)
+    pad = 1000                                     # start sites up to 1 kb outside the window still make promoters
+    g = genes.window(off - pad, WIN + 2 * pad, WIN + 2 * pad).astype(bool)
     ch = lambda n: g[:, gid.index(n + "_plus")] | g[:, gid.index(n + "_minus")]  # noqa: E731
-    tss = np.convolve(ch("tss").astype(np.int32), np.ones(2001, np.int32), "same") > 0
+    tss = (np.convolve(ch("tss").astype(np.int32), np.ones(2001, np.int32), "same") > 0)[pad:pad + WIN]
+    g = g[pad:pad + WIN]
     cls = np.full(WIN, 6, np.int8)
     for k, m in [(5, ch("intron")), (4, tss), (3, ch("ncexon")), (2, ch("utr3")), (1, ch("utr5")), (0, ch("cds"))]:
         cls[m] = k
@@ -93,8 +101,16 @@ class Runner:
         self.model.x_span = (FL, FL + WIN) if heads else None
         self.unit = 2 ** self.model.config.n_down
 
-    def run(self, seq: torch.Tensor) -> torch.Tensor:
+    def reset_segments(self, reach: int) -> torch.Tensor:
+        """Segment ids restarting the core's recurrence ``reach`` bases each side of the central window."""
         seg = torch.zeros(1, CTX // self.unit, dtype=torch.long, device=self.dev)
+        lo, hi = (FL - reach) // self.unit, (FL + WIN + reach) // self.unit
+        seg[:, lo:hi] = 1
+        seg[:, hi:] = 2
+        return seg
+
+    def run(self, seq: torch.Tensor, seg: torch.Tensor | None = None) -> torch.Tensor:
+        seg = seg if seg is not None else torch.zeros(1, CTX // self.unit, dtype=torch.long, device=self.dev)
         ctx = torch.zeros(1, dtype=torch.long, device=self.dev) if self.model.config.n_contexts > 0 else None
         with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
             return self.model(seq[None], seg, ctx)[0][0, FL:FL + WIN].float()
@@ -128,7 +144,10 @@ def cmd_classes(a):
         codes = gen.codes(row["chrom"], row["start"] - FL, row["end"] + FL)
         cls, rp, mid = classes_of(genes, off), gen.repeat[off:off + WIN] > 0, codes[FL:FL + WIN]
         gc = np.isin(mid, (1, 2)).reshape(-1, 128).mean(1).repeat(128)
-        cp = ((mid == 1) & (np.roll(mid, -1) == 2)) | ((mid == 2) & (np.roll(mid, 1) == 1))
+        cp = np.zeros(WIN, bool)                     # C of a CpG and its G, no wrap at the window's ends
+        dinuc = (mid[:-1] == 1) & (mid[1:] == 2)
+        cp[:-1] |= dinuc
+        cp[1:] |= dinuc
         ws, wn = 0.0, 0
         for k in range(a.passes):
             pos, bits, hit = r.masked(codes, 1000 * w + k)
@@ -215,7 +234,8 @@ def cmd_skips(a):
     for i in range(r.model.config.n_down):
         h = r.model.skip_proj[i].register_forward_hook(lambda m, i_, o: torch.zeros_like(o))
         b = bits(); h.remove()
-        print(f"skip {i} ({2 ** i} bp level) zeroed: {b:.4f} ({b - b0:+.4f})", flush=True)
+        level = 2 ** (r.model.config.n_down - 1 - i)   # decode() reads the skips coarsest first (skip_proj[0])
+        print(f"skip_proj[{i}] ({level} bp level) zeroed: {b:.4f} ({b - b0:+.4f})", flush=True)
 
 
 def _dnase_setup(a, r):
@@ -348,7 +368,8 @@ def cmd_spans(a):
     orig = list(r.model.core)
     res = dict(ckpt=a.ckpt, windows=win.height, lens={})
     for L in a.lens:
-        out = {m: [] for m in ("intact", "core layers skipped", "core zeroed")}
+        modes = ["intact", "core layers skipped", "core zeroed"] + [f"core reset {d // 1024} kb" for d in a.reach]
+        out = {m: [] for m in modes}
         for w, codes in enumerate(rows):
             rng = np.random.default_rng(10_000 * w + L)
             n_blk = max(1, int(0.1 * WIN / L)); starts = np.sort(rng.choice(WIN // L, n_blk, replace=False)) * L
@@ -363,13 +384,53 @@ def cmd_spans(a):
                 r.model.core = torch.nn.ModuleList([Skip() for _ in orig] if mode == "core layers skipped" else orig)
                 hook = r.model.core_norm.register_forward_hook(lambda m_, i_, o: torch.zeros_like(o)) \
                     if mode == "core zeroed" else None
-                lg = r.run(s2)[torch.from_numpy(at).to(r.dev)]
+                seg = r.reset_segments(int(mode.split()[2]) * 1024) if mode.startswith("core reset") else None
+                lg = r.run(s2, seg)[torch.from_numpy(at).to(r.dev)]
                 if hook is not None:
                     hook.remove()
                 out[mode].append(float((F.cross_entropy(lg, lab) / np.log(2)).item()))
             r.model.core = torch.nn.ModuleList(orig)
         res["lens"][str(L)] = {m: float(np.mean(v)) for m, v in out.items()}
         print(L, json.dumps(res["lens"][str(L)]), flush=True)
+    json.dump(res, open(a.out, "w"), indent=1)
+
+
+def cmd_flanks(a):
+    win = windows(a.bench, a.windows); gen = Genome()
+    r = Runner(a.ckpt)
+    heads = [h[0] for h in r.model.config.xheads]
+    r.model.x_active = set(heads); r.model.x_span = (FL, FL + WIN)
+    meta = json.load(open(f"{a.bench}/targets.json")); ds = X.open_store(meta["dnase_store"]); consts = ds.consts(r.dev)
+    tgt = np.load(f"{a.bench}/target_dnase_128.npy")[:win.height]
+    rows = [gen.codes(row["chrom"], row["start"] - FL, row["end"] + FL) for row in win.iter_rows(named=True)]
+    seg = torch.zeros(1, CTX // r.unit, dtype=torch.long, device=r.dev)
+    ctx = torch.zeros(1, dtype=torch.long, device=r.dev) if r.model.config.n_contexts > 0 else None
+
+    def outputs(codes):
+        with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
+            r.model(torch.from_numpy(codes).to(r.dev)[None], seg, ctx)
+        o = {h: r.model.last_x[h][0].float().clone() for h in heads}
+        if r.model.last_ntv3 is not None:
+            o["ntv3"] = r.model.last_ntv3[0, FL:FL + WIN].float().clone()
+        pd = o["dnase"]; p_log, _ = X.eval_pair(ds, pd, torch.zeros_like(pd), consts)
+        return o, p_log.cpu().numpy().reshape(-1, 128, p_log.shape[-1]).mean(1)
+
+    base = [outputs(c) for c in rows]
+    res = dict(ckpt=a.ckpt, windows=win.height, keep={})
+    for keep in a.keep:
+        lo, hi = FL - keep, FL + WIN + keep
+        moves = {k: [] for k in base[0][0]}; preds = []
+        for i, c in enumerate(rows):
+            donor = rows[(i + len(rows) // 2) % len(rows)]   # a distant window, never an overlapping neighbour
+            sw = donor.copy(); sw[lo:hi] = c[lo:hi]
+            o, d128 = outputs(sw)
+            preds.append(d128)
+            for k in o:
+                moves[k].append(float((o[k] - base[i][0][k]).norm() / (base[i][0][k].norm() + 1e-9)))
+        p = np.stack(preds); b = np.stack([x[1] for x in base])
+        res["keep"][str(keep)] = dict(output_move={k: float(np.mean(v)) for k, v in moves.items()},
+                                      **_paired(tgt, (b, np.zeros(len(rows))), (p, np.zeros(len(rows)))))
+        print(keep, json.dumps(res["keep"][str(keep)]), flush=True)
     json.dump(res, open(a.out, "w"), indent=1)
 
 
@@ -389,9 +450,12 @@ def main():
     p.add_argument("--windows", type=int, default=32); p.add_argument("--passes", type=int, default=2)
     p = sub.add_parser("spans"); p.add_argument("ckpt"); p.add_argument("bench"); p.add_argument("out")
     p.add_argument("--lens", nargs="+", type=int, default=[1024, 4096, 16384]); p.add_argument("--windows", type=int, default=16)
+    p.add_argument("--reach", nargs="*", type=int, default=[8192, 32768, 131072])
+    p = sub.add_parser("flanks"); p.add_argument("ckpt"); p.add_argument("bench"); p.add_argument("out")
+    p.add_argument("--keep", nargs="+", type=int, default=[0, 32768, 131072]); p.add_argument("--windows", type=int, default=32)
     a = ap.parse_args()
     dict(classes=cmd_classes, core=cmd_core, layers=cmd_layers, skips=cmd_skips, joint=cmd_joint, reset=cmd_reset,
-         cpg=cmd_cpg, spans=cmd_spans)[a.cmd](a)
+         cpg=cmd_cpg, spans=cmd_spans, flanks=cmd_flanks)[a.cmd](a)
 
 
 if __name__ == "__main__":
