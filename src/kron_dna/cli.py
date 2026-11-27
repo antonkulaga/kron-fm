@@ -1043,6 +1043,20 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                  inter_parallel: bool = typer.Option(False, help="with --inter-levels: run the blocks on a side branch "
                                                      "from the encoder level to the decoder level (model config "
                                                      "inter_parallel; the branch's added term starts at zero)"),
+                 slow_layers: str = typer.Option("", help="core layers (0-based, comma separated) whose first --slow-heads "
+                                                  "heads per direction start with slow memory (model config "
+                                                  "slow_layers; half-lives over --slow-range). With --init from a "
+                                                  "checkpoint trained without them, set again after the load"),
+                 slow_heads: int = typer.Option(2, help="with --slow-layers: heads per direction and layer made slow"),
+                 slow_range: str = typer.Option("30000,1000000", help="with --slow-layers: the half-lives' range in bases, "
+                                                "spread log-uniformly over those heads' channels"),
+                 coarse_ratio: int = typer.Option(0, help="> 0: a block over the core states pooled by this many bins "
+                                                  "(model config coarse_ratio; 16 at 128-bp bins = 2,048 bp); it "
+                                                  "starts at zero, so --init from a checkpoint without it is unchanged"),
+                 coarse_after: int = typer.Option(5, help="with --coarse-ratio: the block runs after this many core layers"),
+                 coarse_kind: str = typer.Option("attention", help="with --coarse-ratio: 'attention' or 'kron'"),
+                 coarse_width: int = typer.Option(128, help="with --coarse-ratio: the block's width"),
+                 coarse_heads: int = typer.Option(4, help="with --coarse-ratio: its attention heads"),
                  codon_dims: int = typer.Option(0, help="a codon head predicting this many projected protein features "
                                                 "per codon from the decoder (model config codon_dims). 0: none"),
                  codon_store: Path = typer.Option(None, help="with --codon-weight: the primary genome's codon store "
@@ -2333,6 +2347,10 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                                 n_ntv3=len(ntv3["ids"]) if ntv3 else 0,
                                 chunk_length_feature=chunk_length_feature,
                                 bin_convs=bin_convs, inter_width=inter_width, codon_dims=codon_dims, inter_parallel=inter_parallel,
+                                slow_layers=[int(v_) for v_ in slow_layers.split(",") if v_.strip()], slow_heads=slow_heads,
+                                slow_range=[int(v_) for v_ in slow_range.split(",")], coarse_ratio=coarse_ratio,
+                                coarse_after=coarse_after, coarse_kind=coarse_kind, coarse_width=coarse_width,
+                                coarse_heads=coarse_heads,
                                 inter_levels=[int(v_) for v_ in inter_levels.split(",") if v_.strip()],
                                 **(dict(zip(("local_width", "local_layers", "local_span"),
                                             map(int, local_track.split(",")))) if local_track else {}))
@@ -2568,6 +2586,10 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
         grown, notes = G.expand_state_dict(init_state["model"], model, new_contexts=new_contexts)
         missing, unexpected = model.load_state_dict(grown, strict=False)
         say(f"initialised from {init}; new: {missing}; dropped: {unexpected}; padded: {notes or 'nothing'}")
+        if model.config.slow_layers and not (init_state.get("config") or {}).get("slow_layers"):
+            # the load overwrote the slow init: set it again on the checkpoint's weights (the builder's apply_slow_heads)
+            say(f"--slow-layers {model.config.slow_layers}: slow heads set again after the load in "
+                f"{G.apply_slow_heads(model)} mixers")
         if grow_core:                                  # --grow-core: a shallower trunk's core grown to this depth
             n_old_ = len({k_.split(".")[1] for k_ in init_state["model"] if k_.startswith("core.")})
             if n_old_ >= len(model.core):
