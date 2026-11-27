@@ -6,7 +6,9 @@ For each gene (its TSS = read_pos, its cell type's RNA channels = channel_ids, h
 centred on the TSS: the head's predicted RNA summed over the TSS bin and its two neighbours, and its gradient with
 respect to the one-hot input. Each candidate element's score is |sum over the element of gradient x input|. Elements
 farther than --reach from the TSS are left out (the window reaches +-context/2). Writes one row per pair with its score;
-AUPRC by distance bin, beside a distance-only baseline, is printed at the end.
+AUPRC by distance bin (all pairs, then the pair split's train and pair_test genes), beside a distance-only baseline,
+is printed at the end. v2 (27 Nov, Astra's review): the head's softplus is differentiated (--raw for v1), average
+precision counts tied scores together, and each row carries its element's coordinates and split.
 """
 from __future__ import annotations
 
@@ -25,14 +27,17 @@ CTX, BIN = 1048576, 128
 
 
 def ap(score: np.ndarray, label: np.ndarray) -> float:
-    o = np.argsort(-score); l = label[o].astype(float); tp = np.cumsum(l); k = np.arange(1, len(l) + 1)
-    return float((tp[l > 0] / k[l > 0]).mean()) if l.sum() else float("nan")
+    """Average precision with tied scores counted together (sklearn's), so the order of rows does not matter."""
+    from sklearn.metrics import average_precision_score
+    return float(average_precision_score(label.astype(int), score)) if label.sum() else float("nan")
 
 
 def main():
     a = argparse.ArgumentParser(); a.add_argument("ckpt"); a.add_argument("pairs"); a.add_argument("out")
     a.add_argument("--max-genes", type=int, default=0); a.add_argument("--reach", type=int, default=250000)
     a.add_argument("--context", type=int, default=524288, help="window length (1 Mb needs more than a shared card)")
+    a.add_argument("--raw", action="store_true", help="differentiate the head's raw output (v1); default: its softplus, "
+                   "the value training and evaluation score")
     a = a.parse_args()
     global CTX
     CTX = a.context
@@ -73,7 +78,8 @@ def main():
         rel = (tss - lo) - a0
         step = (a1 - a0) // out.shape[0]
         k = rel // step
-        y = out[max(0, k - 1):k + 2, ch].sum()
+        y = out[max(0, k - 1):k + 2, ch]
+        y = (y if a.raw else torch.nn.functional.softplus(y)).sum()
         model.zero_grad(set_to_none=True)
         y.backward()
         gx = (x.grad[0] * x[0].detach()).sum(0)                              # [L] gradient x input at the true base
@@ -81,19 +87,23 @@ def main():
             s, e = r["del_start"] - lo, max(r["del_end"], r["del_start"] + 1) - lo
             if 0 <= s < CTX and 0 < e <= CTX:
                 rows.append(dict(gene=r["gene"], cell_type=r["cell_type"], distance=r["distance"], regulated=r["regulated"],
-                                 bench_set=r["bench_set"], score=float(gx[s:e].sum().abs())))
+                                 bench_set=r["bench_set"], chrom=r["chrom"], del_start=r["del_start"], del_end=r["del_end"],
+                                 split=r["split"], score=float(gx[s:e].sum().abs())))
         if gi % 50 == 0:
             print(f"gene {gi + 1}/{genes.height}, {len(rows)} pairs, {time.time() - t0:.0f} s, peak "
                   f"{torch.cuda.max_memory_allocated() / 2**30:.1f} GiB", flush=True)
     df = pl.DataFrame(rows); df.write_parquet(a.out)
     bins = [(0, 10_000), (10_000, 100_000), (100_000, a.reach)]
-    for lo_, hi_ in bins:
-        d = df.filter((pl.col("distance").abs() >= lo_) & (pl.col("distance").abs() < hi_))
-        if d.height == 0:
-            continue
-        lab = d["regulated"].to_numpy()
-        print(f"{lo_:>7}-{hi_:<7} pairs {d.height:5d} positives {int(lab.sum()):4d}  AUPRC gradient {ap(d['score'].to_numpy(), lab):.3f}"
-              f"  distance-only {ap(-d['distance'].abs().to_numpy().astype(float), lab):.3f}  base rate {lab.mean():.3f}")
+    for split in ("all", "train", "pair_test"):          # pair_test: genes held out of the pair split
+        ds = df if split == "all" else df.filter(pl.col("split") == split)
+        for lo_, hi_ in bins:
+            d = ds.filter((pl.col("distance").abs() >= lo_) & (pl.col("distance").abs() < hi_))
+            if d.height == 0:
+                continue
+            lab = d["regulated"].to_numpy()
+            print(f"{split:9s} {lo_:>7}-{hi_:<7} pairs {d.height:5d} positives {int(lab.sum()):4d}  AUPRC gradient "
+                  f"{ap(d['score'].to_numpy(), lab):.3f}  distance-only {ap(-d['distance'].abs().to_numpy().astype(float), lab):.3f}"
+                  f"  base rate {lab.mean():.3f}")
 
 
 if __name__ == "__main__":
