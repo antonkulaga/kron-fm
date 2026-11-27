@@ -611,7 +611,8 @@ class CoarseBlock(nn.Module):
     repeated back to the bins and added through a map that starts at zero. ``kind`` "attention": pre-norm
     self-attention over the row's positions, sinusoidal positions added to its input, then an MLP; every position
     reads every other in one step, whatever their distance. "kron": a bidirectional KronLSTM block, each row its
-    own document. A row is pooled as it stands: a packed gap or padding inside it is averaged over."""
+    own document. A row is pooled as it stands: a packed gap or padding inside it is averaged over.
+    Rows of any length are taken (the last position may be short); nothing is skipped."""
 
     def __init__(self, d_model: int, width: int, heads: int, kind: str, ratio: int, index: int) -> None:
         super().__init__()
@@ -635,11 +636,15 @@ class CoarseBlock(nn.Module):
         return torch.cat([ang.sin(), ang.cos()], 1).to(dtype)
 
     def forward(self, h: torch.Tensor) -> torch.Tensor:
-        """``[B, bins, d_model]`` -> the same shape; ``bins`` a multiple of ``ratio``."""
+        """``[B, bins, d_model]`` -> the same shape. A row whose bins are not a multiple of ``ratio`` (a short
+        packed row, e.g. organelle genomes) ends in one shorter position, the mean of the bins it has."""
         b, n, d = h.shape
-        if n % self.ratio:
-            raise ValueError(f"{n} bins per row is not a multiple of coarse_ratio {self.ratio}")
-        z = self.inp(h.reshape(b, n // self.ratio, self.ratio, d).mean(2))
+        p, rest = -(-n // self.ratio), n % self.ratio
+        if rest:
+            whole = h[:, :n - rest].reshape(b, p - 1, self.ratio, d).mean(2)
+            z = self.inp(torch.cat([whole, h[:, n - rest:].mean(1, keepdim=True)], 1))
+        else:
+            z = self.inp(h.reshape(b, p, self.ratio, d).mean(2))
         if self.kind == "kron":
             p = z.shape[1]
             cu = torch.arange(0, b * p + 1, p, device=h.device, dtype=torch.int32)
@@ -649,7 +654,7 @@ class CoarseBlock(nn.Module):
             q = self.norm1(z)
             z = z + self.attn(q, q, q, need_weights=False)[0]
             z = z + self.mlp(self.norm2(z))
-        return h + torch.repeat_interleave(self.out(z), self.ratio, dim=1)
+        return h + torch.repeat_interleave(self.out(z), self.ratio, dim=1)[:, :n]
 
 
 def bin_dilations(n: int) -> list[int]:

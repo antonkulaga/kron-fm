@@ -99,8 +99,32 @@ def test_attention_reads_the_far_end_of_a_row_and_rows_stay_apart(cpu_mixer):
         moved = block(far)
     assert float((moved[0, :4] - base[0, :4]).abs().max()) > 1e-5     # row 0's first position sees it
     assert torch.allclose(moved[1], base[1], atol=1e-6)               # row 1 does not
-    with pytest.raises(ValueError):
-        block(torch.randn(1, 30, 32))
+
+
+@pytest.mark.parametrize("kind", ["attention", "kron"])
+def test_a_row_that_is_not_whole_positions_ends_in_a_short_one(cpu_mixer, kind):
+    """Short packed rows (the organelle slice gives 20 bins against a ratio of 16) are taken, not skipped."""
+    m = small(coarse_ratio=16, coarse_kind=kind)
+    shake(m)
+    block = m.coarse
+    h = torch.randn(2, 20, 32)
+    with torch.no_grad():
+        out = block(h)
+        assert out.shape == h.shape and not torch.allclose(out, h, atol=1e-4)
+        add = out - h
+        assert torch.allclose(add[:, :16], add[:, :1].expand(-1, 16, -1), atol=1e-6)     # one value per position
+        assert torch.allclose(add[:, 16:], add[:, 16:17].expand(-1, 4, -1), atol=1e-6)
+        assert not torch.allclose(add[:, 15], add[:, 16], atol=1e-5)
+        moved = h.clone()
+        moved[0, 19] += 1.0                                           # the short tail's own bin moves its position
+        assert not torch.allclose(block(moved)[0, 16:] - moved[0, 16:], add[0, 16:], atol=1e-5)
+        short = block(torch.randn(1, 5, 32))                          # shorter than one position
+        assert short.shape == (1, 5, 32)
+        whole = torch.randn(1, 32, 32)                                # whole rows are as before
+        assert torch.allclose(block(whole), block(torch.cat([whole, whole[:, :0]], 1)))
+    seq = torch.randint(0, 4, (2, 160))                               # 20 bins of 8 bp through the whole model
+    with torch.no_grad():
+        assert m(seq)[0].shape[:2] == (2, 160)
 
 
 @pytest.mark.parametrize("kind", ["attention", "kron"])
