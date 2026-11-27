@@ -1043,10 +1043,10 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                  inter_parallel: bool = typer.Option(False, help="with --inter-levels: run the blocks on a side branch "
                                                      "from the encoder level to the decoder level (model config "
                                                      "inter_parallel; the branch's added term starts at zero)"),
-                 slow_layers: str = typer.Option("", help="core layers (0-based, comma separated) whose first --slow-heads "
+                 slow_layers: str = typer.Option("", help="core layers (0-based, comma separated) whose --slow-heads longest-memory "
                                                   "heads per direction start with slow memory (model config "
                                                   "slow_layers; half-lives over --slow-range). With --init from a "
-                                                  "checkpoint trained without them, set again after the load"),
+                                                  "checkpoint whose slow heads differ (none, or other layers, heads or range), set again after the load"),
                  slow_heads: int = typer.Option(2, help="with --slow-layers: heads per direction and layer made slow"),
                  slow_range: str = typer.Option("30000,1000000", help="with --slow-layers: the half-lives' range in bases, "
                                                 "spread log-uniformly over those heads' channels"),
@@ -2586,10 +2586,14 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
         grown, notes = G.expand_state_dict(init_state["model"], model, new_contexts=new_contexts)
         missing, unexpected = model.load_state_dict(grown, strict=False)
         say(f"initialised from {init}; new: {missing}; dropped: {unexpected}; padded: {notes or 'nothing'}")
-        if model.config.slow_layers and not (init_state.get("config") or {}).get("slow_layers"):
-            # the load overwrote the slow init: set it again on the checkpoint's weights (the builder's apply_slow_heads)
+        src_cfg_ = init_state.get("config") or {}
+        slow_ = lambda c_: (sorted(int(v_) for v_ in (c_.get("slow_layers") or [])), int(c_.get("slow_heads", 2)),
+                            [int(v_) for v_ in (c_.get("slow_range") or [30_000, 1_000_000])])
+        if model.config.slow_layers and slow_(src_cfg_) != slow_(vars(model.config)):
+            # the load overwrote the slow init, or the checkpoint's slow heads were set otherwise (other layers, heads
+            # or range): set them again on the checkpoint's weights (the builder's apply_slow_heads, every listed layer)
             say(f"--slow-layers {model.config.slow_layers}: slow heads set again after the load in "
-                f"{G.apply_slow_heads(model)} mixers")
+                f"{G.apply_slow_heads(model)} mixers (the checkpoint's: {slow_(src_cfg_)})")
         if grow_core:                                  # --grow-core: a shallower trunk's core grown to this depth
             n_old_ = len({k_.split(".")[1] for k_ in init_state["model"] if k_.startswith("core.")})
             if n_old_ >= len(model.core):
