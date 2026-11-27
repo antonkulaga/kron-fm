@@ -97,8 +97,8 @@ class KronGenomeConfig:
     inter_parallel: bool = False  # the same two blocks per level as a side branch instead of inside the tower: the
                                 # encoder's features of the level go through both, and (output - input) is added to
                                 # the decoder at that level (zero at the start); the tower itself stays plain
-    slow_layers: list = field(default_factory=list)   # core layers (0-based) whose first slow_heads heads start
-                                # with a slow memory, in both directions (set_slow_heads)
+    slow_layers: list = field(default_factory=list)   # core layers (0-based) where slow_heads heads (the ones with
+                                # the longest memory) start with a slow memory, in both directions (set_slow_heads)
     slow_heads: int = 2         # heads per direction and layer that are made slow
     slow_range: list = field(default_factory=lambda: [30_000, 1_000_000])   # their channels' half-lives, bases,
                                 # spread log-uniformly from the first to the second
@@ -568,12 +568,14 @@ class InterKron(nn.Module):
         return x + self.out(h.reshape(b, n, -1).transpose(1, 2))
 
 
-def set_slow_heads(mixer: nn.Module, heads: int, lo: float, hi: float) -> None:
-    """The first ``heads`` heads of a KronLSTM mixer get a slow memory, until training moves it: their rate ``A``
-    is 1, their decay channels get half-lives spread log-uniformly from ``lo`` to ``hi`` steps (``dt = ln 2 /
-    half-life``), and the input-dependent part of those channels (the last map of ``f_proj``) is zeroed, so each
-    channel's decay per step is exactly ``2 ** (-1 / half-life)`` for every input. The layer draws its decays for
-    token-level language: a typical channel keeps a signal for about 12 steps, and a trained model has kept that
+def set_slow_heads(mixer: nn.Module, heads: int, lo: float, hi: float) -> list[int]:
+    """``heads`` heads of a KronLSTM mixer get a slow memory, until training moves it: the heads whose memory is
+    longest as the layer stands (median half-life of their channels with the input term at zero; in a trained layer
+    the ones that cost least to take). Their rate ``A`` is 1, each head's decay channels get half-lives spread
+    log-uniformly from ``lo`` to ``hi`` steps (``dt = ln 2 / half-life``; every slow head has the whole range), and
+    the input-dependent part of those channels (the last map of ``f_proj``) is zeroed, so each channel's decay per
+    step is exactly ``2 ** (-1 / half-life)`` for every input. Returns the heads taken. The layer draws its decays
+    for token-level language: a typical channel keeps a signal for about 12 steps, and a trained model has kept that
     (F at 128-bp bins: median half-life 0.5 to 2.7 kb per layer); nothing in a local loss asks for more."""
     n_heads = mixer.A_log.shape[0]
     per = mixer.dt_bias.shape[0] // n_heads
@@ -581,11 +583,15 @@ def set_slow_heads(mixer: nn.Module, heads: int, lo: float, hi: float) -> None:
         raise ValueError(f"{heads} slow heads asked of a layer with {n_heads}")
     if not 1 < lo <= hi:
         raise ValueError("slow half-lives are more than one step, lo <= hi")
-    half = torch.logspace(math.log10(lo), math.log10(hi), heads * per, dtype=torch.float64)
+    half = torch.logspace(math.log10(lo), math.log10(hi), per, dtype=torch.float64)
     with torch.no_grad():
-        mixer.A_log[:heads] = 0.0
-        mixer.dt_bias[:heads * per] = torch.log(torch.expm1(math.log(2.0) / half)).float()     # inverse softplus
-        mixer.f_proj[-1].weight[:heads * per] = 0.0
+        now = math.log(2.0) / (mixer.A_log.double().exp()[:, None] * F.softplus(mixer.dt_bias.double().view(n_heads, per)))
+        taken = torch.argsort(now.median(1).values, descending=True, stable=True)[:heads].tolist()
+        for k in taken:
+            mixer.A_log[k] = 0.0
+            mixer.dt_bias[k * per:(k + 1) * per] = torch.log(torch.expm1(math.log(2.0) / half)).float()   # inverse softplus
+            mixer.f_proj[-1].weight[k * per:(k + 1) * per] = 0.0
+    return taken
 
 
 def apply_slow_heads(model: "KronGenome") -> int:
@@ -609,10 +615,11 @@ def apply_slow_heads(model: "KronGenome") -> int:
 class CoarseBlock(nn.Module):
     """One block over the core's states pooled to coarse positions (``ratio`` bins each, by mean), its output
     repeated back to the bins and added through a map that starts at zero. ``kind`` "attention": pre-norm
-    self-attention over the row's positions, sinusoidal positions added to its input, then an MLP; every position
-    reads every other in one step, whatever their distance. "kron": a bidirectional KronLSTM block, each row its
-    own document. A row is pooled as it stands: a packed gap or padding inside it is averaged over.
-    Rows of any length are taken (the last position may be short); nothing is skipped."""
+    self-attention over a segment's positions, sinusoidal positions added to its input, then an MLP; every position
+    reads every other of its segment in one step, whatever their distance. "kron": a bidirectional KronLSTM block.
+    It keeps the core's segments (``cu_seqlens``): positions are pooled inside a segment, counted from its start,
+    and nothing is read across a segment's edge (a packed gap, another contig, padding), as in the core's own
+    layers. A segment of any length is taken: one that is not whole positions ends in a shorter one."""
 
     def __init__(self, d_model: int, width: int, heads: int, kind: str, ratio: int, index: int) -> None:
         super().__init__()
@@ -629,32 +636,46 @@ class CoarseBlock(nn.Module):
             self.attn = nn.MultiheadAttention(width, heads, batch_first=True)
             self.mlp = nn.Sequential(nn.Linear(width, 2 * width), nn.GELU(), nn.Linear(2 * width, width))
 
-    def positions(self, n: int, device, dtype) -> torch.Tensor:
+    def positions(self, index: torch.Tensor, dtype) -> torch.Tensor:
         half = self.width // 2
-        freq = torch.exp(-math.log(10000.0) * torch.arange(half, device=device, dtype=torch.float32) / half)
-        ang = torch.arange(n, device=device, dtype=torch.float32).unsqueeze(1) * freq
+        freq = torch.exp(-math.log(10000.0) * torch.arange(half, device=index.device, dtype=torch.float32) / half)
+        ang = index.to(torch.float32).unsqueeze(1) * freq
         return torch.cat([ang.sin(), ang.cos()], 1).to(dtype)
 
-    def forward(self, h: torch.Tensor) -> torch.Tensor:
-        """``[B, bins, d_model]`` -> the same shape. A row whose bins are not a multiple of ``ratio`` (a short
-        packed row, e.g. organelle genomes) ends in one shorter position, the mean of the bins it has."""
-        b, n, d = h.shape
-        p, rest = -(-n // self.ratio), n % self.ratio
-        if rest:
-            whole = h[:, :n - rest].reshape(b, p - 1, self.ratio, d).mean(2)
-            z = self.inp(torch.cat([whole, h[:, n - rest:].mean(1, keepdim=True)], 1))
-        else:
-            z = self.inp(h.reshape(b, p, self.ratio, d).mean(2))
+    def forward(self, h: torch.Tensor, cu: torch.Tensor, local: bool = False) -> torch.Tensor:
+        """``[N, d_model]`` packed bins and their segments' edges ``cu`` (as the core's layers take them) -> the same
+        shape. ``local`` (a control for evaluation): every position reads only itself, so what is left is the
+        pooling, the positions and the maps, without any mixing between positions."""
+        n, r, dev = h.shape[0], self.ratio, h.device
+        lens = torch.diff(cu.to(torch.long))
+        lens = lens[lens > 0]
+        if int(lens.sum()) != n:
+            raise ValueError(f"segments cover {int(lens.sum())} of {n} bins")
+        s = lens.numel()
+        per = (lens + r - 1) // r                                      # positions per segment
+        start, first = torch.cumsum(lens, 0) - lens, torch.cumsum(per, 0) - per
+        seg = torch.repeat_interleave(torch.arange(s, device=dev), lens)
+        pos = first[seg] + (torch.arange(n, device=dev) - start[seg]) // r        # each bin's position
+        p = int(per.sum())
+        count = torch.zeros(p, device=dev, dtype=h.dtype).index_add_(0, pos, torch.ones(n, device=dev, dtype=h.dtype))
+        z = self.inp(torch.zeros(p, h.shape[1], device=dev, dtype=h.dtype).index_add_(0, pos, h) / count.unsqueeze(1))
+        seg_p = torch.repeat_interleave(torch.arange(s, device=dev), per)
+        within = torch.arange(p, device=dev) - first[seg_p]             # a position's index in its segment
         if self.kind == "kron":
-            p = z.shape[1]
-            cu = torch.arange(0, b * p + 1, p, device=h.device, dtype=torch.int32)
-            z = self.block(z.reshape(1, b * p, -1), cu).reshape(b, p, -1)
+            edges = torch.arange(p + 1, device=dev) if local else torch.cat([first, first.new_tensor([p])])
+            z = self.block(z.unsqueeze(0), edges.to(torch.int32))[0]
         else:
-            z = z + self.positions(z.shape[1], z.device, z.dtype)
-            q = self.norm1(z)
-            z = z + self.attn(q, q, q, need_weights=False)[0]
-            z = z + self.mlp(self.norm2(z))
-        return h + torch.repeat_interleave(self.out(z), self.ratio, dim=1)[:, :n]
+            z = z + self.positions(within, z.dtype)
+            row, col = (torch.arange(p, device=dev), torch.zeros_like(within)) if local else (seg_p, within)
+            dense = z.new_zeros(int(row.max()) + 1, int(col.max()) + 1, z.shape[1])
+            dense[row, col] = z
+            empty = torch.ones(dense.shape[:2], device=dev, dtype=torch.bool)
+            empty[row, col] = False                                    # where a shorter segment has no position
+            q = self.norm1(dense)
+            dense = dense + self.attn(q, q, q, key_padding_mask=empty if bool(empty.any()) else None,
+                                      need_weights=False)[0]
+            z = (dense + self.mlp(self.norm2(dense)))[row, col]
+        return h + self.out(z)[pos]
 
 
 def bin_dilations(n: int) -> list[int]:
@@ -1321,18 +1342,17 @@ class KronGenome(nn.Module):
         return torch.where(self.jepa_hidden.unsqueeze(-1), self.last_jepa.to(core.dtype), core)
 
     coarse_off = False                  # evaluation: leave the coarse block out
+    coarse_local = False                # evaluation: the coarse block without mixing between positions (a control)
 
     def run_core(self, h: torch.Tensor, cu: torch.Tensor, checkpoint: bool = False, rows: int = 1) -> torch.Tensor:
         """The KronLSTM core over ``[1, N, d_model]`` packed bins; ``checkpoint`` recomputes each layer in backward.
-        ``rows``: how many equal rows the N bins are (the coarse block, when the model has one, works per row)."""
+        The coarse block, when the model has one, works per segment of ``cu`` as the layers do (``rows`` is kept
+        for callers and no longer read)."""
         coarse = None if self.coarse_off else getattr(self, "coarse", None)
         for i, layer in enumerate(self.core):
             h = torch.utils.checkpoint.checkpoint(layer, h, cu, use_reentrant=False) if checkpoint else layer(h, cu)
             if coarse is not None and i + 1 == self.config.coarse_after:
-                n = h.shape[1]
-                if n % rows:
-                    raise ValueError(f"{n} packed bins are not {rows} equal rows")
-                h = coarse(h.reshape(rows, n // rows, -1)).reshape(1, n, -1)
+                h = coarse(h[0], cu, local=self.coarse_local).unsqueeze(0)
         return self.core_norm(h)
 
     def decode(self, x: torch.Tensor, skips: list[torch.Tensor]) -> torch.Tensor:
