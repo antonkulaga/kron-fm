@@ -322,3 +322,22 @@ Selection `$SCRATCH/kron-dna-build/tracks/dnase-pilot-v1/select.tsv`; downloads 
 - **Open, mine:** in-tower blocks (`InterKron`) restart on a fixed grid and ignore contig gaps (needs segment ids
   through encode/decode in the whole, split, capped and contig forwards); one `local_span` for every fine-scale
   block. Both only if the in-tower design is kept after 15k.
+
+## 27 Nov, 14:40 (afternoon)
+
+- **Paused 26 Nov 01:33 to 27 Nov 13:00**: a safety classifier stopped a reply while I was starting a script to mark
+  vector records that carry held-out human coding sequence. That script is not written and I do not redo it that
+  way. `constructs_vectors_gbsyn274` is therefore **not cleared for training** as a whole; the safe subset is
+  everything but the ORFeome family (`organism` column). Another route to the mark is open.
+- **Retired:** in-tower blocks in both forms (KI, KP below A at 15k); hierarchical JEPA (the coarse screen failed
+  its 5 % bar on F; the trainer reruns it on the slow-memory arm).
+- **Long range (Anton's top priority, 27 Nov):** F's memory half-lives are short (median 0.5 to 2.7 kb per layer).
+  Built, ce75ef0: `slow_layers/slow_heads/slow_range` (init; `apply_slow_heads` after a load) and `coarse_ratio`
+  with `coarse_kind` attention or kron (`CoarseBlock`, zero at start, `coarse_off`). The trainer's arm s (checkpoint
+  surgery on F 250k, 8k steps) reads out the evening of 27 Nov; flags on the trainer's branch trainer-longrange.
+  Next if wanted: a 32-channel pair state at 2 kb with a contact head, on top of the coarse block.
+- **Hi-C:** six ENCODE intact Hi-C maps in scratch `hic/intact-v1/files` (425 GB), selection `hic_select.py`.
+  Blocked on Anton: `hictk` trust-register row (asked 643729999, repeated 644126394), else my own reader.
+- **Codon head:** arm finished (train 1-cosine 0.561 to 0.505, no cost to the trunk); readout `codon_eval.py`
+  (7576c42), not yet run on a card; the trainer runs it.
+- **Waiting on Anton:** Addgene login; hictk row; HF publishing of track stores.
