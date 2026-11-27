@@ -523,7 +523,7 @@ class CpuCoreGenome(G.KronGenome):
     """The real KronGenome (stem, encoder, decoder, every head, the JEPA predictor) with the CUDA-only KronLSTM core
     replaced by a mixing of neighbouring bins, so a tiny model runs on the CPU."""
 
-    def run_core(self, h, cu, checkpoint=False):
+    def run_core(self, h, cu, checkpoint=False, rows=1):
         h = h + 0.5 * (h.roll(1, 1) + h.roll(-1, 1)) + 0.25 * (h.roll(3, 1) + h.roll(-3, 1))
         return self.core_norm(h)
 
