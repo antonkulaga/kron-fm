@@ -1085,6 +1085,11 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                  hole_peak_share: float = typer.Option(0.5, help="with --hole-share: share of holes centred (jitter "
                                                        "+-512) on distal DNase peak cells (signal>=4 of the DNase "
                                                        "store, no promoter within --hole-distal); the rest uniform"),
+                 contact_stores: str = typer.Option("", help="with --contact-weight: contact-map stores of the primary "
+                                                    "genome (prep_hic.py), comma separated, one per biosample; the "
+                                                    "model gets a contact head (config contact_tracks) on the core"),
+                 contact_weight: float = typer.Option(0.0, help="weight of the contact-map loss (MSE on log1p observed "
+                                                      "over expected, pairs up to the stores' reach); 0: off"),
                  hole_target: str = typer.Option("distal", help="with --hole-share: where the --hole-peak-share holes "
                                                  "are centred: 'distal' DNase peaks (no promoter within --hole-distal), "
                                                  "or 'promoter' cells, hiding the promoter so the heads must infer its "
@@ -1714,6 +1719,15 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
     hole_pk = hole_pr = None
     hole_rng = np.random.default_rng([seed, rank, 2031])   # its own stream: windows and masks as without holes
     hole_count = [0, 0]                                       # holes placed on distal peaks, uniform
+    cstores = None                                            # --contact-weight: the contact-map stores
+    contact_losses: list[float] = []
+    if contact_weight > 0:
+        from kron_dna import contacts as CT
+        if not contact_stores:
+            raise typer.BadParameter("--contact-weight needs --contact-stores")
+        cstores = CT.ContactStores([Path(p_) for p_ in contact_stores.split(",") if p_.strip()], index)
+        say(f"contacts: {len(cstores.names)} maps ({', '.join(cstores.names)}), {cstores.cell:,}-base cells, "
+            f"{cstores.diagonals} diagonals, weight {contact_weight:g}, on primary rows inside one contig")
     if hole_share > 0:
         if focus_map is None:
             raise typer.BadParameter("--hole-share needs --focus-map (DNase peak and promoter columns)")
@@ -1902,6 +1916,7 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
         raise typer.BadParameter("--repeat-loss-weight reads repeat.u8 through --repeat-channel")
     rw_batch: list = []              # --repeat-loss-weight: the batch's repeat flags, never dropped
     hole_batch: list = []            # --hole-share: the batch's hidden bases
+    con_batch: list = []             # --contact-weight: per row, (cells, target) or None
     rw_rng = np.random.default_rng([seed, rank, 2029])   # its own stream: the masks and windows stay those of a run without it
     if repeat_loss_weight < 1.0:
         say(f"repeat loss weight {repeat_loss_weight:g}: masked bases in soft-masked repeats are kept as targets with "
@@ -2058,6 +2073,7 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
         rep_rows = []
         rw_rows = []                                 # --repeat-loss-weight: each row's full repeat flags
         hole_rows = []                               # --hole-share: each row's hidden bases
+        con_rows = []                                # --contact-weight: each row's (cells, target) or None
         foc_rows = []                                # --focus-mask-tilt: per base weight of each row (float16)
         codon_rows = []                              # --codon-weight: each row's codons (store rows, positions)
         row_len, row_wt = [], []                     # per row: its length, and its share of one window
@@ -2209,6 +2225,9 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                         if flip_row:
                             h_[:take] = h_[:take][::-1].copy()
                 hole_rows.append(h_)
+            if cstores is not None:                  # the primary genome's rows inside one contig of a held chromosome
+                con_rows.append(cstores.window(at, take, unit, flip_row)
+                                if not (from_mito or xs is not None or fg is not None) and take >= unit else None)
             if codon_st is not None:                 # the primary genome's codons lying wholly in the row
                 ci_, cp_ = np.zeros(0, np.int64), np.zeros((0, 3), np.int64)
                 if not (from_mito or xs is not None or fg is not None) and take > 0:
@@ -2325,10 +2344,11 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
             cod_ = [[codon_rows[i] for i in ix]] if codon_rows else []
             rw_ = [torch.from_numpy(rows(rw_rows))] if rw_rows else []
             hole_ = [torch.from_numpy(rows(hole_rows))] if hole_rows else []
+            con_ = [[con_rows[i] for i in ix]] if con_rows else []
             out = [torch.from_numpy(rows(seqs)), torch.from_numpy(rows(segs)), torch.tensor([ctxs[i] for i in ix])]
             if labels:
                 out += [torch.from_numpy(rows(x)) for x in (labs, acts, valid)]
-            return tuple(out), (epi_, nt_, rep_, foc_, cod_, rw_, hole_)
+            return tuple(out), (epi_, nt_, rep_, foc_, cod_, rw_, hole_, con_)
 
         if pack:                                     # one part per row length, the full window first
             parts = []
@@ -2337,7 +2357,7 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                 parts.append((sum(row_wt[i] for i in ix) / batch, *stacked(ix)))
             return parts
         out, (epi_batch[:], ntv3_batch[:], rep_batch[:], foc_batch[:], codon_batch[:], rw_batch[:],
-              hole_batch[:]) = stacked(range(len(seqs)))
+              hole_batch[:], con_batch[:]) = stacked(range(len(seqs)))
         return out
 
     dev = torch.device("cuda", torch.cuda.current_device())
@@ -2359,6 +2379,8 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                                 n_ntv3=len(ntv3["ids"]) if ntv3 else 0,
                                 chunk_length_feature=chunk_length_feature,
                                 bin_convs=bin_convs, inter_width=inter_width, codon_dims=codon_dims, inter_parallel=inter_parallel,
+                                contact_tracks=len(cstores.names) if cstores is not None else 0,
+                                **({"contact_reach": cstores.diagonals} if cstores is not None else {}),
                                 slow_layers=[int(v_) for v_ in slow_layers.split(",") if v_.strip()], slow_heads=slow_heads, slow_pick=slow_pick,
                                 slow_range=[int(v_) for v_ in slow_range.split(",")], coarse_ratio=coarse_ratio,
                                 coarse_after=coarse_after, coarse_kind=coarse_kind, coarse_width=coarse_width,
@@ -3062,6 +3084,22 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
             codon_losses.append(float(loss_c.detach()))
             if parts_log is not None:
                 parts_log["codon"] = codon_losses[-1]
+        if cstores is not None and model.training and con_batch and ctx_core is not None:
+            got_ = [(r_, w_) for r_, w_ in enumerate(con_batch[0]) if w_ is not None]
+            if got_:                                   # rows padded: cells -1, targets NaN past each row's cells
+                nb_, nc_ = ctx_core.shape[1], max(w_[1].shape[0] for _, w_ in got_)
+                cells_ = torch.full((len(got_), nb_), -1, dtype=torch.long)
+                tgt_ = torch.full((len(got_), nc_, cstores.diagonals, len(cstores.names)), float("nan"))
+                for j_, (_, (c_, t_)) in enumerate(got_):
+                    cells_[j_, :len(c_)] = torch.from_numpy(c_)
+                    tgt_[j_, :t_.shape[0]] = torch.from_numpy(t_)
+                core_ = ctx_core[torch.tensor([r_ for r_, _ in got_], device=ctx_core.device)]
+                pred_ = model.contact_head(core_.float(), cells_.to(core_.device), nc_)
+                loss_k = CT.contact_loss(pred_, tgt_.to(pred_.device))
+                mlm = mlm + contact_weight * loss_k.to(mlm.device)
+                contact_losses.append(float(loss_k.detach()))
+                if parts_log is not None:
+                    parts_log["contact"] = contact_losses[-1]
         if chunk_ratio and model.training and model.last_ratio_loss is not None:
             mlm = mlm + ratio_weight * model.last_ratio_loss
             chunk_rates.append(model.last_chunks)
@@ -3315,7 +3353,8 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
             return loss_on(*parts, **kw)
         loss = track = None
         for w_, rows_, sides_ in parts:
-            epi_batch[:], ntv3_batch[:], rep_batch[:], foc_batch[:], codon_batch[:], rw_batch[:], hole_batch[:] = sides_
+            (epi_batch[:], ntv3_batch[:], rep_batch[:], foc_batch[:], codon_batch[:], rw_batch[:], hole_batch[:],
+             con_batch[:]) = sides_
             l_, t_ = loss_on(*rows_, **kw)
             loss = w_ * l_ if loss is None else loss + w_ * l_
             if t_ is not None:
@@ -3893,6 +3932,9 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
             if hole_pk is not None:       # --hole-share: holes placed since the last report
                 say(f"holes: {hole_count[0]:,} on distal DNase peaks, {hole_count[1]:,} uniform since the last report")
                 hole_count[:] = [0, 0]
+            if contact_losses:          # --contact-weight: the contact head's training loss since the last report
+                say(f"contact head: train MSE {np.mean(contact_losses):.4f} over {len(contact_losses)} micro-batches")
+                contact_losses.clear()
             if codon_losses:            # --codon-weight: the codon head's training loss since the last report
                 say(f"codon head: train 1 - cosine {np.mean(codon_losses):.4f} over {len(codon_losses)} micro-batches")
                 codon_losses.clear()
