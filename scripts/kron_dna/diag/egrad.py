@@ -8,7 +8,8 @@ respect to the one-hot input. Each candidate element's score is |sum over the el
 farther than --reach from the TSS are left out (the window reaches +-context/2). Writes one row per pair with its score;
 AUPRC by distance bin (all pairs, then the pair split's train and pair_test genes), beside a distance-only baseline,
 is printed at the end. v2 (27 Nov, Astra's review): the head's softplus is differentiated (--raw for v1), average
-precision counts tied scores together, and each row carries its element's coordinates and split.
+precision counts tied scores together, and each row carries its element's coordinates and split. v3 (27 Nov, Astra's
+second review): --head-bins (the RNA head's span), --score shuffle (in-silico perturbation) and --coarse on|off|local.
 """
 from __future__ import annotations
 
@@ -38,6 +39,14 @@ def main():
     a.add_argument("--context", type=int, default=524288, help="window length (1 Mb needs more than a shared card)")
     a.add_argument("--raw", action="store_true", help="differentiate the head's raw output (v1); default: its softplus, "
                    "the value training and evaluation score")
+    a.add_argument("--head-bins", type=int, default=9, help="128-bp bins the RNA head runs over, centred on the TSS "
+                   "(v1/v2: 9); 0: the whole window, as wide as the head's training span allows")
+    a.add_argument("--score", choices=("grad", "shuffle"), default="grad", help="grad: |sum of gradient x input| over "
+                   "the element; shuffle: |change of the TSS output| when the element's bases are shuffled in place "
+                   "(length kept), forward passes only, in fp32")
+    a.add_argument("--coarse", choices=("on", "off", "local"), default="on", help="a model with a coarse block: as "
+                   "trained, left out (coarse_off), or without mixing between positions (coarse_local)")
+    a.add_argument("--seed", type=int, default=0)
     a = a.parse_args()
     global CTX
     CTX = a.context
@@ -56,6 +65,8 @@ def main():
 
     dev = torch.device("cuda"); torch.cuda.init()
     model, state = G.load_checkpoint(a.ckpt); model = model.to(dev).eval(); model.checkpoint_core = True
+    model.coarse_off, model.coarse_local = a.coarse == "off", a.coarse == "local"
+    rng = np.random.default_rng(a.seed)
     G.LEAN_CONV = True                                    # recompute norm+act in backward: memory
     stores = ((state.get("run_record") or {}).get("xheads") or {}).get("stores") or {}
     unit = 2 ** model.config.n_down; rows, t0 = [], time.time()
@@ -69,8 +80,32 @@ def main():
         if not ch:
             continue
         b0 = (tss - lo) // BIN * BIN
-        model.x_active = {g["head"]}; model.x_span = (max(0, b0 - 4 * BIN), min(CTX, b0 + 5 * BIN))
+        half = a.head_bins // 2
+        model.x_active = {g["head"]}
+        model.x_span = ((0, CTX) if a.head_bins <= 0 else
+                        (max(0, b0 - half * BIN), min(CTX, b0 + (a.head_bins - half) * BIN)))
         seg = torch.zeros(1, CTX // unit, dtype=torch.long, device=dev); ctx = torch.zeros(1, dtype=torch.long, device=dev)
+        if a.score == "shuffle":
+            def tss_out(c):
+                with torch.no_grad():
+                    model(G.base_channels(c[None]).float(), seg, ctx)
+                    o = model.last_x[g["head"]][0].float(); a0_, a1_ = model.last_x_at
+                    k_ = ((tss - lo) - a0_) // ((a1_ - a0_) // o.shape[0])
+                    v = o[max(0, k_ - 1):k_ + 2, ch]
+                    return float((v if a.raw else torch.nn.functional.softplus(v)).sum())
+            ref = tss_out(codes)
+            for r in sub.iter_rows(named=True):
+                s, e = r["del_start"] - lo, max(r["del_end"], r["del_start"] + 1) - lo
+                if 0 <= s < CTX and 0 < e <= CTX:
+                    c2 = codes.clone(); c2[s:e] = c2[s:e][torch.from_numpy(rng.permutation(e - s)).to(dev)]
+                    rows.append(dict(gene=r["gene"], cell_type=r["cell_type"], distance=r["distance"],
+                                     regulated=r["regulated"], bench_set=r["bench_set"], chrom=r["chrom"],
+                                     del_start=r["del_start"], del_end=r["del_end"], split=r["split"],
+                                     score=abs(tss_out(c2) - ref)))
+            if gi % 50 == 0:
+                print(f"gene {gi + 1}/{genes.height}, {len(rows)} pairs, {time.time() - t0:.0f} s, peak "
+                      f"{torch.cuda.max_memory_allocated() / 2**30:.1f} GiB", flush=True)
+            continue
         with torch.autocast("cuda", dtype=torch.bfloat16):
             model(x, seg, ctx)
             out = model.last_x[g["head"]][0].float()                         # [span bins or bases, channels]
