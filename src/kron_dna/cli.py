@@ -1085,6 +1085,10 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                  hole_peak_share: float = typer.Option(0.5, help="with --hole-share: share of holes centred (jitter "
                                                        "+-512) on distal DNase peak cells (signal>=4 of the DNase "
                                                        "store, no promoter within --hole-distal); the rest uniform"),
+                 hole_target: str = typer.Option("distal", help="with --hole-share: where the --hole-peak-share holes "
+                                                 "are centred: 'distal' DNase peaks (no promoter within --hole-distal), "
+                                                 "or 'promoter' cells, hiding the promoter so the heads must infer its "
+                                                 "activity from the rest of the window"),
                  hole_distal: int = typer.Option(32768, help="with --hole-share: a peak cell counts as distal with "
                                                  "no promoter cell within this many bases"),
                  grow_core: str = typer.Option("", help="with --init from a checkpoint with fewer core layers: 'zero' "
@@ -1713,12 +1717,16 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
     if hole_share > 0:
         if focus_map is None:
             raise typer.BadParameter("--hole-share needs --focus-map (DNase peak and promoter columns)")
+        if hole_target not in ("distal", "promoter"):
+            raise typer.BadParameter("--hole-target is 'distal' or 'promoter'")
         if not (0 < hole_share < 1 and 0 <= hole_peak_share <= 1 and hole_len >= 128):
             raise typer.BadParameter("--hole-share in (0, 1), --hole-peak-share in [0, 1], --hole-len >= 128")
         hole_pk = fm_[:, cols_.index("signal>=4:dnase-biosamples-v1-bin128")]
         hole_pr = fm_[:, cols_.index("label:promoter")]
         say(f"holes: {hole_share:.0%} of each primary row's scored centre in {hole_len:,}-base all-MASK holes, "
-            f"{hole_peak_share:.0%} on distal DNase peaks (no promoter within {hole_distal:,} bases); letters inside "
+            + (f"{hole_peak_share:.0%} on distal DNase peaks (no promoter within {hole_distal:,} bases)"
+               if hole_target == "distal" else f"{hole_peak_share:.0%} on promoter cells")
+            + "; letters inside "
             f"not scored, track heads scored")
     # the model's grid (genome.grid_of): window and row lengths, packs, split halos and head spans are multiples of the
     # core's step or of the widest head bin, whichever is larger (a 32-bp core with 128-bp heads: 128)
@@ -2184,7 +2192,8 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                         pr_ = np.asarray(hole_pr[max(0, c0_ - pad_):c1_ + pad_]) > 0
                         near_ = np.convolve(pr_.astype(np.int32), np.ones(2 * pad_ + 1, np.int32), "same") > 0
                         near_ = near_[c0_ - max(0, c0_ - pad_):][:c1_ - c0_]
-                        pk_ = (np.asarray(hole_pk[c0_:c1_]) > 0) & ~near_
+                        pk_ = ((np.asarray(hole_pk[c0_:c1_]) > 0) & ~near_ if hole_target == "distal"
+                               else np.asarray(hole_pr[c0_:c1_]) > 0)
                         cen_pos_ = np.flatnonzero(pk_) * fb_ + c0_ * fb_ - at + fb_ // 2 - hole_len // 2
                         cen_pos_ = cen_pos_[(cen_pos_ >= lo_) & (cen_pos_ <= hi_)]
                         starts_ = []
