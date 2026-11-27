@@ -95,3 +95,19 @@ def test_a_piece_without_codons_joins_one_with_codons_under_mixed_precision(cpu_
             m.forward_split(seq, devices=["cpu", "cpu"], by="length")
         assert bool(m.last_codon_ok.all()) and m.last_codon.shape == (len(pos), 12)
         assert float(m.last_codon.float().abs().sum()) > 0
+
+
+def test_centred_targets_lose_the_shared_component():
+    g = torch.Generator().manual_seed(0)
+    feat = torch.randint(0, G.PROTEIN_SPACE, (400, 64), generator=g)
+    feat[:, :40] = feat[0, :40]                                       # 40 features every codon shares
+    val = torch.randint(1, 255, (400, 64), generator=g).to(torch.uint8)
+    scale = torch.ones(400)
+    plain = G.protein_targets(feat, val, scale, 64)
+    mean = torch.nn.functional.normalize(plain.mean(0), dim=0)
+    assert float((plain @ mean).mean()) > 0.6                         # a constant output nearly meets the loss
+    centre = G.protein_centre(feat, val, scale, 64)
+    assert centre.shape == (64,)
+    t = G.protein_targets(feat, val, scale, 64, centre)
+    assert torch.allclose(t.norm(dim=-1), torch.ones(400), atol=1e-5)
+    assert abs(float((t @ torch.nn.functional.normalize(t.mean(0), dim=0)).mean())) < 0.1

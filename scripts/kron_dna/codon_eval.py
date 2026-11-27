@@ -1,7 +1,7 @@
 """How well a codon head predicts held-out codons' protein features, beside what the amino acid alone gives.
 
     python scripts/kron_dna/codon_eval.py CKPT CODON_STORE OUT.json [--windows 64] [--context 1048576] [--name hg38]
-        [--mask-share 0.15] [--seed 0]
+        [--mask-share 0.15] [--seed 0] [--centre]
 
 The codon store (prep_esm_atlas_codons.py) gives per codon a target direction (``genome.protein_targets``). Windows
 of ``--context`` bases are drawn around held-out codons (``ntv3/split.u8`` != 1 at the codon's first base), each
@@ -13,6 +13,10 @@ output and the target (higher is better), over the held-out codons of the window
 - ``aa_mean``: the mean target of the codon's amino acid over training codons, the score of a head that knows the
   amino acid and nothing of its context (for a hidden codon it is an upper bound on that);
 - ``global_mean``: the mean target of all training codons.
+
+``--centre``: targets with the training codons' mean taken out (``genome.protein_centre`` over the script's sample
+of training codons), for a head trained on centred targets; without it the targets are as the first arm had them,
+where a constant already scores 0.48.
 
 ``head_clean`` above ``aa_mean`` means the head reads protein context beyond the residue's identity. OUT.json also
 has the scores per amino acid.
@@ -58,6 +62,7 @@ def main() -> None:
     ap.add_argument("--windows", type=int, default=64), ap.add_argument("--context", type=int, default=1 << 20)
     ap.add_argument("--name", default="hg38"), ap.add_argument("--mask-share", type=float, default=0.15)
     ap.add_argument("--seed", type=int, default=0), ap.add_argument("--train-sample", type=int, default=300_000)
+    ap.add_argument("--centre", action="store_true")
     a = ap.parse_args()
     genome = interim_dir("genome", a.name)
     info = json.loads((a.store / "codons.json").read_text())
@@ -82,13 +87,19 @@ def main() -> None:
     if not dims:
         raise SystemExit("the checkpoint has no codon head")
 
-    def targets(rows: np.ndarray) -> torch.Tensor:
+    centre = None
+
+    def parts(rows: np.ndarray) -> tuple:
         rows = np.sort(rows)
-        return G.protein_targets(torch.from_numpy(np.asarray(feat[rows]).astype(np.int64)).to(dev),
-                                 torch.from_numpy(np.asarray(val[rows])).to(dev),
-                                 torch.from_numpy(np.asarray(scale[rows])).to(dev), dims)
+        return (torch.from_numpy(np.asarray(feat[rows]).astype(np.int64)).to(dev),
+                torch.from_numpy(np.asarray(val[rows])).to(dev), torch.from_numpy(np.asarray(scale[rows])).to(dev))
+
+    def targets(rows: np.ndarray) -> torch.Tensor:
+        return G.protein_targets(*parts(rows), dims, centre)
 
     train_rows = np.sort(rng.choice(np.flatnonzero(~held), min(a.train_sample, int((~held).sum())), replace=False))
+    if a.centre:
+        centre = G.protein_centre(*parts(train_rows), dims)
     means, overall = class_means(targets(train_rows), amino_acids(bases, np.asarray(pos[train_rows])))
     starts, ends = contigs["offset"].to_numpy(), (contigs["offset"] + contigs["end"] - contigs["start"]).to_numpy()
     unit, ctx = 2 ** model.config.n_down, a.context
@@ -136,7 +147,7 @@ def main() -> None:
     per_aa = {chr(int(x)): {"n": int((cat["aa"] == x).sum()), "head_clean": float(cat["head_clean"][cat["aa"] == x].mean()),
                             "aa_mean": float(cat["aa_mean"][cat["aa"] == x].mean())} for x in np.unique(cat["aa"]) if x >= 0}
     res = {"checkpoint": str(a.ckpt), "store": a.store.name, "windows": done, "context": ctx, "codons": int(len(cat["aa"])),
-           "hidden_codons": int(len(cat["head_masked"])), "mask_share": a.mask_share, "metric": "cosine to the target, higher is better",
+           "hidden_codons": int(len(cat["head_masked"])), "mask_share": a.mask_share, "centred": bool(a.centre), "metric": "cosine to the target, higher is better",
            **{k: float(cat[k].mean()) for k in ("head_clean", "head_masked", "aa_mean", "aa_mean_masked", "global_mean")},
            "per_amino_acid": per_aa}
     a.out.parent.mkdir(parents=True, exist_ok=True)

@@ -217,16 +217,34 @@ def protein_projection(dims: int, space: int = PROTEIN_SPACE) -> torch.Tensor:
     return _PROTEIN_PROJ[(dims, space)]
 
 
-def protein_targets(feat: torch.Tensor, val: torch.Tensor, scale: torch.Tensor, dims: int) -> torch.Tensor:
+def protein_targets(feat: torch.Tensor, val: torch.Tensor, scale: torch.Tensor, dims: int,
+                    centre: torch.Tensor | None = None) -> torch.Tensor:
     """Codon targets from a protein model's sparse per-residue features: ``feat`` ``[N, k]`` feature ids, ``val``
     ``[N, k]`` their stored values (uint8) and ``scale`` ``[N]`` the protein's scale, as ``[N, dims]`` unit vectors:
-    the active features' projection rows summed with weights ``val / 255 * scale``, then normalised. Two residues
-    with the same active features get the same direction; the length carries nothing and is dropped. No gradient."""
+    the active features' projection rows summed with weights ``val / 255 * scale``, minus ``centre`` ``[dims]`` when
+    given, then normalised. Two residues with the same active features get the same direction; the length carries
+    nothing and is dropped. No gradient.
+
+    Without ``centre`` the targets share one large component (human codons: cosine 0.48 with their common mean,
+    0.50 with their amino acid's mean), so a constant output nearly meets the loss and a head learns next to
+    nothing: the first codon-head arm ended at 0.493. With the training codons' mean taken out
+    (:func:`protein_centre`), a constant scores 0.02 and the amino acid's mean 0.15."""
     with torch.no_grad():
         proj = protein_projection(dims).to(feat.device)
         w = val.float() / 255.0 * scale.float().unsqueeze(-1)
         t = (proj[feat.long()] * w.unsqueeze(-1)).sum(1)
+        if centre is not None:
+            t = t - centre.to(t.device, t.dtype)
         return F.normalize(t, dim=-1)
+
+
+def protein_centre(feat: torch.Tensor, val: torch.Tensor, scale: torch.Tensor, dims: int) -> torch.Tensor:
+    """The mean of the unnormalised projected features over the given (training) codons, ``[dims]``: the ``centre``
+    of :func:`protein_targets`."""
+    with torch.no_grad():
+        proj = protein_projection(dims).to(feat.device)
+        w = val.float() / 255.0 * scale.float().unsqueeze(-1)
+        return (proj[feat.long()] * w.unsqueeze(-1)).sum(1).mean(0)
 
 
 def codon_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
