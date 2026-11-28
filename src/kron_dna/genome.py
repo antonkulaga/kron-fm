@@ -102,6 +102,9 @@ class KronGenomeConfig:
                                 # the longest memory) start with a slow memory, in both directions (set_slow_heads)
     slow_heads: int = 2         # heads per direction and layer that are made slow
     slow_pick: str = "longest"  # which heads: those with the "longest" or the "shortest" memory as the layer stands
+    slow_spread: str = "channels"   # "channels": every slow head has the whole slow_range over its channels;
+                                # "heads": the range is cut into one band per slow head (a spectrum of head speeds:
+                                # slow_heads = n_heads and a range from a few bins to the window gives each head its own)
     slow_range: list = field(default_factory=lambda: [30_000, 1_000_000])   # their channels' half-lives, bases,
                                 # spread log-uniformly from the first to the second
     coarse_ratio: int = 0       # > 0: a block over the core's states pooled by this many bins (64 at 32-bp bins =
@@ -575,7 +578,8 @@ class InterKron(nn.Module):
         return x + self.out(h.reshape(b, n, -1).transpose(1, 2))
 
 
-def set_slow_heads(mixer: nn.Module, heads: int, lo: float, hi: float, pick: str = "longest") -> list[int]:
+def set_slow_heads(mixer: nn.Module, heads: int, lo: float, hi: float, pick: str = "longest",
+                   spread: str = "channels") -> list[int]:
     """``heads`` heads of a KronLSTM mixer get a slow memory, until training moves it: the heads whose memory is
     longest as the layer stands (median half-life of their channels with the input term at zero; in a trained layer
     the ones that cost least to take), or with ``pick`` "shortest" the heads whose memory is shortest (the longest
@@ -584,7 +588,12 @@ def set_slow_heads(mixer: nn.Module, heads: int, lo: float, hi: float, pick: str
     the input-dependent part of those channels (the last map of ``f_proj``) is zeroed, so each channel's decay per
     step is exactly ``2 ** (-1 / half-life)`` for every input. Returns the heads taken. The layer draws its decays
     for token-level language: a typical channel keeps a signal for about 12 steps, and a trained model has kept that
-    (F at 128-bp bins: median half-life 0.5 to 2.7 kb per layer); nothing in a local loss asks for more."""
+    (F at 128-bp bins: median half-life 0.5 to 2.7 kb per layer); nothing in a local loss asks for more.
+
+    ``spread`` "heads" cuts the range into ``heads`` bands of equal width in log half-life, one per slow head, each
+    head's channels spread over its own band: the head whose memory is shortest as the layer stands gets the
+    shortest band. With every head taken and a range from a few steps to the window, the layer starts as a spectrum
+    of head speeds (6 heads over 1 kb to 1 Mb: bands of about 1-3, 3-10, 10-32, 32-100, 100-320 kb, 320 kb-1 Mb)."""
     n_heads = mixer.A_log.shape[0]
     per = mixer.dt_bias.shape[0] // n_heads
     if not 0 < heads <= n_heads:
@@ -593,11 +602,17 @@ def set_slow_heads(mixer: nn.Module, heads: int, lo: float, hi: float, pick: str
         raise ValueError("slow half-lives are more than one step, lo <= hi")
     if pick not in ("longest", "shortest"):
         raise ValueError("slow_pick is 'longest' or 'shortest'")
-    half = torch.logspace(math.log10(lo), math.log10(hi), per, dtype=torch.float64)
+    if spread not in ("channels", "heads"):
+        raise ValueError("slow_spread is 'channels' or 'heads'")
+    edges = torch.linspace(math.log10(lo), math.log10(hi), (heads if spread == "heads" else 1) + 1, dtype=torch.float64)
     with torch.no_grad():
         now = math.log(2.0) / (mixer.A_log.double().exp()[:, None] * F.softplus(mixer.dt_bias.double().view(n_heads, per)))
-        taken = torch.argsort(now.median(1).values, descending=pick == "longest", stable=True)[:heads].tolist()
+        median = now.median(1).values
+        taken = torch.argsort(median, descending=pick == "longest", stable=True)[:heads].tolist()
+        rank = {k: j for j, k in enumerate(sorted(taken, key=lambda k: (float(median[k]), k)))}   # shortest first
         for k in taken:
+            j = rank[k] if spread == "heads" else 0
+            half = torch.logspace(float(edges[j]), float(edges[j + 1]), per, dtype=torch.float64)
             mixer.A_log[k] = 0.0
             mixer.dt_bias[k * per:(k + 1) * per] = torch.log(torch.expm1(math.log(2.0) / half)).float()   # inverse softplus
             mixer.f_proj[-1].weight[k * per:(k + 1) * per] = 0.0
@@ -617,7 +632,7 @@ def apply_slow_heads(model: "KronGenome") -> int:
         for mixer in (block.forward_mixer, block.backward_mixer):
             if mixer is not None and hasattr(mixer, "dt_bias"):
                 lo, hi = (float(b) / 2 ** c.n_down for b in c.slow_range)
-                set_slow_heads(mixer, c.slow_heads, lo, hi, c.slow_pick)
+                set_slow_heads(mixer, c.slow_heads, lo, hi, c.slow_pick, c.slow_spread)
                 n += 1
     return n
 

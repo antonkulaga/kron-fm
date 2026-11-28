@@ -60,14 +60,23 @@ def test_slow_heads_set_the_vendored_layers_decay():
         assert torch.equal(mixer.dt_bias[k * per:(k + 1) * per], before[1][k * per:(k + 1) * per])
         assert torch.equal(mixer.f_proj[-1].weight[k * per:(k + 1) * per], before[2][k * per:(k + 1) * per])
     assert G.set_slow_heads(mixer, 1, 234.0, 8192.0, "shortest") in ([0], [2])     # one of the untouched heads
-    for bad in ((5, 10.0, 20.0), (0, 10.0, 20.0), (1, 1.0, 20.0), (1, 30.0, 20.0), (1, 10.0, 20.0, "first")):
+    # a spectrum: every head its own band of 8 to 8,192 steps, the shortest-memory head the shortest band
+    order = G.set_slow_heads(mixer, 4, 8.0, 8192.0, "shortest", "heads")
+    g = (mixer.A_log.exp().repeat_interleave(per) * F.softplus(mixer.f_proj(x) + mixer.dt_bias)).view(5, 4, per)
+    half = math.log(2) / g[0]
+    edges = [8.0 * 2 ** (2.5 * j) for j in range(5)]                  # 4 bands of equal width in log half-life
+    for j, k in enumerate(order):
+        assert abs(float(half[k, 0]) / edges[j] - 1) < 1e-3 and abs(float(half[k, -1]) / edges[j + 1] - 1) < 1e-3
+    assert sorted(order) == [0, 1, 2, 3] and torch.allclose(math.log(2) / g[1], half, rtol=1e-4)   # whatever the input
+    for bad in ((5, 10.0, 20.0), (0, 10.0, 20.0), (1, 1.0, 20.0), (1, 30.0, 20.0), (1, 10.0, 20.0, "first"),
+                (1, 10.0, 20.0, "longest", "bands")):
         with pytest.raises(ValueError):
             G.set_slow_heads(mixer, *bad)
 
 
 def test_slow_layers_reach_both_directions_and_are_refused_out_of_range(monkeypatch):
     seen = []
-    monkeypatch.setattr(G, "set_slow_heads", lambda mixer, heads, lo, hi, pick: seen.append((mixer, heads, lo, hi, pick)))
+    monkeypatch.setattr(G, "set_slow_heads", lambda mixer, heads, lo, hi, pick, spread: seen.append((mixer, heads, lo, hi, pick, spread)))
 
     class WithDecay(CausalMixer):
         def __init__(self, *a):
@@ -76,7 +85,7 @@ def test_slow_layers_reach_both_directions_and_are_refused_out_of_range(monkeypa
 
     monkeypatch.setattr(kron_core.blocks, "kronlstm_mixer", WithDecay)
     m = small(slow_layers=[1], slow_heads=1, slow_range=[800, 8000])
-    assert [x[1:] for x in seen] == [(1, 100.0, 1000.0, "longest")] * 2   # bases over 8-bp bins
+    assert [x[1:] for x in seen] == [(1, 100.0, 1000.0, "longest", "channels")] * 2   # bases over 8-bp bins
     assert {id(x[0]) for x in seen} == {id(m.core[1].forward_mixer), id(m.core[1].backward_mixer)}
     assert G.apply_slow_heads(m) == 2
     with pytest.raises(ValueError):

@@ -362,3 +362,21 @@ Selection `$SCRATCH/kron-dna-build/tracks/dnase-pilot-v1/select.tsv`; downloads 
   10 or 25 kb cells before judging.
 - Not done: a card run of any of this; ONNX export of a coarse-block model after the segment change.
 - Still waiting on Anton: Addgene login (by direct message); publishing track stores.
+
+## 28 Nov, 00:30: catching up with AlphaGenome on tracks (Anton, 644260742)
+
+Counts per kind posted (644260738; AlphaGenome's column is the trainer's, from its output list: 644260689). Built
+human stores: 6,156 channels (RNA 462, CAGE+RAMPAGE 442, PRO-cap 448, DNase 196, histone 1,923, TF 1,643, eCLIP
+1,026, STARR 6, contacts 6, splice sites 4); mouse 1,989. Missing kinds: human ATAC, splice-site usage and
+junctions, most contact maps, mouse CAGE and contacts. Plan promised to Anton (644261218), each store to the
+trainer once validated:
+
+| Step | State |
+|---|---|
+| 1 Human ATAC, ENCODE | **done 28 Nov 05:10**, handed to the trainer in channel: `tracks/hg38/atac-v1-bin128`, 105 tracks `ATAC|<biosample>` (one per biosample, most replicates; the 102 LCL donors as GM12878 only; `select.tsv`), all 464 files kept in `$SCRATCH/kron-dna-build/tracks/atac-hg38-v1/files` (659 GB). Cells vs bigWig r min 0.9991. In the DNase-open 3 % of cells ATAC is 2.6x (min 1.6x); own-biosample r 0.60 vs 0.44 others within open cells (32 shared biosamples, one 51 Mb stretch). Weak: 'upper lobe of left lung', 'T-cell' |
+| 2 More contact maps | downloading since 28 Nov 00:45, jobs 6668046-8: MAPQ-thresholded `.hic`, the largest per single biosample, 106 human (no LCL beyond GM12878, not the 6 built) + 16 mouse, 122 files, 4.3 TB, `$SCRATCH/kron-dna-build/hic/encode-v2/` (`selection.tsv`). `prep_hic_batch.py` (895dd5c; rerun as files arrive, finished stores skipped): first 51 files converted 28 Nov 06:00, 0 failed, stores `contacts/{hg38,mm10}/encode-<biosample>-5kb`. Depth = share of empty pairs at 100 kb (lower is better): 35 of 57 stores under 0.25 (17 of 18 mouse), 16 over 0.5 (the small files, downloaded first). To do when the download ends (Sun ~02:00): rerun the batch, write a depth list, hand the trainer the stores under a depth cut, delete the `.hic`; promised Sun 29 Nov |
+| 3 Rest of ENCODE human DNase and RNA-seq | **done 28 Nov 10:00**, handed to the trainer in channel (joins the main run at its next resume): `tracks/hg38/dnase-rest-v1-bin128` (303 tracks; D341Med ENCFF532OSS dropped, signal in 0.3 % of cells; cells vs bigWig r median 0.9992, min 0.93 GOT3; 7.8x in the old store's open cells; 121 files without chrY = zeros) and `rnaseq-rest-v1-bin128` (42 channels, 21 biosamples; ENCSR916YUR's strands are swapped at ENCODE, channels swapped in `rna.tsv`, original in `rna.before-swap.tsv`; five sparse tracks r 0.77-0.87). Selections and files in `$SCRATCH/kron-dna-build/tracks/encode-rest-hg38-v1/` (`all.tsv` = every ENCODE GRCh38 DNase/RNA/CAGE/RAMPAGE experiment). ENCODE CAGE and RAMPAGE: we hold all; its 618 further RNA experiments are of biosamples we hold: not taken |
+| 4 CAGE from FANTOM5, human and mouse | source checked 28 Nov: fantom.gsc.riken.jp/5/datafiles/reprocessed/{hg38,mm10}_latest/basic/, CC BY 4.0; per sample a `ctss.bed.gz` (5' end counts per base and strand): human cell lines 266, tissues 188, primary cells 512; mouse tissues 280, primary cells 119, cell line 1; sample sheets `*.assay_sdrf.txt`. To build: a CTSS reader into the binned store format (stranded pairs `_P`/`_M`), one sample per biosample or pooled replicates; Mon 30 Nov |
+| 5 Splice junctions and usage | check recount3 junction tables (build, strand, licence) and report to Anton before building; first version Thu 3 Dec |
+
+`slurm/submit.sh cpu NAME` takes the command as words after `uv run` (not one shell string: "Failed to spawn").
