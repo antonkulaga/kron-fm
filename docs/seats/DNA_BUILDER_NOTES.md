@@ -373,7 +373,7 @@ trainer once validated:
 
 | Step | State |
 |---|---|
-| 1 Human ATAC, ENCODE (464 experiments, 206 biosamples, 659 GB) | downloading since 28 Nov 00:05, jobs 6668024-6, `$SCRATCH/kron-dna-build/tracks/atac-hg38-v1/` (`selection.tsv`, `part{0,1,2}.tsv`); then convert, bin to `tracks/hg38/atac-v1-bin128`, validate; promised Sat 28 Nov ~16:00 |
+| 1 Human ATAC, ENCODE | **done 28 Nov 05:10**, handed to the trainer in channel: `tracks/hg38/atac-v1-bin128`, 105 tracks `ATAC|<biosample>` (one per biosample, most replicates; the 102 LCL donors as GM12878 only; `select.tsv`), all 464 files kept in `$SCRATCH/kron-dna-build/tracks/atac-hg38-v1/files` (659 GB). Cells vs bigWig r min 0.9991. In the DNase-open 3 % of cells ATAC is 2.6x (min 1.6x); own-biosample r 0.60 vs 0.44 others within open cells (32 shared biosamples, one 51 Mb stretch). Weak: 'upper lobe of left lung', 'T-cell' |
 | 2 More contact maps | downloading since 28 Nov 00:45, jobs 6668046-8: MAPQ-thresholded `.hic`, the largest per single biosample, 106 human (no LCL beyond GM12878, not the 6 built) + 16 mouse, 122 files, 4.3 TB, `$SCRATCH/kron-dna-build/hic/encode-v2/` (`selection.tsv`); then `prep_hic.py` per file (mouse needs an mm10 run), delete the `.hic`; promised Sun 29 Nov |
 | 3 Rest of ENCODE human DNase and RNA-seq beyond NTv3's list | `encode_select.py --assembly GRCh38`, minus what the stores hold; Sun 29 Nov |
 | 4 CAGE from FANTOM5, human and mouse | source and build (hg38/mm10 reprocessed CTSS) to check; Mon 30 Nov |
