@@ -1048,6 +1048,10 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                                                   "slow_layers; half-lives over --slow-range). With --init from a "
                                                   "checkpoint whose slow heads differ (none, or other layers, heads or range), set again after the load"),
                  slow_heads: int = typer.Option(2, help="with --slow-layers: heads per direction and layer made slow"),
+                 slow_spread: str = typer.Option("channels", help="with --slow-layers: 'channels' (every slow head spreads "
+                                                 "the whole --slow-range over its channels) or 'heads' (the range cut "
+                                                 "into one band per slow head, a spectrum of head speeds; model config "
+                                                 "slow_spread)"),
                  slow_pick: str = typer.Option("longest", help="with --slow-layers: which heads are made slow, those with "
                                                "the 'longest' or the 'shortest' memory as the layer stands (model "
                                                "config slow_pick)"),
@@ -2398,7 +2402,7 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
                                 bin_convs=bin_convs, inter_width=inter_width, codon_dims=codon_dims, inter_parallel=inter_parallel,
                                 contact_tracks=len(cstores.names) if cstores is not None else 0,
                                 **({"contact_reach": cstores.diagonals} if cstores is not None else {}),
-                                slow_layers=[int(v_) for v_ in slow_layers.split(",") if v_.strip()], slow_heads=slow_heads, slow_pick=slow_pick,
+                                slow_layers=[int(v_) for v_ in slow_layers.split(",") if v_.strip()], slow_heads=slow_heads, slow_pick=slow_pick, slow_spread=slow_spread,
                                 slow_range=[int(v_) for v_ in slow_range.split(",")], coarse_ratio=coarse_ratio,
                                 coarse_after=coarse_after, coarse_kind=coarse_kind, coarse_width=coarse_width,
                                 coarse_heads=coarse_heads,
@@ -2638,7 +2642,7 @@ def genome_train(out: Path = typer.Argument(..., help="run directory (resumes fr
         missing, unexpected = model.load_state_dict(grown, strict=False)
         say(f"initialised from {init}; new: {missing}; dropped: {unexpected}; padded: {notes or 'nothing'}")
         src_cfg_ = init_state.get("config") or {}
-        slow_ = lambda c_: (sorted(int(v_) for v_ in (c_.get("slow_layers") or [])), int(c_.get("slow_heads", 2)), c_.get("slow_pick", "longest"),
+        slow_ = lambda c_: (sorted(int(v_) for v_ in (c_.get("slow_layers") or [])), int(c_.get("slow_heads", 2)), c_.get("slow_pick", "longest"), c_.get("slow_spread", "channels"),
                             [int(v_) for v_ in (c_.get("slow_range") or [30_000, 1_000_000])])
         if model.config.slow_layers and slow_(src_cfg_) != slow_(vars(model.config)):
             # the load overwrote the slow init, or the checkpoint's slow heads were set otherwise (other layers, heads
