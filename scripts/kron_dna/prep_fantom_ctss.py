@@ -101,8 +101,9 @@ def select(out: Path, assembly: str = "hg38", groups: str = "cell_line+tissue+pr
 
 @app.command()
 def fetch(select: Path, out: Path) -> None:
-    """Each sample's table once, to ``OUT/<CNhs>.ctss.bed.gz``; a file of the listed size (within 1 %, the listing
-    rounds) that gunzips to its end is kept, anything else is downloaded again."""
+    """Each sample's table once, to ``OUT/<CNhs>.ctss.bed.gz``; a file of the listed size (within 6 %: the listing
+    gives two digits) that gunzips to its end is kept; one that fails stays as ``.part`` and is reported, and is
+    checked again, not downloaded again, on the next run (delete it to fetch it anew)."""
     out.mkdir(parents=True, exist_ok=True)
     rows = {r["experiment"]: r for r in csv.DictReader(select.open(), delimiter="\t")}
     bad = 0
@@ -110,9 +111,10 @@ def fetch(select: Path, out: Path) -> None:
         dst = out / f"{cnhs}.ctss.bed.gz"
         if not dst.exists():
             tmp = Path(str(dst) + ".part")
-            subprocess.run(["curl", "-sS", "--fail", "--retry", "5", "--retry-all-errors", "-o", str(tmp), r["url"]],
-                           check=True)
-            ok = abs(tmp.stat().st_size - int(r["size"])) <= max(2048, 0.01 * int(r["size"]))
+            if not tmp.exists():
+                subprocess.run(["curl", "-sS", "--fail", "--retry", "5", "--retry-all-errors", "-o", str(tmp),
+                                r["url"]], check=True)
+            ok = abs(tmp.stat().st_size - int(r["size"])) <= max(2048, 0.06 * int(r["size"]))
             ok = ok and subprocess.run(["gzip", "-t", str(tmp)]).returncode == 0
             if not ok:
                 bad += 1
